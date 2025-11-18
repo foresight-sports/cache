@@ -75035,7 +75035,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.createTarWithPigz = exports.ensurePigz = void 0;
+exports.extractTarWithPigz = exports.createTarWithPigz = exports.ensurePigz = void 0;
 const constants_1 = __nccwpck_require__(58287);
 const cacheUtils = __importStar(__nccwpck_require__(98299));
 const tar_1 = __nccwpck_require__(95321);
@@ -75074,7 +75074,6 @@ function installPigz() {
                 yield exec.exec('sudo apt-get install -y pigz');
             }
             else if (platform === 'darwin') {
-                // Ensure brew is available
                 const brew = yield io.which('brew', false);
                 if (!brew)
                     throw new Error('Homebrew not found');
@@ -75088,6 +75087,11 @@ function installPigz() {
                 }
                 const downloadPath = path.join(os.tmpdir(), 'pigz.exe');
                 yield tc.downloadTool(pigzUrl, downloadPath);
+                // make a copy and rename it to unpigz for unzippping
+                const pigzPath = path.join(os.tmpdir(), 'pigz.exe');
+                yield io.cp(downloadPath, pigzPath);
+                // add to PATH
+                core.addPath(os.tmpdir());
             }
             else {
                 throw new Error(`Unsupported platform: ${platform}`);
@@ -75127,17 +75131,6 @@ function ensurePigz() {
 }
 exports.ensurePigz = ensurePigz;
 /**
- * Prefer the system tar on Windows if available, otherwise fall back to `tar` on PATH.
- */
-function getTarExecutable() {
-    return __awaiter(this, void 0, void 0, function* () {
-        if (IS_WINDOWS && constants_1.SystemTarPathOnWindows && (0, fs_1.existsSync)(constants_1.SystemTarPathOnWindows)) {
-            return constants_1.SystemTarPathOnWindows;
-        }
-        return yield io.which('tar', true);
-    });
-}
-/**
  * Create a tar archive using pigz for gzip compression when available.
  * Falls back to the default @actions/cache tar implementation otherwise.
  */
@@ -75164,12 +75157,12 @@ function createTarWithPigz(archiveFolder, cachePaths, compressionMethod) {
         const cacheFileNameForTar = cacheFileName.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
         // Same working directory semantics as internal tar.ts
         const workingDirectory = ((_a = process.env['GITHUB_WORKSPACE']) !== null && _a !== void 0 ? _a : process.cwd()).replace(new RegExp(`\\${path.sep}`, 'g'), '/');
-        const tarExe = yield getTarExecutable();
+        const pigz = IS_WINDOWS ? pigzPath : 'pigz';
         // Build tar command string using pigz as the compressor
         // Equivalent to:
         //   tar --posix -cf <archive> --exclude <archive> -P -C <workspace> --files-from manifest.txt --use-compress-program pigz
         const parts = [
-            `"${tarExe}"`,
+            `"${pigz}"`,
             '--posix',
             '-cf',
             cacheFileNameForTar,
@@ -75199,6 +75192,51 @@ function createTarWithPigz(archiveFolder, cachePaths, compressionMethod) {
     });
 }
 exports.createTarWithPigz = createTarWithPigz;
+function extractTarWithPigz(archivePath, compressionMethod) {
+    return __awaiter(this, void 0, void 0, function* () {
+        // pigz only makes sense for gzip; for zstd variants use the default implementation.
+        if (compressionMethod !== constants_1.CompressionMethod.Gzip) {
+            core.warning('Compression method is not gzip; delegating to default extractTar.');
+            return (0, tar_1.extractTar)(archivePath, compressionMethod);
+        }
+        // Ensure pigz is installed. If not, just use the default tar implementation.
+        const pigzPath = yield ensurePigz();
+        if (!pigzPath) {
+            core.warning('pigz is not available; delegating to default extractTar.');
+            return (0, tar_1.extractTar)(archivePath, compressionMethod);
+        }
+        core.info('Using pigz for gzip decompression when extracting cache tarball.');
+        const pigz = IS_WINDOWS ? pigzPath : 'pigz';
+        const unpigz = // get unpigz path
+         IS_WINDOWS
+            ? pigzPath.replace('pigz.exe', 'unpigz.exe')
+            : 'unpigz';
+        // Build tar command string using pigz as the decompressor
+        // Equivalent to:
+        //   tar --posix -xf <archive> --use-compress-program pigz
+        const parts = [
+            `"${unpigz}"`,
+            '--posix',
+            '-xf',
+            `"${archivePath}"`,
+            '--use-compress-program',
+            'pigz'
+        ];
+        const command = parts.join(' ');
+        core.debug(`Running tar with pigz: ${command}`);
+        try {
+            yield exec.exec(command, undefined, {
+                env: Object.assign(Object.assign({}, process.env), { MSYS: 'winsymlinks:nativestrict' })
+            });
+        }
+        catch (error) {
+            // If anything goes wrong with pigz/tar, fall back to the default implementation
+            core.warning(`tar with pigz failed (${error === null || error === void 0 ? void 0 : error.message}); falling back to default extractTar.`);
+            return (0, tar_1.extractTar)(archivePath, compressionMethod);
+        }
+    });
+}
+exports.extractTarWithPigz = extractTarWithPigz;
 
 
 /***/ }),
