@@ -75034,6 +75034,9 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.extractTarWithPigz = exports.createTarWithPigz = exports.ensurePigz = void 0;
 const constants_1 = __nccwpck_require__(58287);
@@ -75046,6 +75049,7 @@ const io = __importStar(__nccwpck_require__(94994));
 const os = __importStar(__nccwpck_require__(70857));
 const fs_1 = __nccwpck_require__(79896);
 const path = __importStar(__nccwpck_require__(16928));
+const fs_2 = __importDefault(__nccwpck_require__(79896));
 const IS_WINDOWS = process.platform === 'win32';
 /**
  * Try to find pigz in PATH
@@ -75080,19 +75084,27 @@ function installPigz() {
                 yield exec.exec('brew install pigz');
             }
             else if (platform === 'win32') {
-                // no package manager available, download binary directly from a trusted source
-                const pigzUrl = core.getInput('pigz-download-url');
-                if (!pigzUrl) {
-                    throw new Error('pigz-download-url input is not set');
+                // expect the binaries to be in GITHUB_WORKSPACE/.tool-cache/
+                // no version
+                const githubWorkspace = process.env['GITHUB_WORKSPACE'];
+                if (!githubWorkspace) {
+                    throw new Error('GITHUB_WORKSPACE is not defined');
                 }
-                const downloadPath = yield tc.downloadTool(pigzUrl);
-                // provide both pigz and unpigz executables as documented for Windows
-                const pigzPath = path.join(os.tmpdir(), 'pigz.exe');
-                const unpigzPath = path.join(os.tmpdir(), 'unpigz.exe');
-                yield io.cp(downloadPath, pigzPath, { force: true });
-                yield io.cp(downloadPath, unpigzPath, { force: true });
-                // add to PATH
-                core.addPath(os.tmpdir());
+                const pigzDir = path.join(githubWorkspace, '.tool-cache');
+                // if directory doesn't exist, throw error. Don't use io.<> here
+                if (!fs_2.default.existsSync(pigzDir)) {
+                    throw new Error(`Expected pigz directory does not exist: ${pigzDir}`);
+                }
+                const pigzPath = path.join(pigzDir, 'pigz.exe');
+                if (!fs_2.default.existsSync(pigzPath)) {
+                    throw new Error(`pigz.exe not found at expected location: ${pigzPath}`);
+                }
+                const unpigzPath = path.join(pigzDir, 'unpigz.exe');
+                if (!fs_2.default.existsSync(unpigzPath)) {
+                    throw new Error(`unpigz.exe not found at expected location: ${unpigzPath}`);
+                }
+                // add dir to tool cache
+                yield tc.cacheDir(pigzDir, 'pigz', 'latest');
             }
             else {
                 throw new Error(`Unsupported platform: ${platform}`);
