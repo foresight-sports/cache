@@ -2,6 +2,7 @@ import { CompressionMethod, ManifestFilename, SystemTarPathOnWindows } from '@ac
 import * as cacheUtils from '@actions/cache/lib/internal/cacheUtils'
 import { createTar as defaultCreateTar } from '@actions/cache/lib/internal/tar'
 
+import * as tc from '@actions/tool-cache'
 import * as core from '@actions/core'
 import * as exec from '@actions/exec'
 import * as io from '@actions/io'
@@ -41,10 +42,13 @@ async function installPigz(): Promise<void> {
             if (!brew) throw new Error('Homebrew not found')
             await exec.exec('brew install pigz')
         } else if (platform === 'win32') {
-            // Ensure choco is available
-            const choco = await io.which('choco', false)
-            if (!choco) throw new Error('Chocolatey not found')
-            await exec.exec('choco install pigz -y')
+            // no package manager available, download binary directly from a trusted source
+            const pigzUrl = core.getInput('pigz-download-url');
+            if (!pigzUrl) {
+                throw new Error('pigz-download-url input is not set')
+            }
+            const downloadPath = path.join(os.tmpdir(), 'pigz.exe')
+            await tc.downloadTool(pigzUrl, downloadPath);
         } else {
             throw new Error(`Unsupported platform: ${platform}`)
         }
