@@ -190,7 +190,7 @@ export async function createTarWithPigz(
 
     const pigz = IS_WINDOWS ? pigzPath : 'pigz'
     const threadCount = Math.max(os.cpus().length, 1)
-    const pigzProgram = `"${pigz}" -1 -p ${threadCount}`
+    const pigzProgram = `"\"${pigz}\" -1 -p ${threadCount}\"`
     const tarResolution = await resolveTar()
 
     // Build tar command string using pigz as the compressor
@@ -255,7 +255,7 @@ export async function extractTarWithPigz(
 
     const pigz = IS_WINDOWS ? pigzPath : 'pigz';
     const threadCount = Math.max(os.cpus().length, 1);
-    const pigzProgram = `"${pigz}" -d -p ${threadCount}`;
+    const pigzProgram = `"\"${pigz}\" -d -p ${threadCount}\"`;
     const tarResolution = await resolveTar();
     const workingDirectory = getWorkingDirectory();
     await io.mkdirP(workingDirectory);
