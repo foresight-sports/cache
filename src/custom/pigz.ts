@@ -15,6 +15,11 @@ import * as path from 'path'
 
 const IS_WINDOWS = process.platform === 'win32'
 
+interface TarResolution {
+    path: string
+    useForceLocal: boolean
+}
+
 /**
  * Try to find pigz in PATH
  */
@@ -49,11 +54,12 @@ async function installPigz(): Promise<void> {
             if (!pigzUrl) {
                 throw new Error('pigz-download-url input is not set');
             }
-            const downloadPath = path.join(os.tmpdir(), 'pigz.exe');
-            await tc.downloadTool(pigzUrl, downloadPath);
-            // make a copy and rename it to unpigz for unzippping
+            const downloadPath = await tc.downloadTool(pigzUrl);
+            // provide both pigz and unpigz executables as documented for Windows
             const pigzPath = path.join(os.tmpdir(), 'pigz.exe');
-            await io.cp(downloadPath, pigzPath);
+            const unpigzPath = path.join(os.tmpdir(), 'unpigz.exe');
+            await io.cp(downloadPath, pigzPath, { force: true });
+            await io.cp(downloadPath, unpigzPath, { force: true });
             // add to PATH
             core.addPath(os.tmpdir());
         } else {
@@ -95,6 +101,26 @@ export async function ensurePigz(): Promise<string | null> {
     return null
 }
 
+async function resolveTar(): Promise<TarResolution> {
+    if (IS_WINDOWS) {
+        const gnuTar = await cacheUtils.getGnuTarPathOnWindows()
+        if (gnuTar) {
+            return { path: gnuTar, useForceLocal: true }
+        }
+        return { path: SystemTarPathOnWindows, useForceLocal: false }
+    }
+
+    const tarPath = await io.which('tar', true)
+    return { path: tarPath, useForceLocal: false }
+}
+
+function getWorkingDirectory(): string {
+    return (process.env['GITHUB_WORKSPACE'] ?? process.cwd()).replace(
+        new RegExp(`\\${path.sep}`, 'g'),
+        '/'
+    )
+}
+
 /**
  * Create a tar archive using pigz for gzip compression when available.
  * Falls back to the default @actions/cache tar implementation otherwise.
@@ -131,19 +157,18 @@ export async function createTarWithPigz(
     // Normalize to forward slashes for tar
     const cacheFileNameForTar = cacheFileName.replace(new RegExp(`\\${path.sep}`, 'g'), '/')
 
-    // Same working directory semantics as internal tar.ts
-    const workingDirectory = (process.env['GITHUB_WORKSPACE'] ?? process.cwd()).replace(
-        new RegExp(`\\${path.sep}`, 'g'),
-        '/'
-    )
+    const workingDirectory = getWorkingDirectory()
 
     const pigz = IS_WINDOWS ? pigzPath : 'pigz'
+    const threadCount = Math.max(os.cpus().length, 1)
+    const pigzProgram = `"${pigz}" -1 -p ${threadCount}`
+    const tarResolution = await resolveTar()
 
     // Build tar command string using pigz as the compressor
     // Equivalent to:
     //   tar --posix -cf <archive> --exclude <archive> -P -C <workspace> --files-from manifest.txt --use-compress-program pigz
     const parts: string[] = [
-        `"${pigz}"`,
+        `"${tarResolution.path}"`,
         '--posix',
         '-cf',
         cacheFileNameForTar,
@@ -155,8 +180,12 @@ export async function createTarWithPigz(
         '--files-from',
         ManifestFilename,
         '--use-compress-program',
-        'pigz'
+        pigzProgram
     ]
+
+    if (tarResolution.useForceLocal) {
+        parts.push('--force-local')
+    }
 
     const command = parts.join(' ')
     core.debug(`Running tar with pigz: ${command}`)
@@ -196,22 +225,30 @@ export async function extractTarWithPigz(
     core.info('Using pigz for gzip decompression when extracting cache tarball.');
 
     const pigz = IS_WINDOWS ? pigzPath : 'pigz';
-    const unpigz = // get unpigz path
-        IS_WINDOWS
-            ? pigzPath.replace('pigz.exe', 'unpigz.exe')
-            : 'unpigz';
+    const threadCount = Math.max(os.cpus().length, 1);
+    const pigzProgram = `"${pigz}" -d -p ${threadCount}`;
+    const tarResolution = await resolveTar();
+    const workingDirectory = getWorkingDirectory();
+    await io.mkdirP(workingDirectory);
+    const normalizedArchivePath = archivePath.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
 
     // Build tar command string using pigz as the decompressor
     // Equivalent to:
-    //   tar --posix -xf <archive> --use-compress-program pigz
+    //   tar -xf <archive> -P -C <workspace> --use-compress-program "pigz -d ..."
     const parts: string[] = [
-        `"${unpigz}"`,
-        '--posix',
+        `"${tarResolution.path}"`,
         '-xf',
-        `"${archivePath}"`,
+        normalizedArchivePath,
+        '-P',
+        '-C',
+        workingDirectory,
         '--use-compress-program',
-        'pigz'
+        pigzProgram
     ];
+
+    if (tarResolution.useForceLocal) {
+        parts.push('--force-local');
+    }
 
     const command = parts.join(' ');
     core.debug(`Running tar with pigz: ${command}`);
