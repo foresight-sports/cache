@@ -73470,16 +73470,97 @@ function saveCache(key, paths, archivePath, { compressionMethod, enableCrossOsAr
         // Commit Cache
         const cacheSize = utils.getArchiveFileSizeInBytes(archivePath);
         core.info(`Cache Size: ~${Math.round(cacheSize / (1024 * 1024))} MB (${cacheSize} B)`);
-        const totalParts = Math.ceil(cacheSize / uploadPartSize);
         core.info(`Uploading cache from ${archivePath} to ${bucketName}/${s3Key}`);
+        const uploadProgress = new UploadProgressReporter(cacheSize);
+        uploadProgress.startDisplayTimer();
+        const partLoadedBytes = new Map();
+        let uploadedBytes = 0;
         multipartUpload.on("httpUploadProgress", progress => {
-            core.info(`Uploaded part ${progress.part}/${totalParts}.`);
+            var _a, _b;
+            const partNumber = (_a = progress.part) !== null && _a !== void 0 ? _a : 0;
+            if (typeof progress.loaded === "number") {
+                if (partNumber > 0) {
+                    const previous = (_b = partLoadedBytes.get(partNumber)) !== null && _b !== void 0 ? _b : 0;
+                    let delta = progress.loaded - previous;
+                    if (delta < 0) {
+                        // part likely restarted, back out prior count and start fresh
+                        uploadedBytes = Math.max(uploadedBytes - previous, 0);
+                        partLoadedBytes.set(partNumber, 0);
+                        delta = progress.loaded;
+                    }
+                    if (delta > 0) {
+                        uploadedBytes += delta;
+                        partLoadedBytes.set(partNumber, progress.loaded);
+                    }
+                }
+                else {
+                    uploadedBytes = Math.max(uploadedBytes, progress.loaded);
+                }
+                uploadProgress.setUploadedBytes(Math.min(uploadedBytes, cacheSize));
+            }
         });
-        yield multipartUpload.done();
-        core.info(`Cache saved successfully.`);
+        try {
+            yield multipartUpload.done();
+            core.info(`Cache saved successfully.`);
+        }
+        finally {
+            uploadProgress.stopDisplayTimer();
+        }
     });
 }
 exports.saveCache = saveCache;
+class UploadProgressReporter {
+    constructor(totalBytes) {
+        this.totalBytes = totalBytes;
+        this.uploadedBytes = 0;
+        this.startTime = Date.now();
+        this.displayedComplete = false;
+    }
+    setUploadedBytes(bytes) {
+        this.uploadedBytes = Math.min(bytes, this.totalBytes);
+    }
+    getTransferredBytes() {
+        return this.uploadedBytes;
+    }
+    isDone() {
+        return this.totalBytes === 0 || this.uploadedBytes >= this.totalBytes;
+    }
+    display() {
+        if (this.displayedComplete) {
+            return;
+        }
+        const transferredBytes = this.getTransferredBytes();
+        const percentage = this.totalBytes
+            ? ((100 * transferredBytes) / this.totalBytes).toFixed(1)
+            : "100.0";
+        const elapsedTime = Date.now() - this.startTime;
+        const uploadSpeed = elapsedTime
+            ? (transferredBytes /
+                (1024 * 1024) /
+                (elapsedTime / 1000)).toFixed(1)
+            : "0.0";
+        core.info(`Uploaded ${transferredBytes} of ${this.totalBytes} (${percentage}%), ${uploadSpeed} MBs/sec`);
+        if (this.isDone()) {
+            this.displayedComplete = true;
+        }
+    }
+    startDisplayTimer(delayInMs = 1000) {
+        const displayCallback = () => {
+            this.display();
+            if (!this.isDone()) {
+                this.timeoutHandle = setTimeout(displayCallback, delayInMs);
+            }
+        };
+        this.timeoutHandle = setTimeout(displayCallback, delayInMs);
+    }
+    stopDisplayTimer() {
+        if (this.timeoutHandle) {
+            clearTimeout(this.timeoutHandle);
+            this.timeoutHandle = undefined;
+        }
+        this.display();
+    }
+}
 
 
 /***/ }),
