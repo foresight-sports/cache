@@ -100805,6 +100805,7 @@ const path = __importStar(__nccwpck_require__(6928));
 const utils = __importStar(__nccwpck_require__(8299));
 const cacheHttpClient = __importStar(__nccwpck_require__(5951));
 const tar_1 = __nccwpck_require__(5321);
+const pigz_1 = __nccwpck_require__(2122);
 class ValidationError extends Error {
     constructor(message) {
         super(message);
@@ -100960,7 +100961,7 @@ function saveCache(paths, key, options, enableCrossOsArchive = false) {
         const archivePath = path.join(archiveFolder, utils.getCacheFileName(compressionMethod));
         core.debug(`Archive Path: ${archivePath}`);
         try {
-            yield (0, tar_1.createTar)(archiveFolder, cachePaths, compressionMethod);
+            yield (0, pigz_1.createTarWithPigz)(archiveFolder, cachePaths, compressionMethod);
             if (core.isDebug()) {
                 yield (0, tar_1.listTar)(archivePath, compressionMethod);
             }
@@ -101284,6 +101285,209 @@ const promiseWithTimeout = (timeoutMs, promise) => __awaiter(void 0, void 0, voi
         return result;
     });
 });
+
+
+/***/ }),
+
+/***/ 2122:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.createTarWithPigz = exports.ensurePigz = void 0;
+const constants_1 = __nccwpck_require__(8287);
+const cacheUtils = __importStar(__nccwpck_require__(8299));
+const tar_1 = __nccwpck_require__(5321);
+const core = __importStar(__nccwpck_require__(7484));
+const exec = __importStar(__nccwpck_require__(5236));
+const io = __importStar(__nccwpck_require__(4994));
+const os = __importStar(__nccwpck_require__(857));
+const fs_1 = __nccwpck_require__(9896);
+const path = __importStar(__nccwpck_require__(6928));
+const IS_WINDOWS = process.platform === 'win32';
+/**
+ * Try to find pigz in PATH
+ */
+function findPigz() {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const found = yield io.which('pigz', false);
+            return found || null;
+        }
+        catch (_a) {
+            return null;
+        }
+    });
+}
+/**
+ * OS-specific installation logic
+ */
+function installPigz() {
+    return __awaiter(this, void 0, void 0, function* () {
+        const platform = os.platform();
+        core.info(`Attempting to install pigz on ${platform}...`);
+        try {
+            if (platform === 'linux') {
+                yield exec.exec('sudo apt-get update');
+                yield exec.exec('sudo apt-get install -y pigz');
+            }
+            else if (platform === 'darwin') {
+                // Ensure brew is available
+                const brew = yield io.which('brew', false);
+                if (!brew)
+                    throw new Error('Homebrew not found');
+                yield exec.exec('brew install pigz');
+            }
+            else if (platform === 'win32') {
+                // Ensure choco is available
+                const choco = yield io.which('choco', false);
+                if (!choco)
+                    throw new Error('Chocolatey not found');
+                yield exec.exec('choco install pigz -y');
+            }
+            else {
+                throw new Error(`Unsupported platform: ${platform}`);
+            }
+            core.info('pigz installation attempt complete.');
+        }
+        catch (err) {
+            core.warning(`Failed to install pigz: ${err.message}`);
+        }
+    });
+}
+/**
+ * Ensure pigz is installed and accessible.
+ * Returns the path or null if we must fall back to tar/gzip.
+ */
+function ensurePigz() {
+    return __awaiter(this, void 0, void 0, function* () {
+        // Step 1: check PATH first
+        let pigzPath = yield findPigz();
+        if (pigzPath) {
+            core.info(`pigz found at: ${pigzPath}`);
+            return pigzPath;
+        }
+        core.info('pigz not found — attempting installation…');
+        // Step 2: attempt installation
+        yield installPigz();
+        // Step 3: check again
+        pigzPath = yield findPigz();
+        if (pigzPath) {
+            core.info(`pigz successfully installed at: ${pigzPath}`);
+            return pigzPath;
+        }
+        // Step 4: fall back to tar/gzip
+        core.warning('pigz could not be installed; falling back to tar/gzip.');
+        return null;
+    });
+}
+exports.ensurePigz = ensurePigz;
+/**
+ * Prefer the system tar on Windows if available, otherwise fall back to `tar` on PATH.
+ */
+function getTarExecutable() {
+    return __awaiter(this, void 0, void 0, function* () {
+        if (IS_WINDOWS && constants_1.SystemTarPathOnWindows && (0, fs_1.existsSync)(constants_1.SystemTarPathOnWindows)) {
+            return constants_1.SystemTarPathOnWindows;
+        }
+        return yield io.which('tar', true);
+    });
+}
+/**
+ * Create a tar archive using pigz for gzip compression when available.
+ * Falls back to the default @actions/cache tar implementation otherwise.
+ */
+function createTarWithPigz(archiveFolder, cachePaths, compressionMethod) {
+    var _a;
+    return __awaiter(this, void 0, void 0, function* () {
+        // pigz only makes sense for gzip; for zstd variants use the default implementation.
+        if (compressionMethod !== constants_1.CompressionMethod.Gzip) {
+            core.warning('Compression method is not gzip; delegating to default createTar.');
+            return (0, tar_1.createTar)(archiveFolder, cachePaths, compressionMethod);
+        }
+        // Ensure pigz is installed. If not, just use the default tar implementation.
+        const pigzPath = yield ensurePigz();
+        if (!pigzPath) {
+            core.warning('pigz is not available; delegating to default createTar.');
+            return (0, tar_1.createTar)(archiveFolder, cachePaths, compressionMethod);
+        }
+        core.info('Using pigz for gzip compression when creating cache tarball.');
+        // Write manifest.txt in the archiveFolder, mirroring the default createTar behavior
+        (0, fs_1.writeFileSync)(path.join(archiveFolder, constants_1.ManifestFilename), cachePaths.join('\n'));
+        // Compute the archive filename exactly as actions/cache would
+        const cacheFileName = cacheUtils.getCacheFileName(compressionMethod);
+        // Normalize to forward slashes for tar
+        const cacheFileNameForTar = cacheFileName.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
+        // Same working directory semantics as internal tar.ts
+        const workingDirectory = ((_a = process.env['GITHUB_WORKSPACE']) !== null && _a !== void 0 ? _a : process.cwd()).replace(new RegExp(`\\${path.sep}`, 'g'), '/');
+        const tarExe = yield getTarExecutable();
+        // Build tar command string using pigz as the compressor
+        // Equivalent to:
+        //   tar --posix -cf <archive> --exclude <archive> -P -C <workspace> --files-from manifest.txt --use-compress-program pigz
+        const parts = [
+            `"${tarExe}"`,
+            '--posix',
+            '-cf',
+            cacheFileNameForTar,
+            '--exclude',
+            cacheFileNameForTar,
+            '-P',
+            '-C',
+            workingDirectory,
+            '--files-from',
+            constants_1.ManifestFilename,
+            '--use-compress-program',
+            'pigz'
+        ];
+        const command = parts.join(' ');
+        core.debug(`Running tar with pigz: ${command}`);
+        try {
+            yield exec.exec(command, undefined, {
+                cwd: archiveFolder,
+                env: Object.assign(Object.assign({}, process.env), { MSYS: 'winsymlinks:nativestrict' })
+            });
+        }
+        catch (error) {
+            // If anything goes wrong with pigz/tar, fall back to the default implementation
+            core.warning(`tar with pigz failed (${error === null || error === void 0 ? void 0 : error.message}); falling back to default createTar.`);
+            return (0, tar_1.createTar)(archiveFolder, cachePaths, compressionMethod);
+        }
+    });
+}
+exports.createTarWithPigz = createTarWithPigz;
 
 
 /***/ }),
