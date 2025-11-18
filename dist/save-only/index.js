@@ -74613,7 +74613,7 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             if (archiveFileSize === 0) {
                 throw new DownloadValidationError("Downloaded cache archive is empty (0 bytes). This may indicate a failed download or corrupted cache.");
             }
-            yield (0, tar_1.extractTar)(archivePath, compressionMethod);
+            yield (0, pigz_1.extractTarWithPigz)(archivePath, compressionMethod);
             core.info("Cache restored successfully");
             return cacheEntry.cacheKey;
         }

@@ -9,7 +9,7 @@ import {
     listTar
 } from "@actions/cache/lib/internal/tar";
 import { DownloadOptions, UploadOptions } from "@actions/cache/lib/options";
-import { createTarWithPigz } from "./pigz";
+import { createTarWithPigz, extractTarWithPigz } from "./pigz";
 
 export class ValidationError extends Error {
     constructor(message: string) {
@@ -150,7 +150,7 @@ export async function restoreCache(
             );
         }
 
-        await extractTar(archivePath, compressionMethod);
+        await extractTarWithPigz(archivePath, compressionMethod);
         core.info("Cache restored successfully");
 
         return cacheEntry.cacheKey;
