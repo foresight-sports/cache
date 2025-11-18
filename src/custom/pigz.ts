@@ -12,6 +12,7 @@ import * as io from '@actions/io'
 import * as os from 'os'
 import { writeFileSync } from 'fs'
 import * as path from 'path'
+import fs from 'fs'
 
 const IS_WINDOWS = process.platform === 'win32'
 
@@ -49,19 +50,38 @@ async function installPigz(): Promise<void> {
             if (!brew) throw new Error('Homebrew not found');
             await exec.exec('brew install pigz');
         } else if (platform === 'win32') {
-            // no package manager available, download binary directly from a trusted source
-            const pigzUrl = core.getInput('pigz-download-url');
-            if (!pigzUrl) {
-                throw new Error('pigz-download-url input is not set');
+            // expect the binaries to be in GITHUB_WORKSPACE/.tool-cache/
+            // no version
+            const githubWorkspace = process.env['GITHUB_WORKSPACE'];
+            if (!githubWorkspace) {
+                throw new Error('GITHUB_WORKSPACE is not defined');
             }
-            const downloadPath = await tc.downloadTool(pigzUrl);
-            // provide both pigz and unpigz executables as documented for Windows
-            const pigzPath = path.join(os.tmpdir(), 'pigz.exe');
-            const unpigzPath = path.join(os.tmpdir(), 'unpigz.exe');
-            await io.cp(downloadPath, pigzPath, { force: true });
-            await io.cp(downloadPath, unpigzPath, { force: true });
-            // add to PATH
-            core.addPath(os.tmpdir());
+            const pigzDir = path.join(githubWorkspace, '.tool-cache');
+            // if directory doesn't exist, throw error. Don't use io.<> here
+
+            if (!fs.existsSync(pigzDir)) {
+                throw new Error(`Expected pigz directory does not exist: ${pigzDir}`);
+            }
+
+            const pigzPath = path.join(pigzDir, 'pigz.exe');
+
+            if (!fs.existsSync(pigzPath)) {
+                throw new Error(`pigz.exe not found at expected location: ${pigzPath}`);
+            }
+
+            const unpigzPath = path.join(pigzDir, 'unpigz.exe');
+
+            if (!fs.existsSync(unpigzPath)) {
+                throw new Error(`unpigz.exe not found at expected location: ${unpigzPath}`);
+            }
+
+            // add dir to tool cache
+            await tc.cacheDir(
+                pigzDir,
+                'pigz',
+                'latest'
+            );
+
         } else {
             throw new Error(`Unsupported platform: ${platform}`);
         }

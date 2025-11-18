@@ -5,7 +5,6 @@ import * as path from "path";
 import * as utils from "@actions/cache/lib/internal/cacheUtils";
 import * as cacheHttpClient from "./backend";
 import {
-    extractTar,
     listTar
 } from "@actions/cache/lib/internal/tar";
 import { DownloadOptions, UploadOptions } from "@actions/cache/lib/options";
