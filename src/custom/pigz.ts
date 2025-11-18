@@ -106,14 +106,14 @@ export async function createTarWithPigz(
 ): Promise<void> {
     // pigz only makes sense for gzip; for zstd variants use the default implementation.
     if (compressionMethod !== CompressionMethod.Gzip) {
-        core.debug('Compression method is not gzip; delegating to default createTar.')
+        core.warning('Compression method is not gzip; delegating to default createTar.')
         return defaultCreateTar(archiveFolder, cachePaths, compressionMethod)
     }
 
     // Ensure pigz is installed. If not, just use the default tar implementation.
     const pigzPath = await ensurePigz()
     if (!pigzPath) {
-        core.debug('pigz is not available; delegating to default createTar.')
+        core.warning('pigz is not available; delegating to default createTar.')
         return defaultCreateTar(archiveFolder, cachePaths, compressionMethod)
     }
 
