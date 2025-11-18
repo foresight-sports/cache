@@ -247,7 +247,6 @@ export async function saveCache(
         )} MB (${cacheSize} B)`
     );
 
-    const totalParts = Math.ceil(cacheSize / uploadPartSize);
     core.info(`Uploading cache from ${archivePath} to ${bucketName}/${s3Key}`);
     const uploadProgress = new UploadProgressReporter(cacheSize);
     uploadProgress.startDisplayTimer();
@@ -280,15 +279,6 @@ export async function saveCache(
             uploadProgress.setUploadedBytes(
                 Math.min(uploadedBytes, cacheSize)
             );
-        }
-
-        if (
-            partNumber > 0 &&
-            typeof progress.loaded === "number" &&
-            typeof progress.total === "number" &&
-            progress.loaded === progress.total
-        ) {
-            core.info(`Uploaded part ${partNumber}/${totalParts}.`);
         }
     });
 
