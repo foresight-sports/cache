@@ -249,10 +249,128 @@ export async function saveCache(
 
     const totalParts = Math.ceil(cacheSize / uploadPartSize);
     core.info(`Uploading cache from ${archivePath} to ${bucketName}/${s3Key}`);
+    const uploadProgress = new UploadProgressReporter(cacheSize);
+    uploadProgress.startDisplayTimer();
+    const partLoadedBytes = new Map<number, number>();
+    let uploadedBytes = 0;
+
     multipartUpload.on("httpUploadProgress", progress => {
-        core.info(`Uploaded part ${progress.part}/${totalParts}.`);
+        const partNumber = progress.part ?? 0;
+
+        if (typeof progress.loaded === "number") {
+            if (partNumber > 0) {
+                const previous = partLoadedBytes.get(partNumber) ?? 0;
+                let delta = progress.loaded - previous;
+
+                if (delta < 0) {
+                    // part likely restarted, back out prior count and start fresh
+                    uploadedBytes = Math.max(uploadedBytes - previous, 0);
+                    partLoadedBytes.set(partNumber, 0);
+                    delta = progress.loaded;
+                }
+
+                if (delta > 0) {
+                    uploadedBytes += delta;
+                    partLoadedBytes.set(partNumber, progress.loaded);
+                }
+            } else {
+                uploadedBytes = Math.max(uploadedBytes, progress.loaded);
+            }
+
+            uploadProgress.setUploadedBytes(
+                Math.min(uploadedBytes, cacheSize)
+            );
+        }
+
+        if (
+            partNumber > 0 &&
+            typeof progress.loaded === "number" &&
+            typeof progress.total === "number" &&
+            progress.loaded === progress.total
+        ) {
+            core.info(`Uploaded part ${partNumber}/${totalParts}.`);
+        }
     });
 
-    await multipartUpload.done();
-    core.info(`Cache saved successfully.`);
+    try {
+        await multipartUpload.done();
+        core.info(`Cache saved successfully.`);
+    } finally {
+        uploadProgress.stopDisplayTimer();
+    }
+}
+
+class UploadProgressReporter {
+    private readonly totalBytes: number;
+    private uploadedBytes: number;
+    private readonly startTime: number;
+    private displayedComplete: boolean;
+    private timeoutHandle?: ReturnType<typeof setTimeout>;
+
+    constructor(totalBytes: number) {
+        this.totalBytes = totalBytes;
+        this.uploadedBytes = 0;
+        this.startTime = Date.now();
+        this.displayedComplete = false;
+    }
+
+    setUploadedBytes(bytes: number): void {
+        this.uploadedBytes = Math.min(bytes, this.totalBytes);
+    }
+
+    private getTransferredBytes(): number {
+        return this.uploadedBytes;
+    }
+
+    private isDone(): boolean {
+        return this.totalBytes === 0 || this.uploadedBytes >= this.totalBytes;
+    }
+
+    private display(): void {
+        if (this.displayedComplete) {
+            return;
+        }
+
+        const transferredBytes = this.getTransferredBytes();
+        const percentage = this.totalBytes
+            ? ((100 * transferredBytes) / this.totalBytes).toFixed(1)
+            : "100.0";
+        const elapsedTime = Date.now() - this.startTime;
+        const uploadSpeed = elapsedTime
+            ? (
+                transferredBytes /
+                (1024 * 1024) /
+                (elapsedTime / 1000)
+            ).toFixed(1)
+            : "0.0";
+
+        core.info(
+            `Uploaded ${transferredBytes} of ${this.totalBytes} (${percentage}%), ${uploadSpeed} MBs/sec`
+        );
+
+        if (this.isDone()) {
+            this.displayedComplete = true;
+        }
+    }
+
+    startDisplayTimer(delayInMs = 1000): void {
+        const displayCallback = (): void => {
+            this.display();
+
+            if (!this.isDone()) {
+                this.timeoutHandle = setTimeout(displayCallback, delayInMs);
+            }
+        };
+
+        this.timeoutHandle = setTimeout(displayCallback, delayInMs);
+    }
+
+    stopDisplayTimer(): void {
+        if (this.timeoutHandle) {
+            clearTimeout(this.timeoutHandle);
+            this.timeoutHandle = undefined;
+        }
+
+        this.display();
+    }
 }
