@@ -51,44 +51,53 @@ async function installPigz(): Promise<void> {
             await exec.exec('brew install pigz');
         } else if (platform === 'win32') {
             // expect the binaries to be in GITHUB_WORKSPACE/.tool-cache/
-            // no version
             const githubWorkspace = process.env['GITHUB_WORKSPACE'];
+
             if (!githubWorkspace) {
                 throw new Error('GITHUB_WORKSPACE is not defined');
             }
+
             const pigzDir = path.join(githubWorkspace, '.tool-cache');
             // if directory doesn't exist, throw error. Don't use io.<> here
+
+            core.info(`Checking for pigz directory at: ${pigzDir}`);
 
             if (!fs.existsSync(pigzDir)) {
                 throw new Error(`Expected pigz directory does not exist: ${pigzDir}`);
             }
 
+            core.info(`Checking for pigz.exe in: ${pigzDir}`);
             const pigzPath = path.join(pigzDir, 'pigz.exe');
 
             if (!fs.existsSync(pigzPath)) {
                 throw new Error(`pigz.exe not found at expected location: ${pigzPath}`);
             }
 
+            core.info(`Checking for unpigz.exe in: ${pigzDir}`);
             const unpigzPath = path.join(pigzDir, 'unpigz.exe');
 
             if (!fs.existsSync(unpigzPath)) {
                 throw new Error(`unpigz.exe not found at expected location: ${unpigzPath}`);
             }
 
+            core.info('Adding pigz to the tool cache...');
+
             // add dir to tool cache
-            await tc.cacheDir(
+            const toolPath = await tc.cacheDir(
                 pigzDir,
                 'pigz',
                 'latest'
             );
 
+            core.info(`pigz added to tool cache at: ${toolPath}`);
+            core.addPath(pigzDir);
         } else {
             throw new Error(`Unsupported platform: ${platform}`);
         }
 
         core.info('pigz installation attempt complete.');
-    } catch (err: any) {
-        core.warning(`Failed to install pigz: ${err.message}`);
+    } catch (e: any) {
+        core.warning(`Failed to install pigz: ${e.message}`);
     }
 }
 
