@@ -150,6 +150,32 @@ function getWorkingDirectory(): string {
     )
 }
 
+async function createPigzWrapper(
+    pigzExecutable: string,
+    args: string[]
+): Promise<string> {
+    const tempDir = await fs.promises.mkdtemp(
+        path.join(os.tmpdir(), 'pigz-wrapper-')
+    )
+
+    if (IS_WINDOWS) {
+        const wrapperPath = path.join(tempDir, 'pigz-wrapper.cmd')
+        const content = `@echo off\r\n"${pigzExecutable}" ${args.join(' ')} %*\r\n`
+        await fs.promises.writeFile(wrapperPath, content, {
+            encoding: 'utf8'
+        })
+        return wrapperPath
+    }
+
+    const wrapperPath = path.join(tempDir, 'pigz-wrapper.sh')
+    const script = `#!/bin/sh\n"${pigzExecutable}" ${args.join(' ')} "$@"\n`
+    await fs.promises.writeFile(wrapperPath, script, {
+        encoding: 'utf8'
+    })
+    await fs.promises.chmod(wrapperPath, 0o755)
+    return wrapperPath
+}
+
 /**
  * Create a tar archive using pigz for gzip compression when available.
  * Falls back to the default @actions/cache tar implementation otherwise.
@@ -188,9 +214,18 @@ export async function createTarWithPigz(
 
     const workingDirectory = getWorkingDirectory()
 
-    const pigz = IS_WINDOWS ? pigzPath : 'pigz'
-    const threadCount = Math.max(os.cpus().length, 1)
-    const pigzProgram = `"\"${pigz}\" -1 -p ${threadCount}\"`
+    const pigz = IS_WINDOWS ? pigzPath : 'pigz';
+    const threadCount = Math.max(os.cpus().length, 1);
+    const pigzWrapperPath = await createPigzWrapper(pigz, [
+        '-d',
+        '-p',
+        threadCount.toString()
+    ]);
+    const pigzProgramPath = pigzWrapperPath.replace(
+        new RegExp(`\\${path.sep}`, 'g'),
+        '/'
+    );
+    const pigzProgram = `"${pigzProgramPath}"`;
     const tarResolution = await resolveTar()
 
     // Build tar command string using pigz as the compressor
@@ -253,9 +288,18 @@ export async function extractTarWithPigz(
 
     core.info('Using pigz for gzip decompression when extracting cache tarball.');
 
-    const pigz = IS_WINDOWS ? pigzPath : 'pigz';
-    const threadCount = Math.max(os.cpus().length, 1);
-    const pigzProgram = `"\"${pigz}\" -d -p ${threadCount}\"`;
+    const pigz = IS_WINDOWS ? pigzPath : 'pigz'
+    const threadCount = Math.max(os.cpus().length, 1)
+    const pigzWrapperPath = await createPigzWrapper(pigz, [
+        '-1',
+        '-p',
+        threadCount.toString()
+    ])
+    const pigzProgramPath = pigzWrapperPath.replace(
+        new RegExp(`\\${path.sep}`, 'g'),
+        '/'
+    )
+    const pigzProgram = `"${pigzProgramPath}"`
     const tarResolution = await resolveTar();
     const workingDirectory = getWorkingDirectory();
     await io.mkdirP(workingDirectory);

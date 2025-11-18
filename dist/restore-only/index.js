@@ -75165,6 +75165,26 @@ function getWorkingDirectory() {
     var _a;
     return ((_a = process.env['GITHUB_WORKSPACE']) !== null && _a !== void 0 ? _a : process.cwd()).replace(new RegExp(`\\${path.sep}`, 'g'), '/');
 }
+function createPigzWrapper(pigzExecutable, args) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const tempDir = yield fs_2.default.promises.mkdtemp(path.join(os.tmpdir(), 'pigz-wrapper-'));
+        if (IS_WINDOWS) {
+            const wrapperPath = path.join(tempDir, 'pigz-wrapper.cmd');
+            const content = `@echo off\r\n"${pigzExecutable}" ${args.join(' ')} %*\r\n`;
+            yield fs_2.default.promises.writeFile(wrapperPath, content, {
+                encoding: 'utf8'
+            });
+            return wrapperPath;
+        }
+        const wrapperPath = path.join(tempDir, 'pigz-wrapper.sh');
+        const script = `#!/bin/sh\n"${pigzExecutable}" ${args.join(' ')} "$@"\n`;
+        yield fs_2.default.promises.writeFile(wrapperPath, script, {
+            encoding: 'utf8'
+        });
+        yield fs_2.default.promises.chmod(wrapperPath, 0o755);
+        return wrapperPath;
+    });
+}
 /**
  * Create a tar archive using pigz for gzip compression when available.
  * Falls back to the default @actions/cache tar implementation otherwise.
@@ -75192,7 +75212,13 @@ function createTarWithPigz(archiveFolder, cachePaths, compressionMethod) {
         const workingDirectory = getWorkingDirectory();
         const pigz = IS_WINDOWS ? pigzPath : 'pigz';
         const threadCount = Math.max(os.cpus().length, 1);
-        const pigzProgram = `"\"${pigz}\" -1 -p ${threadCount}\"`;
+        const pigzWrapperPath = yield createPigzWrapper(pigz, [
+            '-d',
+            '-p',
+            threadCount.toString()
+        ]);
+        const pigzProgramPath = pigzWrapperPath.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
+        const pigzProgram = `"${pigzProgramPath}"`;
         const tarResolution = yield resolveTar();
         // Build tar command string using pigz as the compressor
         // Equivalent to:
@@ -75247,7 +75273,13 @@ function extractTarWithPigz(archivePath, compressionMethod) {
         core.info('Using pigz for gzip decompression when extracting cache tarball.');
         const pigz = IS_WINDOWS ? pigzPath : 'pigz';
         const threadCount = Math.max(os.cpus().length, 1);
-        const pigzProgram = `"\"${pigz}\" -d -p ${threadCount}\"`;
+        const pigzWrapperPath = yield createPigzWrapper(pigz, [
+            '-1',
+            '-p',
+            threadCount.toString()
+        ]);
+        const pigzProgramPath = pigzWrapperPath.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
+        const pigzProgram = `"${pigzProgramPath}"`;
         const tarResolution = yield resolveTar();
         const workingDirectory = getWorkingDirectory();
         yield io.mkdirP(workingDirectory);
