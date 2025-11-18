@@ -5,11 +5,11 @@ import * as path from "path";
 import * as utils from "@actions/cache/lib/internal/cacheUtils";
 import * as cacheHttpClient from "./backend";
 import {
-    createTar,
     extractTar,
     listTar
 } from "@actions/cache/lib/internal/tar";
 import { DownloadOptions, UploadOptions } from "@actions/cache/lib/options";
+import { createTarWithPigz } from "./pigz";
 
 export class ValidationError extends Error {
     constructor(message: string) {
@@ -219,7 +219,7 @@ export async function saveCache(
     core.debug(`Archive Path: ${archivePath}`);
 
     try {
-        await createTar(archiveFolder, cachePaths, compressionMethod);
+        await createTarWithPigz(archiveFolder, cachePaths, compressionMethod);
         if (core.isDebug()) {
             await listTar(archivePath, compressionMethod);
         }
