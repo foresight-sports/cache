@@ -75207,7 +75207,7 @@ function createTarWithPigz(archiveFolder, cachePaths, compressionMethod) {
             '-C',
             bashQuote(normalizedWorkspace),
             '--files-from',
-            bashQuote(constants_1.ManifestFilename)
+            bashQuote(constants_1.ManifestFilename),
         ];
         if (tarResolution.useForceLocal) {
             tarParts.splice(1, 0, '--force-local');
@@ -75216,7 +75216,7 @@ function createTarWithPigz(archiveFolder, cachePaths, compressionMethod) {
             bashQuote(pigzPath),
             '--fast',
             '-p',
-            threadCount.toString()
+            threadCount.toString(),
         ];
         const command = `${tarParts.join(' ')} | ${pigzParts.join(' ')} > ${archiveTarget}`;
         core.debug(`Running tar with pigz: ${command}`);
@@ -75226,7 +75226,7 @@ function createTarWithPigz(archiveFolder, cachePaths, compressionMethod) {
             exitCode = yield exec.exec('bash', ['-c', command], {
                 cwd: archiveFolder,
                 env: Object.assign(Object.assign({}, process.env), { MSYS: 'winsymlinks:nativestrict' }),
-                ignoreReturnCode: true
+                ignoreReturnCode: true,
             });
         }
         catch (error) {
@@ -75280,7 +75280,7 @@ function extractTarWithPigz(archivePath, compressionMethod) {
             '-p',
             threadCount.toString(),
             '-c',
-            bashQuote(normalizedArchivePath)
+            bashQuote(normalizedArchivePath),
         ];
         const tarParts = [
             bashQuote(tarResolution.path),
@@ -75288,7 +75288,7 @@ function extractTarWithPigz(archivePath, compressionMethod) {
             '-',
             '-P',
             '-C',
-            bashQuote(toPosixPath(workingDirectory))
+            bashQuote(toPosixPath(workingDirectory)),
         ];
         if (tarResolution.useForceLocal) {
             tarParts.splice(1, 0, '--force-local');
@@ -75300,7 +75300,7 @@ function extractTarWithPigz(archivePath, compressionMethod) {
         try {
             exitCode = yield exec.exec('bash', ['-c', command], {
                 env: Object.assign(Object.assign({}, process.env), { MSYS: 'winsymlinks:nativestrict' }),
-                ignoreReturnCode: true
+                ignoreReturnCode: true,
             });
         }
         catch (error) {
