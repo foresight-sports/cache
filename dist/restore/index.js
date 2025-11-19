@@ -75244,9 +75244,11 @@ function createTarWithPigz(archiveFolder, cachePaths, compressionMethod) {
         const cacheFileNameForTar = cacheFileName.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
         const workingDirectory = getWorkingDirectory();
         const threadCount = Math.max(os.cpus().length, 1);
-        const pigzWrapperPath = yield createProgramWrapper(pigzPath, ['--fast', '-p', threadCount.toString()], 'pigz');
+        const pigzWrapperPath = yield createProgramWrapper(pigzPath, ['--fast', '-v', '-p', threadCount.toString()], 'pigz');
         const compressProgramPath = pigzWrapperPath.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
         const pigzProgram = `"${compressProgramPath}"`;
+        core.info(`pigz threads: ${threadCount}`);
+        core.info(`pigz command (via wrapper): ${pigzProgram}`);
         const tarResolution = yield resolveTar();
         // Build tar command string using pigz as the compressor
         // Equivalent to:
@@ -75299,9 +75301,11 @@ function extractTarWithPigz(archivePath, compressionMethod) {
         }
         core.info('Using unpigz for gzip decompression when extracting cache tarball.');
         const threadCount = Math.max(os.cpus().length, 1);
-        const unpigzWrapperPath = yield createProgramWrapper(unpigzPath, ['-p', threadCount.toString()], 'unpigz');
+        const unpigzWrapperPath = yield createProgramWrapper(unpigzPath, ['-v', '-p', threadCount.toString()], 'unpigz');
         const decompressorProgramPath = unpigzWrapperPath.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
         const decompressorProgram = `"${decompressorProgramPath}"`;
+        core.info(`unpigz threads: ${threadCount}`);
+        core.info(`unpigz command (via wrapper): ${decompressorProgram}`);
         const tarResolution = yield resolveTar();
         const workingDirectory = getWorkingDirectory();
         yield io.mkdirP(workingDirectory);

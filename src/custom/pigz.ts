@@ -249,7 +249,7 @@ export async function createTarWithPigz(
     const threadCount = Math.max(os.cpus().length, 1)
     const pigzWrapperPath = await createProgramWrapper(
         pigzPath,
-        ['--fast', '-p', threadCount.toString()],
+        ['--fast', '-v', '-p', threadCount.toString()],
         'pigz'
     )
     const compressProgramPath = pigzWrapperPath.replace(
@@ -257,6 +257,8 @@ export async function createTarWithPigz(
         '/'
     )
     const pigzProgram = `"${compressProgramPath}"`
+    core.info(`pigz threads: ${threadCount}`)
+    core.info(`pigz command (via wrapper): ${pigzProgram}`)
     const tarResolution = await resolveTar()
 
     // Build tar command string using pigz as the compressor
@@ -321,14 +323,16 @@ export async function extractTarWithPigz(
     const threadCount = Math.max(os.cpus().length, 1)
     const unpigzWrapperPath = await createProgramWrapper(
         unpigzPath,
-        ['-p', threadCount.toString()],
+        ['-v', '-p', threadCount.toString()],
         'unpigz'
     );
     const decompressorProgramPath = unpigzWrapperPath.replace(
         new RegExp(`\\${path.sep}`, 'g'),
         '/'
     );
-    const decompressorProgram = `"${decompressorProgramPath}"`;
+    const decompressorProgram = `"${decompressorProgramPath}"`
+    core.info(`unpigz threads: ${threadCount}`)
+    core.info(`unpigz command (via wrapper): ${decompressorProgram}`)
     const tarResolution = await resolveTar();
     const workingDirectory = getWorkingDirectory();
     await io.mkdirP(workingDirectory);
