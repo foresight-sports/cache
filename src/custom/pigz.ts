@@ -269,6 +269,7 @@ export async function createTarWithPigz(
         '--posix',
         '-cf',
         cacheFileNameForTar,
+        '-v',
         '--exclude',
         cacheFileNameForTar,
         '-P',
@@ -330,7 +331,7 @@ export async function extractTarWithPigz(
         new RegExp(`\\${path.sep}`, 'g'),
         '/'
     );
-    const decompressorProgram = `"${decompressorProgramPath}"`
+    const decompressorProgram = `"${decompressorProgramPath}"`;
     core.info(`unpigz threads: ${threadCount}`)
     core.info(`unpigz command (via wrapper): ${decompressorProgram}`)
     const tarResolution = await resolveTar();
@@ -345,6 +346,7 @@ export async function extractTarWithPigz(
         `"${tarResolution.path}"`,
         '-xf',
         normalizedArchivePath,
+        '-v',
         '-P',
         '-C',
         workingDirectory,
