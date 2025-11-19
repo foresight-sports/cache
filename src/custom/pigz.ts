@@ -21,11 +21,6 @@ interface TarResolution {
     useForceLocal: boolean
 }
 
-interface DecompressorBinary {
-    executable: string
-    requiresDecompressFlag: boolean
-}
-
 /**
  * Try to find pigz in PATH
  */
@@ -144,11 +139,11 @@ export async function ensurePigz(): Promise<string | null> {
     return null
 }
 
-async function ensureUnpigz(): Promise<DecompressorBinary | null> {
+async function ensureUnpigz(): Promise<string | null> {
     let unpigzPath = await findUnpigz()
     if (unpigzPath) {
         core.info(`unpigz found at: ${unpigzPath}`)
-        return { executable: unpigzPath, requiresDecompressFlag: false }
+        return unpigzPath
     }
 
     core.info('unpigz not found — attempting installation…')
@@ -157,17 +152,10 @@ async function ensureUnpigz(): Promise<DecompressorBinary | null> {
     unpigzPath = await findUnpigz()
     if (unpigzPath) {
         core.info(`unpigz successfully installed at: ${unpigzPath}`)
-        return { executable: unpigzPath, requiresDecompressFlag: false }
+        return unpigzPath
     }
 
-    core.info('unpigz is not available; attempting to use pigz -d instead.')
-    const pigzPath = await ensurePigz()
-    if (pigzPath) {
-        core.info('pigz will be used for decompression with the -d flag.')
-        return { executable: pigzPath, requiresDecompressFlag: true }
-    }
-
-    core.warning('Neither unpigz nor pigz are available; falling back to tar/gzip.')
+    core.warning('unpigz could not be installed; falling back to tar/gzip.')
     return null
 }
 
@@ -320,37 +308,33 @@ export async function extractTarWithPigz(
         return defaultExtractTar(archivePath, compressionMethod);
     }
 
-    const decompressor = await ensureUnpigz()
-    if (!decompressor) {
-        core.warning('pigz/unpigz is not available; delegating to default extractTar.')
+    const unpigzPath = await ensureUnpigz()
+    if (!unpigzPath) {
+        core.warning('unpigz is not available; delegating to default extractTar.')
         return defaultExtractTar(archivePath, compressionMethod)
     }
 
-    core.info('Using pigz/unpigz for gzip decompression when extracting cache tarball.')
+    core.info('Using unpigz for gzip decompression when extracting cache tarball.')
 
     const threadCount = Math.max(os.cpus().length, 1)
-    const decompressorArgs = decompressor.requiresDecompressFlag
-        ? ['-d', '-p', threadCount.toString()]
-        : ['-p', threadCount.toString()]
-    const decompressorLabel = decompressor.requiresDecompressFlag ? 'pigz' : 'unpigz'
-    const decompressorWrapperPath = await createProgramWrapper(
-        decompressor.executable,
-        decompressorArgs,
-        decompressorLabel
-    )
-    const decompressorProgramPath = decompressorWrapperPath.replace(
+    const unpigzWrapperPath = await createProgramWrapper(
+        unpigzPath,
+        ['-p', threadCount.toString()],
+        'unpigz'
+    );
+    const decompressorProgramPath = unpigzWrapperPath.replace(
         new RegExp(`\\${path.sep}`, 'g'),
         '/'
-    )
-    const decompressorProgram = `"${decompressorProgramPath}"`
+    );
+    const decompressorProgram = `"${decompressorProgramPath}"`;
     const tarResolution = await resolveTar();
     const workingDirectory = getWorkingDirectory();
     await io.mkdirP(workingDirectory);
     const normalizedArchivePath = archivePath.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
 
-    // Build tar command string using pigz as the decompressor
+    // Build tar command string using unpigz as the decompressor
     // Equivalent to:
-    //   tar -xf <archive> -P -C <workspace> --use-compress-program "pigz -d ..."
+    //   tar -xf <archive> -P -C <workspace> --use-compress-program "unpigz -p ..."
     const parts: string[] = [
         `"${tarResolution.path}"`,
         '-xf',
@@ -367,7 +351,7 @@ export async function extractTarWithPigz(
     }
 
     const command = parts.join(' ');
-    core.debug(`Running tar with pigz: ${command}`);
+    core.debug(`Running tar with unpigz: ${command}`);
 
     try {
         await exec.exec(command, undefined, {
@@ -377,8 +361,8 @@ export async function extractTarWithPigz(
             }
         });
     } catch (error: any) {
-        // If anything goes wrong with pigz/tar, fall back to the default implementation
-        core.warning(`tar with pigz failed (${error?.message}); falling back to default extractTar.`);
+        // If anything goes wrong with unpigz/tar, fall back to the default implementation
+        core.warning(`tar with unpigz failed (${error?.message}); falling back to default extractTar.`);
         return defaultExtractTar(archivePath, compressionMethod);
     }
 }
