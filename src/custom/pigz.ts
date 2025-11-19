@@ -184,8 +184,11 @@ async function createProgramWrapper(
     args: string[],
     label: string
 ): Promise<string> {
+    const runnerTemp = process.env['RUNNER_TEMP']?.trim()
+    const baseTempDir = runnerTemp && runnerTemp.length > 0 ? runnerTemp : os.tmpdir()
+    await io.mkdirP(baseTempDir)
     const tempDir = await fs.promises.mkdtemp(
-        path.join(os.tmpdir(), `${label}-wrapper-`)
+        path.join(baseTempDir, `${label}-wrapper-`)
     )
 
     if (IS_WINDOWS) {
@@ -241,13 +244,12 @@ export async function createTarWithPigz(
 
     // Normalize to forward slashes for tar
     const cacheFileNameForTar = cacheFileName.replace(new RegExp(`\\${path.sep}`, 'g'), '/')
-
     const workingDirectory = getWorkingDirectory()
 
     const threadCount = Math.max(os.cpus().length, 1)
     const pigzWrapperPath = await createProgramWrapper(
         pigzPath,
-        ['-1', '-p', threadCount.toString()],
+        ['--fast', '-p', threadCount.toString()],
         'pigz'
     )
     const compressProgramPath = pigzWrapperPath.replace(

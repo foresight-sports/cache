@@ -75195,8 +75195,12 @@ function getWorkingDirectory() {
     return ((_a = process.env['GITHUB_WORKSPACE']) !== null && _a !== void 0 ? _a : process.cwd()).replace(new RegExp(`\\${path.sep}`, 'g'), '/');
 }
 function createProgramWrapper(executable, args, label) {
+    var _a;
     return __awaiter(this, void 0, void 0, function* () {
-        const tempDir = yield fs_2.default.promises.mkdtemp(path.join(os.tmpdir(), `${label}-wrapper-`));
+        const runnerTemp = (_a = process.env['RUNNER_TEMP']) === null || _a === void 0 ? void 0 : _a.trim();
+        const baseTempDir = runnerTemp && runnerTemp.length > 0 ? runnerTemp : os.tmpdir();
+        yield io.mkdirP(baseTempDir);
+        const tempDir = yield fs_2.default.promises.mkdtemp(path.join(baseTempDir, `${label}-wrapper-`));
         if (IS_WINDOWS) {
             const wrapperPath = path.join(tempDir, `${label}-wrapper.cmd`);
             const content = `@echo off\r\n"${executable}" ${args.join(' ')} %*\r\n`;
@@ -75240,7 +75244,7 @@ function createTarWithPigz(archiveFolder, cachePaths, compressionMethod) {
         const cacheFileNameForTar = cacheFileName.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
         const workingDirectory = getWorkingDirectory();
         const threadCount = Math.max(os.cpus().length, 1);
-        const pigzWrapperPath = yield createProgramWrapper(pigzPath, ['-1', '-p', threadCount.toString()], 'pigz');
+        const pigzWrapperPath = yield createProgramWrapper(pigzPath, ['--fast', '-p', threadCount.toString()], 'pigz');
         const compressProgramPath = pigzWrapperPath.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
         const pigzProgram = `"${compressProgramPath}"`;
         const tarResolution = yield resolveTar();
