@@ -75065,6 +75065,17 @@ function findPigz() {
         }
     });
 }
+function findUnpigz() {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const found = yield io.which('unpigz', false);
+            return found || null;
+        }
+        catch (_a) {
+            return null;
+        }
+    });
+}
 /**
  * OS-specific installation logic
  */
@@ -75148,6 +75159,30 @@ function ensurePigz() {
     });
 }
 exports.ensurePigz = ensurePigz;
+function ensureUnpigz() {
+    return __awaiter(this, void 0, void 0, function* () {
+        let unpigzPath = yield findUnpigz();
+        if (unpigzPath) {
+            core.info(`unpigz found at: ${unpigzPath}`);
+            return { executable: unpigzPath, requiresDecompressFlag: false };
+        }
+        core.info('unpigz not found — attempting installation…');
+        yield installPigz();
+        unpigzPath = yield findUnpigz();
+        if (unpigzPath) {
+            core.info(`unpigz successfully installed at: ${unpigzPath}`);
+            return { executable: unpigzPath, requiresDecompressFlag: false };
+        }
+        core.info('unpigz is not available; attempting to use pigz -d instead.');
+        const pigzPath = yield ensurePigz();
+        if (pigzPath) {
+            core.info('pigz will be used for decompression with the -d flag.');
+            return { executable: pigzPath, requiresDecompressFlag: true };
+        }
+        core.warning('Neither unpigz nor pigz are available; falling back to tar/gzip.');
+        return null;
+    });
+}
 function resolveTar() {
     return __awaiter(this, void 0, void 0, function* () {
         if (IS_WINDOWS) {
@@ -75165,19 +75200,19 @@ function getWorkingDirectory() {
     var _a;
     return ((_a = process.env['GITHUB_WORKSPACE']) !== null && _a !== void 0 ? _a : process.cwd()).replace(new RegExp(`\\${path.sep}`, 'g'), '/');
 }
-function createPigzWrapper(pigzExecutable, args) {
+function createProgramWrapper(executable, args, label) {
     return __awaiter(this, void 0, void 0, function* () {
-        const tempDir = yield fs_2.default.promises.mkdtemp(path.join(os.tmpdir(), 'pigz-wrapper-'));
+        const tempDir = yield fs_2.default.promises.mkdtemp(path.join(os.tmpdir(), `${label}-wrapper-`));
         if (IS_WINDOWS) {
-            const wrapperPath = path.join(tempDir, 'pigz-wrapper.cmd');
-            const content = `@echo off\r\n"${pigzExecutable}" ${args.join(' ')} %*\r\n`;
+            const wrapperPath = path.join(tempDir, `${label}-wrapper.cmd`);
+            const content = `@echo off\r\n"${executable}" ${args.join(' ')} %*\r\n`;
             yield fs_2.default.promises.writeFile(wrapperPath, content, {
                 encoding: 'utf8'
             });
             return wrapperPath;
         }
-        const wrapperPath = path.join(tempDir, 'pigz-wrapper.sh');
-        const script = `#!/bin/sh\n"${pigzExecutable}" ${args.join(' ')} "$@"\n`;
+        const wrapperPath = path.join(tempDir, `${label}-wrapper.sh`);
+        const script = `#!/bin/sh\n"${executable}" ${args.join(' ')} "$@"\n`;
         yield fs_2.default.promises.writeFile(wrapperPath, script, {
             encoding: 'utf8'
         });
@@ -75210,15 +75245,10 @@ function createTarWithPigz(archiveFolder, cachePaths, compressionMethod) {
         // Normalize to forward slashes for tar
         const cacheFileNameForTar = cacheFileName.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
         const workingDirectory = getWorkingDirectory();
-        const pigz = IS_WINDOWS ? pigzPath : 'pigz';
         const threadCount = Math.max(os.cpus().length, 1);
-        const pigzWrapperPath = yield createPigzWrapper(pigz, [
-            '-d',
-            '-p',
-            threadCount.toString()
-        ]);
-        const pigzProgramPath = pigzWrapperPath.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
-        const pigzProgram = `"${pigzProgramPath}"`;
+        const pigzWrapperPath = yield createProgramWrapper(pigzPath, ['-1', '-p', threadCount.toString()], 'pigz');
+        const compressProgramPath = pigzWrapperPath.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
+        const pigzProgram = `"${compressProgramPath}"`;
         const tarResolution = yield resolveTar();
         // Build tar command string using pigz as the compressor
         // Equivalent to:
@@ -75264,22 +75294,20 @@ function extractTarWithPigz(archivePath, compressionMethod) {
             core.warning('Compression method is not gzip; delegating to default extractTar.');
             return (0, tar_1.extractTar)(archivePath, compressionMethod);
         }
-        // Ensure pigz is installed. If not, just use the default tar implementation.
-        const pigzPath = yield ensurePigz();
-        if (!pigzPath) {
-            core.warning('pigz is not available; delegating to default extractTar.');
+        const decompressor = yield ensureUnpigz();
+        if (!decompressor) {
+            core.warning('pigz/unpigz is not available; delegating to default extractTar.');
             return (0, tar_1.extractTar)(archivePath, compressionMethod);
         }
-        core.info('Using pigz for gzip decompression when extracting cache tarball.');
-        const pigz = IS_WINDOWS ? pigzPath : 'pigz';
+        core.info('Using pigz/unpigz for gzip decompression when extracting cache tarball.');
         const threadCount = Math.max(os.cpus().length, 1);
-        const pigzWrapperPath = yield createPigzWrapper(pigz, [
-            '-1',
-            '-p',
-            threadCount.toString()
-        ]);
-        const pigzProgramPath = pigzWrapperPath.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
-        const pigzProgram = `"${pigzProgramPath}"`;
+        const decompressorArgs = decompressor.requiresDecompressFlag
+            ? ['-d', '-p', threadCount.toString()]
+            : ['-p', threadCount.toString()];
+        const decompressorLabel = decompressor.requiresDecompressFlag ? 'pigz' : 'unpigz';
+        const decompressorWrapperPath = yield createProgramWrapper(decompressor.executable, decompressorArgs, decompressorLabel);
+        const decompressorProgramPath = decompressorWrapperPath.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
+        const decompressorProgram = `"${decompressorProgramPath}"`;
         const tarResolution = yield resolveTar();
         const workingDirectory = getWorkingDirectory();
         yield io.mkdirP(workingDirectory);
@@ -75295,7 +75323,7 @@ function extractTarWithPigz(archivePath, compressionMethod) {
             '-C',
             workingDirectory,
             '--use-compress-program',
-            pigzProgram
+            decompressorProgram
         ];
         if (tarResolution.useForceLocal) {
             parts.push('--force-local');

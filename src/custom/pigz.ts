@@ -21,12 +21,26 @@ interface TarResolution {
     useForceLocal: boolean
 }
 
+interface DecompressorBinary {
+    executable: string
+    requiresDecompressFlag: boolean
+}
+
 /**
  * Try to find pigz in PATH
  */
 async function findPigz(): Promise<string | null> {
     try {
         const found = await io.which('pigz', false);
+        return found || null;
+    } catch {
+        return null;
+    }
+}
+
+async function findUnpigz(): Promise<string | null> {
+    try {
+        const found = await io.which('unpigz', false);
         return found || null;
     } catch {
         return null;
@@ -130,6 +144,33 @@ export async function ensurePigz(): Promise<string | null> {
     return null
 }
 
+async function ensureUnpigz(): Promise<DecompressorBinary | null> {
+    let unpigzPath = await findUnpigz()
+    if (unpigzPath) {
+        core.info(`unpigz found at: ${unpigzPath}`)
+        return { executable: unpigzPath, requiresDecompressFlag: false }
+    }
+
+    core.info('unpigz not found — attempting installation…')
+    await installPigz()
+
+    unpigzPath = await findUnpigz()
+    if (unpigzPath) {
+        core.info(`unpigz successfully installed at: ${unpigzPath}`)
+        return { executable: unpigzPath, requiresDecompressFlag: false }
+    }
+
+    core.info('unpigz is not available; attempting to use pigz -d instead.')
+    const pigzPath = await ensurePigz()
+    if (pigzPath) {
+        core.info('pigz will be used for decompression with the -d flag.')
+        return { executable: pigzPath, requiresDecompressFlag: true }
+    }
+
+    core.warning('Neither unpigz nor pigz are available; falling back to tar/gzip.')
+    return null
+}
+
 async function resolveTar(): Promise<TarResolution> {
     if (IS_WINDOWS) {
         const gnuTar = await cacheUtils.getGnuTarPathOnWindows()
@@ -150,25 +191,26 @@ function getWorkingDirectory(): string {
     )
 }
 
-async function createPigzWrapper(
-    pigzExecutable: string,
-    args: string[]
+async function createProgramWrapper(
+    executable: string,
+    args: string[],
+    label: string
 ): Promise<string> {
     const tempDir = await fs.promises.mkdtemp(
-        path.join(os.tmpdir(), 'pigz-wrapper-')
+        path.join(os.tmpdir(), `${label}-wrapper-`)
     )
 
     if (IS_WINDOWS) {
-        const wrapperPath = path.join(tempDir, 'pigz-wrapper.cmd')
-        const content = `@echo off\r\n"${pigzExecutable}" ${args.join(' ')} %*\r\n`
+        const wrapperPath = path.join(tempDir, `${label}-wrapper.cmd`)
+        const content = `@echo off\r\n"${executable}" ${args.join(' ')} %*\r\n`
         await fs.promises.writeFile(wrapperPath, content, {
             encoding: 'utf8'
         })
         return wrapperPath
     }
 
-    const wrapperPath = path.join(tempDir, 'pigz-wrapper.sh')
-    const script = `#!/bin/sh\n"${pigzExecutable}" ${args.join(' ')} "$@"\n`
+    const wrapperPath = path.join(tempDir, `${label}-wrapper.sh`)
+    const script = `#!/bin/sh\n"${executable}" ${args.join(' ')} "$@"\n`
     await fs.promises.writeFile(wrapperPath, script, {
         encoding: 'utf8'
     })
@@ -214,18 +256,17 @@ export async function createTarWithPigz(
 
     const workingDirectory = getWorkingDirectory()
 
-    const pigz = IS_WINDOWS ? pigzPath : 'pigz';
-    const threadCount = Math.max(os.cpus().length, 1);
-    const pigzWrapperPath = await createPigzWrapper(pigz, [
-        '-d',
-        '-p',
-        threadCount.toString()
-    ]);
-    const pigzProgramPath = pigzWrapperPath.replace(
+    const threadCount = Math.max(os.cpus().length, 1)
+    const pigzWrapperPath = await createProgramWrapper(
+        pigzPath,
+        ['-1', '-p', threadCount.toString()],
+        'pigz'
+    )
+    const compressProgramPath = pigzWrapperPath.replace(
         new RegExp(`\\${path.sep}`, 'g'),
         '/'
-    );
-    const pigzProgram = `"${pigzProgramPath}"`;
+    )
+    const pigzProgram = `"${compressProgramPath}"`
     const tarResolution = await resolveTar()
 
     // Build tar command string using pigz as the compressor
@@ -279,27 +320,29 @@ export async function extractTarWithPigz(
         return defaultExtractTar(archivePath, compressionMethod);
     }
 
-    // Ensure pigz is installed. If not, just use the default tar implementation.
-    const pigzPath = await ensurePigz();
-    if (!pigzPath) {
-        core.warning('pigz is not available; delegating to default extractTar.');
-        return defaultExtractTar(archivePath, compressionMethod);
+    const decompressor = await ensureUnpigz()
+    if (!decompressor) {
+        core.warning('pigz/unpigz is not available; delegating to default extractTar.')
+        return defaultExtractTar(archivePath, compressionMethod)
     }
 
-    core.info('Using pigz for gzip decompression when extracting cache tarball.');
+    core.info('Using pigz/unpigz for gzip decompression when extracting cache tarball.')
 
-    const pigz = IS_WINDOWS ? pigzPath : 'pigz'
     const threadCount = Math.max(os.cpus().length, 1)
-    const pigzWrapperPath = await createPigzWrapper(pigz, [
-        '-1',
-        '-p',
-        threadCount.toString()
-    ])
-    const pigzProgramPath = pigzWrapperPath.replace(
+    const decompressorArgs = decompressor.requiresDecompressFlag
+        ? ['-d', '-p', threadCount.toString()]
+        : ['-p', threadCount.toString()]
+    const decompressorLabel = decompressor.requiresDecompressFlag ? 'pigz' : 'unpigz'
+    const decompressorWrapperPath = await createProgramWrapper(
+        decompressor.executable,
+        decompressorArgs,
+        decompressorLabel
+    )
+    const decompressorProgramPath = decompressorWrapperPath.replace(
         new RegExp(`\\${path.sep}`, 'g'),
         '/'
     )
-    const pigzProgram = `"${pigzProgramPath}"`
+    const decompressorProgram = `"${decompressorProgramPath}"`
     const tarResolution = await resolveTar();
     const workingDirectory = getWorkingDirectory();
     await io.mkdirP(workingDirectory);
@@ -316,7 +359,7 @@ export async function extractTarWithPigz(
         '-C',
         workingDirectory,
         '--use-compress-program',
-        pigzProgram
+        decompressorProgram
     ];
 
     if (tarResolution.useForceLocal) {
