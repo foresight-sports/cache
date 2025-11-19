@@ -75051,6 +75051,10 @@ const fs_1 = __nccwpck_require__(79896);
 const path = __importStar(__nccwpck_require__(16928));
 const fs_2 = __importDefault(__nccwpck_require__(79896));
 const IS_WINDOWS = process.platform === 'win32';
+const BYTES_PER_MEGABYTE = 1024 * 1024;
+function toPosixPath(target) {
+    return target.replace(/\\/g, '/');
+}
 /**
  * Try to find pigz in PATH
  */
@@ -75194,30 +75198,6 @@ function getWorkingDirectory() {
     var _a;
     return ((_a = process.env['GITHUB_WORKSPACE']) !== null && _a !== void 0 ? _a : process.cwd()).replace(new RegExp(`\\${path.sep}`, 'g'), '/');
 }
-function createProgramWrapper(executable, args, label) {
-    var _a;
-    return __awaiter(this, void 0, void 0, function* () {
-        const runnerTemp = (_a = process.env['RUNNER_TEMP']) === null || _a === void 0 ? void 0 : _a.trim();
-        const baseTempDir = runnerTemp && runnerTemp.length > 0 ? runnerTemp : os.tmpdir();
-        yield io.mkdirP(baseTempDir);
-        const tempDir = yield fs_2.default.promises.mkdtemp(path.join(baseTempDir, `${label}-wrapper-`));
-        if (IS_WINDOWS) {
-            const wrapperPath = path.join(tempDir, `${label}-wrapper.cmd`);
-            const content = `@echo off\r\n"${executable}" ${args.join(' ')} %*\r\n`;
-            yield fs_2.default.promises.writeFile(wrapperPath, content, {
-                encoding: 'utf8'
-            });
-            return wrapperPath;
-        }
-        const wrapperPath = path.join(tempDir, `${label}-wrapper.sh`);
-        const script = `#!/bin/sh\n"${executable}" ${args.join(' ')} "$@"\n`;
-        yield fs_2.default.promises.writeFile(wrapperPath, script, {
-            encoding: 'utf8'
-        });
-        yield fs_2.default.promises.chmod(wrapperPath, 0o755);
-        return wrapperPath;
-    });
-}
 /**
  * Create a tar archive using pigz for gzip compression when available.
  * Falls back to the default @actions/cache tar implementation otherwise.
@@ -75243,52 +75223,70 @@ function createTarWithPigz(archiveFolder, cachePaths, compressionMethod) {
         // Normalize to forward slashes for tar
         const cacheFileNameForTar = cacheFileName.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
         const workingDirectory = getWorkingDirectory();
+        const totalBytes = yield calculateCachePathsSize(cachePaths, workingDirectory);
         const threadCount = Math.max(os.cpus().length, 1);
-        const pigzWrapperPath = yield createProgramWrapper(pigzPath, ['--fast', '-v', '-p', threadCount.toString()], 'pigz');
-        const compressProgramPath = pigzWrapperPath.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
-        const pigzProgram = `"${compressProgramPath}"`;
         core.info(`pigz threads: ${threadCount}`);
-        core.info(`pigz command (via wrapper): ${pigzProgram}`);
+        core.info(`Compressing cache inputs to '${cacheFileNameForTar}' using ${threadCount} threads (pigz=${pigzPath}).`);
         const tarResolution = yield resolveTar();
-        // Build tar command string using pigz as the compressor
-        // Equivalent to:
-        //   tar --posix -cf <archive> --exclude <archive> -P -C <workspace> --files-from manifest.txt --use-compress-program pigz
-        const parts = [
-            `"${tarResolution.path}"`,
+        const normalizedWorkspace = toPosixPath(workingDirectory);
+        const archiveTarget = bashQuote(cacheFileNameForTar);
+        const tarParts = [
+            bashQuote(tarResolution.path),
             '--posix',
             '-cf',
-            cacheFileNameForTar,
-            '-v',
+            '-',
             '--exclude',
-            cacheFileNameForTar,
+            archiveTarget,
             '-P',
             '-C',
-            workingDirectory,
+            bashQuote(normalizedWorkspace),
             '--files-from',
-            constants_1.ManifestFilename,
-            '--use-compress-program',
-            pigzProgram
+            bashQuote(constants_1.ManifestFilename)
         ];
         if (tarResolution.useForceLocal) {
-            parts.push('--force-local');
+            tarParts.splice(1, 0, '--force-local');
         }
-        const command = parts.join(' ');
+        const pigzParts = [
+            bashQuote(pigzPath),
+            '--fast',
+            '-p',
+            threadCount.toString()
+        ];
+        const command = `${tarParts.join(' ')} | ${pigzParts.join(' ')} > ${archiveTarget}`;
         core.debug(`Running tar with pigz: ${command}`);
+        const startTime = process.hrtime.bigint();
+        let exitCode = 0;
         try {
-            yield exec.exec(command, undefined, {
+            exitCode = yield exec.exec('bash', ['-c', command], {
                 cwd: archiveFolder,
-                env: Object.assign(Object.assign({}, process.env), { MSYS: 'winsymlinks:nativestrict' })
+                env: Object.assign(Object.assign({}, process.env), { MSYS: 'winsymlinks:nativestrict' }),
+                ignoreReturnCode: true
             });
         }
         catch (error) {
-            // If anything goes wrong with pigz/tar, fall back to the default implementation
             core.warning(`tar with pigz failed (${error === null || error === void 0 ? void 0 : error.message}); falling back to default createTar.`);
+            return (0, tar_1.createTar)(archiveFolder, cachePaths, compressionMethod);
+        }
+        const elapsedSeconds = hrtimeSeconds(startTime);
+        core.info(`Compressed cache inputs in ${formatSeconds(elapsedSeconds)} seconds (exit=${exitCode}).`);
+        const compressionThroughput = formatThroughput(totalBytes, elapsedSeconds);
+        if (compressionThroughput) {
+            core.info(`Compress throughput: ${compressionThroughput} MB/s`);
+        }
+        const archiveFullPath = path.join(archiveFolder, cacheFileName);
+        const archiveStats = yield safeLstat(archiveFullPath);
+        if (archiveStats) {
+            core.info(`Archive size: ${archiveStats.size} bytes`);
+        }
+        if (exitCode !== 0) {
+            core.warning('tar with pigz reported a non-zero exit code; falling back to default createTar.');
             return (0, tar_1.createTar)(archiveFolder, cachePaths, compressionMethod);
         }
     });
 }
 exports.createTarWithPigz = createTarWithPigz;
 function extractTarWithPigz(archivePath, compressionMethod) {
+    var _a;
     return __awaiter(this, void 0, void 0, function* () {
         // pigz only makes sense for gzip; for zstd variants use the default implementation.
         if (compressionMethod !== constants_1.CompressionMethod.Gzip) {
@@ -75302,47 +75300,132 @@ function extractTarWithPigz(archivePath, compressionMethod) {
         }
         core.info('Using unpigz for gzip decompression when extracting cache tarball.');
         const threadCount = Math.max(os.cpus().length, 1);
-        const unpigzWrapperPath = yield createProgramWrapper(unpigzPath, ['-v', '-p', threadCount.toString()], 'unpigz');
-        const decompressorProgramPath = unpigzWrapperPath.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
-        const decompressorProgram = `"${decompressorProgramPath}"`;
         core.info(`unpigz threads: ${threadCount}`);
-        core.info(`unpigz command (via wrapper): ${decompressorProgram}`);
         const tarResolution = yield resolveTar();
         const workingDirectory = getWorkingDirectory();
+        core.info(`Decompressing archive '${archivePath}' to '${workingDirectory}' using ${threadCount} threads (pigz=${unpigzPath}).`);
         yield io.mkdirP(workingDirectory);
-        const normalizedArchivePath = archivePath.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
-        // Build tar command string using unpigz as the decompressor
-        // Equivalent to:
-        //   tar -xf <archive> -P -C <workspace> --use-compress-program "unpigz -p ..."
-        const parts = [
-            `"${tarResolution.path}"`,
+        const normalizedArchivePath = toPosixPath(archivePath);
+        const archiveStats = yield safeLstat(archivePath);
+        const archiveBytes = (_a = archiveStats === null || archiveStats === void 0 ? void 0 : archiveStats.size) !== null && _a !== void 0 ? _a : 0;
+        const unpigzParts = [
+            bashQuote(unpigzPath),
+            '-d',
+            '-p',
+            threadCount.toString(),
+            '-c',
+            bashQuote(normalizedArchivePath)
+        ];
+        const tarParts = [
+            bashQuote(tarResolution.path),
             '-xf',
-            normalizedArchivePath,
-            '-v',
+            '-',
             '-P',
             '-C',
-            workingDirectory,
-            '--use-compress-program',
-            decompressorProgram
+            bashQuote(toPosixPath(workingDirectory))
         ];
         if (tarResolution.useForceLocal) {
-            parts.push('--force-local');
+            tarParts.splice(1, 0, '--force-local');
         }
-        const command = parts.join(' ');
+        const command = `${unpigzParts.join(' ')} | ${tarParts.join(' ')}`;
         core.debug(`Running tar with unpigz: ${command}`);
+        const startTime = process.hrtime.bigint();
+        let exitCode = 0;
         try {
-            yield exec.exec(command, undefined, {
-                env: Object.assign(Object.assign({}, process.env), { MSYS: 'winsymlinks:nativestrict' })
+            exitCode = yield exec.exec('bash', ['-c', command], {
+                env: Object.assign(Object.assign({}, process.env), { MSYS: 'winsymlinks:nativestrict' }),
+                ignoreReturnCode: true
             });
         }
         catch (error) {
-            // If anything goes wrong with unpigz/tar, fall back to the default implementation
             core.warning(`tar with unpigz failed (${error === null || error === void 0 ? void 0 : error.message}); falling back to default extractTar.`);
+            return (0, tar_1.extractTar)(archivePath, compressionMethod);
+        }
+        const elapsedSeconds = hrtimeSeconds(startTime);
+        core.info(`Decompressed archive in ${formatSeconds(elapsedSeconds)} seconds (exit=${exitCode}).`);
+        const decompressionThroughput = formatThroughput(archiveBytes, elapsedSeconds);
+        if (decompressionThroughput) {
+            core.info(`Decompress throughput: ${decompressionThroughput} MB/s`);
+        }
+        if (exitCode !== 0) {
+            core.warning('tar with unpigz reported a non-zero exit code; falling back to default extractTar.');
             return (0, tar_1.extractTar)(archivePath, compressionMethod);
         }
     });
 }
 exports.extractTarWithPigz = extractTarWithPigz;
+function bashQuote(p) {
+    // Escape single quotes by replacing ' with '\''
+    // Then wrap the entire string in single quotes
+    return `'${p.replace(/'/g, "'\\''")}'`;
+}
+function hrtimeSeconds(start) {
+    const diff = Number(process.hrtime.bigint() - start);
+    return diff / 1000000000;
+}
+function formatSeconds(seconds) {
+    return seconds.toFixed(3);
+}
+function formatThroughput(bytes, seconds) {
+    if (bytes <= 0 || seconds <= 0) {
+        return null;
+    }
+    const mbPerSecond = bytes / seconds / BYTES_PER_MEGABYTE;
+    return mbPerSecond.toFixed(2);
+}
+function safeLstat(target) {
+    var _a;
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            return yield fs_2.default.promises.lstat(target);
+        }
+        catch (error) {
+            core.debug(`Unable to stat path '${target}': ${(_a = error === null || error === void 0 ? void 0 : error.message) !== null && _a !== void 0 ? _a : error}`);
+            return null;
+        }
+    });
+}
+function getPathBytes(target) {
+    var _a;
+    return __awaiter(this, void 0, void 0, function* () {
+        const stats = yield safeLstat(target);
+        if (!stats) {
+            return 0;
+        }
+        if (stats.isSymbolicLink() || !stats.isDirectory()) {
+            return stats.size;
+        }
+        let total = 0;
+        let entries = [];
+        try {
+            entries = yield fs_2.default.promises.readdir(target);
+        }
+        catch (error) {
+            core.debug(`Unable to read directory '${target}': ${(_a = error === null || error === void 0 ? void 0 : error.message) !== null && _a !== void 0 ? _a : error}`);
+            return 0;
+        }
+        for (const entry of entries) {
+            total += yield getPathBytes(path.join(target, entry));
+        }
+        return total;
+    });
+}
+function calculateCachePathsSize(cachePaths, workspace) {
+    return __awaiter(this, void 0, void 0, function* () {
+        let total = 0;
+        for (const rawPath of cachePaths) {
+            const trimmed = rawPath.trim();
+            if (!trimmed || trimmed.startsWith('!')) {
+                continue;
+            }
+            const absolutePath = path.isAbsolute(trimmed)
+                ? trimmed
+                : path.join(workspace, trimmed);
+            total += yield getPathBytes(absolutePath);
+        }
+        return total;
+    });
+}
 
 
 /***/ }),

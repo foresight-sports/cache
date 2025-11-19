@@ -15,10 +15,15 @@ import * as path from 'path'
 import fs from 'fs'
 
 const IS_WINDOWS = process.platform === 'win32'
+const BYTES_PER_MEGABYTE = 1024 * 1024
 
 interface TarResolution {
     path: string
     useForceLocal: boolean
+}
+
+function toPosixPath(target: string): string {
+    return target.replace(/\\/g, '/')
 }
 
 /**
@@ -179,36 +184,6 @@ function getWorkingDirectory(): string {
     )
 }
 
-async function createProgramWrapper(
-    executable: string,
-    args: string[],
-    label: string
-): Promise<string> {
-    const runnerTemp = process.env['RUNNER_TEMP']?.trim()
-    const baseTempDir = runnerTemp && runnerTemp.length > 0 ? runnerTemp : os.tmpdir()
-    await io.mkdirP(baseTempDir)
-    const tempDir = await fs.promises.mkdtemp(
-        path.join(baseTempDir, `${label}-wrapper-`)
-    )
-
-    if (IS_WINDOWS) {
-        const wrapperPath = path.join(tempDir, `${label}-wrapper.cmd`)
-        const content = `@echo off\r\n"${executable}" ${args.join(' ')} %*\r\n`
-        await fs.promises.writeFile(wrapperPath, content, {
-            encoding: 'utf8'
-        })
-        return wrapperPath
-    }
-
-    const wrapperPath = path.join(tempDir, `${label}-wrapper.sh`)
-    const script = `#!/bin/sh\n"${executable}" ${args.join(' ')} "$@"\n`
-    await fs.promises.writeFile(wrapperPath, script, {
-        encoding: 'utf8'
-    })
-    await fs.promises.chmod(wrapperPath, 0o755)
-    return wrapperPath
-}
-
 /**
  * Create a tar archive using pigz for gzip compression when available.
  * Falls back to the default @actions/cache tar implementation otherwise.
@@ -220,15 +195,15 @@ export async function createTarWithPigz(
 ): Promise<void> {
     // pigz only makes sense for gzip; for zstd variants use the default implementation.
     if (compressionMethod !== CompressionMethod.Gzip) {
-        core.warning('Compression method is not gzip; delegating to default createTar.')
-        return defaultCreateTar(archiveFolder, cachePaths, compressionMethod)
+        core.warning('Compression method is not gzip; delegating to default createTar.');
+        return defaultCreateTar(archiveFolder, cachePaths, compressionMethod);
     }
 
     // Ensure pigz is installed. If not, just use the default tar implementation.
-    const pigzPath = await ensurePigz()
+    const pigzPath = await ensurePigz();
     if (!pigzPath) {
-        core.warning('pigz is not available; delegating to default createTar.')
-        return defaultCreateTar(archiveFolder, cachePaths, compressionMethod)
+        core.warning('pigz is not available; delegating to default createTar.');
+        return defaultCreateTar(archiveFolder, cachePaths, compressionMethod);
     }
 
     core.info('Using pigz for gzip compression when creating cache tarball.')
@@ -237,68 +212,80 @@ export async function createTarWithPigz(
     writeFileSync(
         path.join(archiveFolder, ManifestFilename),
         cachePaths.join('\n')
-    )
+    );
 
     // Compute the archive filename exactly as actions/cache would
-    const cacheFileName = cacheUtils.getCacheFileName(compressionMethod)
+    const cacheFileName = cacheUtils.getCacheFileName(compressionMethod);
 
     // Normalize to forward slashes for tar
-    const cacheFileNameForTar = cacheFileName.replace(new RegExp(`\\${path.sep}`, 'g'), '/')
-    const workingDirectory = getWorkingDirectory()
+    const cacheFileNameForTar = cacheFileName.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
+    const workingDirectory = getWorkingDirectory();
+    const totalBytes = await calculateCachePathsSize(cachePaths, workingDirectory);
 
-    const threadCount = Math.max(os.cpus().length, 1)
-    const pigzWrapperPath = await createProgramWrapper(
-        pigzPath,
-        ['--fast', '-v', '-p', threadCount.toString()],
-        'pigz'
-    )
-    const compressProgramPath = pigzWrapperPath.replace(
-        new RegExp(`\\${path.sep}`, 'g'),
-        '/'
-    )
-    const pigzProgram = `"${compressProgramPath}"`
-    core.info(`pigz threads: ${threadCount}`)
-    core.info(`pigz command (via wrapper): ${pigzProgram}`)
-    const tarResolution = await resolveTar()
-
-    // Build tar command string using pigz as the compressor
-    // Equivalent to:
-    //   tar --posix -cf <archive> --exclude <archive> -P -C <workspace> --files-from manifest.txt --use-compress-program pigz
-    const parts: string[] = [
-        `"${tarResolution.path}"`,
+    const threadCount = Math.max(os.cpus().length, 1);
+    core.info(`pigz threads: ${threadCount}`);
+    core.info(`Compressing cache inputs to '${cacheFileNameForTar}' using ${threadCount} threads (pigz=${pigzPath}).`);
+    const tarResolution = await resolveTar();
+    const normalizedWorkspace = toPosixPath(workingDirectory);
+    const archiveTarget = bashQuote(cacheFileNameForTar);
+    const tarParts: string[] = [
+        bashQuote(tarResolution.path),
         '--posix',
         '-cf',
-        cacheFileNameForTar,
-        '-v',
+        '-',
         '--exclude',
-        cacheFileNameForTar,
+        archiveTarget,
         '-P',
         '-C',
-        workingDirectory,
+        bashQuote(normalizedWorkspace),
         '--files-from',
-        ManifestFilename,
-        '--use-compress-program',
-        pigzProgram
-    ]
-
+        bashQuote(ManifestFilename)
+    ];
     if (tarResolution.useForceLocal) {
-        parts.push('--force-local')
+        tarParts.splice(1, 0, '--force-local');
     }
+    const pigzParts = [
+        bashQuote(pigzPath),
+        '--fast',
+        '-p',
+        threadCount.toString()
+    ];
+    const command = `${tarParts.join(' ')} | ${pigzParts.join(' ')} > ${archiveTarget}`;
+    core.debug(`Running tar with pigz: ${command}`);
 
-    const command = parts.join(' ')
-    core.debug(`Running tar with pigz: ${command}`)
-
+    const startTime = process.hrtime.bigint();
+    let exitCode = 0;
     try {
-        await exec.exec(command, undefined, {
+        exitCode = await exec.exec('bash', ['-c', command], {
             cwd: archiveFolder,
             env: {
                 ...(process.env as object),
                 MSYS: 'winsymlinks:nativestrict'
-            }
+            },
+            ignoreReturnCode: true
         })
     } catch (error: any) {
-        // If anything goes wrong with pigz/tar, fall back to the default implementation
         core.warning(`tar with pigz failed (${error?.message}); falling back to default createTar.`)
+        return defaultCreateTar(archiveFolder, cachePaths, compressionMethod)
+    }
+
+    const elapsedSeconds = hrtimeSeconds(startTime)
+    core.info(
+        `Compressed cache inputs in ${formatSeconds(elapsedSeconds)} seconds (exit=${exitCode}).`
+    )
+    const compressionThroughput = formatThroughput(totalBytes, elapsedSeconds)
+    if (compressionThroughput) {
+        core.info(`Compress throughput: ${compressionThroughput} MB/s`)
+    }
+
+    const archiveFullPath = path.join(archiveFolder, cacheFileName)
+    const archiveStats = await safeLstat(archiveFullPath)
+    if (archiveStats) {
+        core.info(`Archive size: ${archiveStats.size} bytes`)
+    }
+
+    if (exitCode !== 0) {
+        core.warning('tar with pigz reported a non-zero exit code; falling back to default createTar.')
         return defaultCreateTar(archiveFolder, cachePaths, compressionMethod)
     }
 }
@@ -313,64 +300,149 @@ export async function extractTarWithPigz(
         return defaultExtractTar(archivePath, compressionMethod);
     }
 
-    const unpigzPath = await ensureUnpigz()
+    const unpigzPath = await ensureUnpigz();
     if (!unpigzPath) {
-        core.warning('unpigz is not available; delegating to default extractTar.')
-        return defaultExtractTar(archivePath, compressionMethod)
+        core.warning('unpigz is not available; delegating to default extractTar.');
+        return defaultExtractTar(archivePath, compressionMethod);
     }
 
-    core.info('Using unpigz for gzip decompression when extracting cache tarball.')
+    core.info('Using unpigz for gzip decompression when extracting cache tarball.');
 
-    const threadCount = Math.max(os.cpus().length, 1)
-    const unpigzWrapperPath = await createProgramWrapper(
-        unpigzPath,
-        ['-v', '-p', threadCount.toString()],
-        'unpigz'
-    );
-    const decompressorProgramPath = unpigzWrapperPath.replace(
-        new RegExp(`\\${path.sep}`, 'g'),
-        '/'
-    );
-    const decompressorProgram = `"${decompressorProgramPath}"`;
-    core.info(`unpigz threads: ${threadCount}`)
-    core.info(`unpigz command (via wrapper): ${decompressorProgram}`)
+    const threadCount = Math.max(os.cpus().length, 1);
+    core.info(`unpigz threads: ${threadCount}`);
     const tarResolution = await resolveTar();
     const workingDirectory = getWorkingDirectory();
+    core.info(`Decompressing archive '${archivePath}' to '${workingDirectory}' using ${threadCount} threads (pigz=${unpigzPath}).`);
     await io.mkdirP(workingDirectory);
-    const normalizedArchivePath = archivePath.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
+    const normalizedArchivePath = toPosixPath(archivePath);
+    const archiveStats = await safeLstat(archivePath);
+    const archiveBytes = archiveStats?.size ?? 0;
 
-    // Build tar command string using unpigz as the decompressor
-    // Equivalent to:
-    //   tar -xf <archive> -P -C <workspace> --use-compress-program "unpigz -p ..."
-    const parts: string[] = [
-        `"${tarResolution.path}"`,
+    const unpigzParts = [
+        bashQuote(unpigzPath),
+        '-d',
+        '-p',
+        threadCount.toString(),
+        '-c',
+        bashQuote(normalizedArchivePath)
+    ];
+    const tarParts = [
+        bashQuote(tarResolution.path),
         '-xf',
-        normalizedArchivePath,
-        '-v',
+        '-',
         '-P',
         '-C',
-        workingDirectory,
-        '--use-compress-program',
-        decompressorProgram
+        bashQuote(toPosixPath(workingDirectory))
     ];
-
     if (tarResolution.useForceLocal) {
-        parts.push('--force-local');
+        tarParts.splice(1, 0, '--force-local');
     }
 
-    const command = parts.join(' ');
+    const command = `${unpigzParts.join(' ')} | ${tarParts.join(' ')}`;
     core.debug(`Running tar with unpigz: ${command}`);
 
+    const startTime = process.hrtime.bigint();
+    let exitCode = 0;
     try {
-        await exec.exec(command, undefined, {
+        exitCode = await exec.exec('bash', ['-c', command], {
             env: {
                 ...(process.env as object),
                 MSYS: 'winsymlinks:nativestrict'
-            }
+            },
+            ignoreReturnCode: true
         });
     } catch (error: any) {
-        // If anything goes wrong with unpigz/tar, fall back to the default implementation
         core.warning(`tar with unpigz failed (${error?.message}); falling back to default extractTar.`);
         return defaultExtractTar(archivePath, compressionMethod);
     }
+
+    const elapsedSeconds = hrtimeSeconds(startTime);
+    core.info(
+        `Decompressed archive in ${formatSeconds(elapsedSeconds)} seconds (exit=${exitCode}).`
+    );
+    const decompressionThroughput = formatThroughput(archiveBytes, elapsedSeconds);
+    if (decompressionThroughput) {
+        core.info(`Decompress throughput: ${decompressionThroughput} MB/s`);
+    }
+
+    if (exitCode !== 0) {
+        core.warning('tar with unpigz reported a non-zero exit code; falling back to default extractTar.');
+        return defaultExtractTar(archivePath, compressionMethod);
+    }
+}
+
+function bashQuote(p: string): string {
+    // Escape single quotes by replacing ' with '\''
+    // Then wrap the entire string in single quotes
+    return `'${p.replace(/'/g, "'\\''")}'`;
+}
+
+function hrtimeSeconds(start: bigint): number {
+    const diff = Number(process.hrtime.bigint() - start)
+    return diff / 1_000_000_000
+}
+
+function formatSeconds(seconds: number): string {
+    return seconds.toFixed(3)
+}
+
+function formatThroughput(bytes: number, seconds: number): string | null {
+    if (bytes <= 0 || seconds <= 0) {
+        return null
+    }
+    const mbPerSecond = bytes / seconds / BYTES_PER_MEGABYTE
+    return mbPerSecond.toFixed(2)
+}
+
+async function safeLstat(target: string): Promise<fs.Stats | null> {
+    try {
+        return await fs.promises.lstat(target)
+    } catch (error: any) {
+        core.debug(`Unable to stat path '${target}': ${error?.message ?? error}`)
+        return null
+    }
+}
+
+async function getPathBytes(target: string): Promise<number> {
+    const stats = await safeLstat(target)
+    if (!stats) {
+        return 0
+    }
+
+    if (stats.isSymbolicLink() || !stats.isDirectory()) {
+        return stats.size
+    }
+
+    let total = 0
+    let entries: string[] = []
+    try {
+        entries = await fs.promises.readdir(target)
+    } catch (error: any) {
+        core.debug(`Unable to read directory '${target}': ${error?.message ?? error}`)
+        return 0
+    }
+
+    for (const entry of entries) {
+        total += await getPathBytes(path.join(target, entry))
+    }
+    return total
+}
+
+async function calculateCachePathsSize(
+    cachePaths: string[],
+    workspace: string
+): Promise<number> {
+    let total = 0
+    for (const rawPath of cachePaths) {
+        const trimmed = rawPath.trim()
+        if (!trimmed || trimmed.startsWith('!')) {
+            continue
+        }
+
+        const absolutePath = path.isAbsolute(trimmed)
+            ? trimmed
+            : path.join(workspace, trimmed)
+        total += await getPathBytes(absolutePath)
+    }
+    return total
 }
