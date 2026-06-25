@@ -2,15 +2,16 @@
 
 import * as core from "@actions/core";
 import * as path from "path";
-import * as utils from "@actions/cache/lib/internal/cacheUtils";
-import * as cacheHttpClient from "./backend";
-import { CompressionMethod } from "@actions/cache/lib/internal/constants";
 import {
+    cacheUtils as utils,
+    CompressionMethod,
     createTar as defaultCreateTar,
+    DownloadOptions,
     extractTar as defaultExtractTar,
-    listTar as defaultListTar
-} from "@actions/cache/lib/internal/tar";
-import { DownloadOptions, UploadOptions } from "@actions/cache/lib/options";
+    listTar as defaultListTar,
+    UploadOptions
+} from "../actionsCacheShims.js";
+import * as cacheHttpClient from "./backend";
 import {
     createTar as uncompressedCreateTar,
     extractTar as uncompressedExtractTar,

@@ -1,6 +1,6 @@
 # Shockingly faster cache action
 
-This action is a drop-in replacement for the official `actions/cache@v4` action, for use with the [RunsOn](https://runs-on.com/?ref=cache) self-hosted GitHub Action runner provider, or with your own self-hosted runner solution.
+This action is a drop-in replacement for the official `actions/cache@v6` action, for use with the [RunsOn](https://runs-on.com/?ref=cache) self-hosted GitHub Action runner provider, or with your own self-hosted runner solution.
 
 ![image](https://github.com/runs-on/cache/assets/6114/e61c5b6f-aa86-48be-9e1b-baac6dce9b84)
 
@@ -10,13 +10,17 @@ Also note that you no longer have any limit on the size of the cache. The bucket
 
 If no S3 bucket is provided, it will also transparently switch to the default behaviour. This means you can use this action and switch between RunsOn runners and official GitHub runners with no change.
 
+> [!IMPORTANT]
+> This fork runs on the Node.js 24 runtime (`node24`) and requires a minimum Actions Runner version of `2.327.1`.
+> If you are using self-hosted runners, ensure they are updated before upgrading.
+
 ## Usage with RunsOn
 
-If using [RunsOn](https://runs-on.com), simply replace `actions/cache@v4` with `runs-on/cache@v4`. All the official options are supported.
+If using [RunsOn](https://runs-on.com), simply replace `actions/cache@v6` with `foresight-sports/cache@<sha>`. All the official options are supported.
 
 ```diff
-- - uses: actions/cache@v4
-+ - uses: runs-on/cache@v4
+- - uses: actions/cache@v6
++ - uses: foresight-sports/cache@<commit-sha>
     with:
       ...
 ```
@@ -30,7 +34,7 @@ If you want to use this in your own infrastructure, setup your AWS credentials w
 ```yaml
   - uses: aws-actions/configure-aws-credentials@v4
     ...
-  - uses: runs-on/cache@v4
+  - uses: foresight-sports/cache@<commit-sha>
     with:
       ...
     env:
@@ -48,7 +52,7 @@ Be aware of S3 transfer costs if your runners are not in the same AWS region as 
 
 ## Compression level input
 
-All variants of this action (`runs-on/cache`, `runs-on/cache/restore`, and `runs-on/cache/save`) accept a `compression-level` input. Set it to any integer from `0` to `9`:
+All variants of this action (`foresight-sports/cache`, `foresight-sports/cache/restore`, and `foresight-sports/cache/save`) accept a `compression-level` input. Set it to any integer from `0` to `9`:
 
 * `0` (default) keeps using raw tar archives with no compression – the fastest option for large caches.
 * `1-9` enable gzip compression at the requested level. Higher values trade additional CPU for slightly smaller archives.
@@ -56,7 +60,7 @@ All variants of this action (`runs-on/cache`, `runs-on/cache/restore`, and `runs
 Example:
 
 ```yaml
-- uses: runs-on/cache@v4
+- uses: foresight-sports/cache@<commit-sha>
   with:
     path: ~/.npm
     key: node-deps-${{ hashFiles('package-lock.json') }}
@@ -65,7 +69,16 @@ Example:
 
 When gzip compression is enabled, both standard GitHub caches and RunsOn's S3 backend honor the chosen level.
 
-
 ## Action pinning
 
-Contrary to the upstream action, `v4` is a branch. When merging a stable release from upstream (e.g. v4.3.0), I will publish an equivalent tag in this repository. You can either pin to that tag, or a specific commit.
+Contrary to the upstream action, `dev/no-compression` is a branch. When merging a stable release from upstream (e.g. v6.0.0), publish an equivalent tag in this repository. You can either pin to that tag, or a specific commit.
+
+## Upstream v6 changes
+
+This fork merges upstream `actions/cache@v6.0.0`, which:
+
+* Updates `@actions/cache`, `@actions/core`, `@actions/exec` to latest major versions
+* Migrates to ESM module system
+* Runs on Node.js 24 (`node24`)
+
+Foresight-specific behavior is preserved: S3-backed RunsOn cache backend, no-compression default, and split `restore/` + `save/` composite actions.

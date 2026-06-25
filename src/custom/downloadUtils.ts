@@ -1,10 +1,9 @@
 // Just a copy of the original file from the toolkit/actions/cache repository, with a change for byte range used in the downloadCacheHttpClientConcurrent function.
 import * as core from "@actions/core";
 import { HttpClient } from "@actions/http-client";
-import { TransferProgressEvent } from "@azure/ms-rest-js";
+import { TransferProgressEvent } from "@azure/core-rest-pipeline";
 import * as fs from "fs";
-import { DownloadOptions } from "@actions/cache/lib/options";
-import { retryHttpClientResponse } from "@actions/cache/lib/internal/requestUtils";
+import { DownloadOptions, retryHttpClientResponse } from "../actionsCacheShims.js";
 
 export interface RunsOnDownloadOptions extends DownloadOptions {
     partSize: number;

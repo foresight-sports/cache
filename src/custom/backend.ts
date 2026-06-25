@@ -3,16 +3,16 @@ import {
     GetObjectCommand,
     ListObjectsV2Command
 } from "@aws-sdk/client-s3";
-const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createReadStream } from "fs";
 import * as crypto from "crypto";
 import {
     DownloadOptions,
     getDownloadOptions
-} from "@actions/cache/lib/options";
-import { CompressionMethod } from "@actions/cache/lib/internal/constants";
+} from "../actionsCacheShims.js";
+import { CompressionMethod } from "../actionsCacheShims.js";
 import * as core from "@actions/core";
-import * as utils from "@actions/cache/lib/internal/cacheUtils";
+import { cacheUtils as utils } from "../actionsCacheShims.js";
 import { Upload } from "@aws-sdk/lib-storage";
 import { downloadCacheHttpClientConcurrent } from "./downloadUtils";
 

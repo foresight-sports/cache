@@ -1,10 +1,10 @@
-import * as utils from "@actions/cache/lib/internal/cacheUtils";
 import {
     ArchiveToolType,
+    cacheUtils as utils,
     CompressionMethod,
     ManifestFilename,
     SystemTarPathOnWindows
-} from "@actions/cache/lib/internal/constants";
+} from "../../actionsCacheShims.js";
 import type { ExecOptions } from "@actions/exec";
 import { exec } from "@actions/exec";
 import * as io from "@actions/io";
