@@ -127076,7 +127076,29 @@ const downloadUtils_promiseWithTimeout = async (timeoutMs, promise) => {
     });
 };
 
+;// CONCATENATED MODULE: ./src/custom/utils/partSize.ts
+// S3 multipart-upload part-size math, centralized here so it is unit testable in
+// isolation without pulling in the S3 client / AWS SDK (see __tests__/partSize.test.ts).
+//
+//  - @aws-sdk/lib-storage enforces a hard MAX_PARTS = 10000 ceiling. Targeting
+//    <= ~9500 parts (headroom under 10000) keeps any payload representable
+//    without throwing "Exceeded 10000 parts".
+//  - S3 requires every part except the last to be at least 5 MiB. A small
+//    upload-chunk-size on a mid-size cache could otherwise yield a sub-5 MiB part
+//    that S3 rejects with EntityTooSmall.
+const MAX_MULTIPART_PARTS_TARGET = 9500;
+const S3_MIN_PART_SIZE = 5 * 1024 * 1024;
+/**
+ * Compute the multipart part size (in bytes) for a cache upload: the configured
+ * part size, floored so the payload fits in <= ~9500 parts and never drops below
+ * S3's 5 MiB per-part minimum.
+ */
+function computeEffectivePartSize(cacheSize, configuredPartSize) {
+    return Math.max(configuredPartSize, Math.ceil(cacheSize / MAX_MULTIPART_PARTS_TARGET), S3_MIN_PART_SIZE);
+}
+
 ;// CONCATENATED MODULE: ./src/custom/backend.ts
+
 
 
 
@@ -127114,7 +127136,12 @@ const downloadQueueSize = Number(process.env.DOWNLOAD_QUEUE_SIZE || "8");
 const downloadPartSize = Number(process.env.DOWNLOAD_PART_SIZE || "16") * 1024 * 1024;
 // The AWS SDK's default HTTP handler caps concurrent sockets at maxSockets=50,
 // which throttles multipart concurrency above ~48 no matter how large the queue
-// size is. Size the socket pool to the largest queue we use, plus headroom.
+// size is. This socket pool is attached to s3Client, which only the upload path
+// uses (the lib-storage Upload fans out its PUT-part requests through it). The
+// download path builds its own @actions/http-client HttpClient from a presigned
+// URL (see downloadUtils.ts / downloadCacheHttpClientConcurrent) and never
+// touches s3Client, so download concurrency is governed separately there. Size
+// the pool to the upload queue, plus headroom.
 const s3Client = new dist_cjs.S3Client({
     region,
     forcePathStyle,
@@ -127122,7 +127149,7 @@ const s3Client = new dist_cjs.S3Client({
     requestHandler: new node_http_handler_dist_cjs.NodeHttpHandler({
         httpsAgent: new external_https_.Agent({
             keepAlive: true,
-            maxSockets: Math.max(uploadQueueSize, downloadQueueSize) + 8
+            maxSockets: uploadQueueSize + 8
         })
     })
 });
@@ -127248,14 +127275,16 @@ async function backend_saveCache(key, paths, archivePath, { compressionMethod, e
     // @aws-sdk/lib-storage enforces a hard MAX_PARTS = 10000 ceiling. With a fixed
     // part size, any payload larger than partSize * 10000 throws
     // "Exceeded 10000 parts" (e.g. 32 MB parts cap out at ~320 GB, 64 MB at ~640 GB).
-    // Raise the part size adaptively so any payload is representable in <= ~9500
-    // parts (9500 leaves headroom under 10000), making that crash impossible
-    // regardless of the configured/overridden part size. `upload-chunk-size` (bytes),
-    // when provided, overrides the default part size but is still floored here.
+    // computeEffectivePartSize raises the part size adaptively so any payload is
+    // representable in <= ~9500 parts (headroom under 10000), and also floors it at
+    // S3's 5 MiB multipart minimum so a small upload-chunk-size on a mid-size cache
+    // can't produce a sub-5 MiB part that S3 rejects with EntityTooSmall.
+    // `upload-chunk-size` (bytes), when provided, overrides the default part size
+    // but is still floored here.
     const configuredPartSize = uploadChunkSize && uploadChunkSize > 0
         ? uploadChunkSize
         : uploadPartSize;
-    const effectivePartSize = Math.max(configuredPartSize, Math.ceil(cacheSize / 9500));
+    const effectivePartSize = computeEffectivePartSize(cacheSize, configuredPartSize);
     const estimatedParts = Math.max(1, Math.ceil(cacheSize / effectivePartSize));
     info(`Multipart upload: part size ~${Math.round(effectivePartSize / (1024 * 1024))} MB, queue size ${uploadQueueSize}, ~${estimatedParts} parts for ${cacheSize} B.`);
     const multipartUpload = new lib_storage_dist_cjs/* Upload */._({
@@ -127343,6 +127372,7 @@ class backend_UploadProgress {
 
 
 
+
 async function getTarTool() {
     switch (process.platform) {
         case "win32": {
@@ -127407,11 +127437,27 @@ function sanitizeEnv(env) {
 function getExecEnv() {
     return sanitizeEnv({ ...process.env, MSYS: "winsymlinks:nativestrict" });
 }
+// createTar shells out to `zstd` (the no-compression fast path compresses with
+// multithreaded zstd). If zstd isn't on PATH the tar invocation fails and the
+// cache is silently skipped upstream — surface one clear warning so the cause is
+// obvious in the log instead of a generic tar error. Emitted at most once.
+let zstdMissingWarned = false;
+async function warnIfZstdMissing() {
+    if (zstdMissingWarned) {
+        return;
+    }
+    const zstdPath = await which("zstd", false);
+    if (!zstdPath) {
+        zstdMissingWarned = true;
+        warning("zstd not found on PATH — cache disabled for this run. Install zstd to enable caching.");
+    }
+}
 async function runTar(tool, args, options) {
     await exec_exec(`"${tool.path}"`, args, options);
 }
 async function uncompressedTar_createTar(archiveFolder, sourceDirectories, compressionMethod) {
     const tool = await getTarTool();
+    await warnIfZstdMissing();
     const cacheFileName = getCacheFileName(compressionMethod);
     const normalizedArchiveName = normalizeForTar(cacheFileName);
     const normalizedManifestPath = normalizeForTar(external_path_.join(archiveFolder, ManifestFilename));

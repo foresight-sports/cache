@@ -5,6 +5,7 @@ import {
     ManifestFilename,
     SystemTarPathOnWindows
 } from "../../actionsCacheShims.js";
+import * as core from "@actions/core";
 import type { ExecOptions } from "@actions/exec";
 import { exec } from "@actions/exec";
 import * as io from "@actions/io";
@@ -86,6 +87,24 @@ function getExecEnv(): { [key: string]: string } {
     return sanitizeEnv({ ...process.env, MSYS: "winsymlinks:nativestrict" });
 }
 
+// createTar shells out to `zstd` (the no-compression fast path compresses with
+// multithreaded zstd). If zstd isn't on PATH the tar invocation fails and the
+// cache is silently skipped upstream — surface one clear warning so the cause is
+// obvious in the log instead of a generic tar error. Emitted at most once.
+let zstdMissingWarned = false;
+async function warnIfZstdMissing(): Promise<void> {
+    if (zstdMissingWarned) {
+        return;
+    }
+    const zstdPath = await io.which("zstd", false);
+    if (!zstdPath) {
+        zstdMissingWarned = true;
+        core.warning(
+            "zstd not found on PATH — cache disabled for this run. Install zstd to enable caching."
+        );
+    }
+}
+
 async function runTar(
     tool: TarToolInfo,
     args: string[],
@@ -100,6 +119,7 @@ export async function createTar(
     compressionMethod: CompressionMethod
 ): Promise<void> {
     const tool = await getTarTool();
+    await warnIfZstdMissing();
     const cacheFileName = utils.getCacheFileName(compressionMethod);
     const normalizedArchiveName = normalizeForTar(cacheFileName);
     const normalizedManifestPath = normalizeForTar(

@@ -17,6 +17,7 @@ import * as core from "@actions/core";
 import { cacheUtils as utils } from "../actionsCacheShims.js";
 import { Upload } from "@aws-sdk/lib-storage";
 import { downloadCacheHttpClientConcurrent } from "./downloadUtils";
+import { computeEffectivePartSize } from "./utils/partSize";
 
 export interface ArtifactCacheEntry {
     cacheKey?: string;
@@ -60,7 +61,12 @@ const downloadPartSize =
 
 // The AWS SDK's default HTTP handler caps concurrent sockets at maxSockets=50,
 // which throttles multipart concurrency above ~48 no matter how large the queue
-// size is. Size the socket pool to the largest queue we use, plus headroom.
+// size is. This socket pool is attached to s3Client, which only the upload path
+// uses (the lib-storage Upload fans out its PUT-part requests through it). The
+// download path builds its own @actions/http-client HttpClient from a presigned
+// URL (see downloadUtils.ts / downloadCacheHttpClientConcurrent) and never
+// touches s3Client, so download concurrency is governed separately there. Size
+// the pool to the upload queue, plus headroom.
 const s3Client = new S3Client({
     region,
     forcePathStyle,
@@ -68,7 +74,7 @@ const s3Client = new S3Client({
     requestHandler: new NodeHttpHandler({
         httpsAgent: new Agent({
             keepAlive: true,
-            maxSockets: Math.max(uploadQueueSize, downloadQueueSize) + 8
+            maxSockets: uploadQueueSize + 8
         })
     })
 });
@@ -259,17 +265,19 @@ export async function saveCache(
     // @aws-sdk/lib-storage enforces a hard MAX_PARTS = 10000 ceiling. With a fixed
     // part size, any payload larger than partSize * 10000 throws
     // "Exceeded 10000 parts" (e.g. 32 MB parts cap out at ~320 GB, 64 MB at ~640 GB).
-    // Raise the part size adaptively so any payload is representable in <= ~9500
-    // parts (9500 leaves headroom under 10000), making that crash impossible
-    // regardless of the configured/overridden part size. `upload-chunk-size` (bytes),
-    // when provided, overrides the default part size but is still floored here.
+    // computeEffectivePartSize raises the part size adaptively so any payload is
+    // representable in <= ~9500 parts (headroom under 10000), and also floors it at
+    // S3's 5 MiB multipart minimum so a small upload-chunk-size on a mid-size cache
+    // can't produce a sub-5 MiB part that S3 rejects with EntityTooSmall.
+    // `upload-chunk-size` (bytes), when provided, overrides the default part size
+    // but is still floored here.
     const configuredPartSize =
         uploadChunkSize && uploadChunkSize > 0
             ? uploadChunkSize
             : uploadPartSize;
-    const effectivePartSize = Math.max(
-        configuredPartSize,
-        Math.ceil(cacheSize / 9500)
+    const effectivePartSize = computeEffectivePartSize(
+        cacheSize,
+        configuredPartSize
     );
     const estimatedParts = Math.max(
         1,
