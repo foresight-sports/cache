@@ -1,20 +1,26 @@
+import * as core from "@actions/core";
 import {
-    S3Client,
     GetObjectCommand,
-    ListObjectsV2Command
+    HeadObjectCommand,
+    ListObjectsV2Command,
+    S3Client
 } from "@aws-sdk/client-s3";
-const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
-import { createReadStream } from "fs";
+import { Upload } from "@aws-sdk/lib-storage";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { NodeHttpHandler } from "@smithy/node-http-handler";
 import * as crypto from "crypto";
+import { createReadStream, statSync } from "fs";
+import { Agent } from "https";
+
 import {
+    cacheUtils as utils,
+    CompressionMethod,
     DownloadOptions,
     getDownloadOptions
-} from "@actions/cache/lib/options";
-import { CompressionMethod } from "@actions/cache/lib/internal/constants";
-import * as core from "@actions/core";
-import * as utils from "@actions/cache/lib/internal/cacheUtils";
-import { Upload } from "@aws-sdk/lib-storage";
+} from "../actionsCacheShims.js";
 import { downloadCacheHttpClientConcurrent } from "./downloadUtils";
+import { transferArchive } from "./transferEngine";
+import { computeEffectivePartSize } from "./utils/partSize";
 
 export interface ArtifactCacheEntry {
     cacheKey?: string;
@@ -33,7 +39,12 @@ if (process.env.RUNS_ON_RUNNER_NAME && process.env.RUNS_ON_RUNNER_NAME !== "") {
     delete process.env.AWS_SESSION_TOKEN;
 }
 
-const versionSalt = "1.0";
+// Bumped 1.0 -> 2.0 to start a fresh cache generation: the no-compression fast
+// path now writes zstd-compressed archives (see custom/utils/uncompressedTar.ts),
+// which are not byte-compatible with previously stored raw-tar archives that share
+// the same file extension. Bumping the salt namespaces old and new archives apart
+// so a stale raw-tar entry is never fetched and fed to the zstd extractor.
+const versionSalt = "2.0";
 const bucketName = process.env.RUNS_ON_S3_BUCKET_CACHE;
 const endpoint = process.env.RUNS_ON_S3_BUCKET_ENDPOINT;
 const region =
@@ -44,14 +55,32 @@ const forcePathStyle =
     process.env.RUNS_ON_S3_FORCE_PATH_STYLE === "true" ||
     process.env.AWS_S3_FORCE_PATH_STYLE === "true";
 
-const uploadQueueSize = Number(process.env.UPLOAD_QUEUE_SIZE || "4");
+const uploadQueueSize = Number(process.env.UPLOAD_QUEUE_SIZE || "16");
 const uploadPartSize =
-    Number(process.env.UPLOAD_PART_SIZE || "32") * 1024 * 1024;
-const downloadQueueSize = Number(process.env.DOWNLOAD_QUEUE_SIZE || "8");
+    Number(process.env.UPLOAD_PART_SIZE || "64") * 1024 * 1024;
+const downloadQueueSize = Number(process.env.DOWNLOAD_QUEUE_SIZE || "16");
 const downloadPartSize =
-    Number(process.env.DOWNLOAD_PART_SIZE || "16") * 1024 * 1024;
+    Number(process.env.DOWNLOAD_PART_SIZE || "32") * 1024 * 1024;
 
-const s3Client = new S3Client({ region, forcePathStyle, endpoint });
+// The AWS SDK's default HTTP handler caps concurrent sockets at maxSockets=50,
+// which throttles multipart concurrency above ~48 no matter how large the queue
+// size is. This socket pool is attached to s3Client, which only the upload path
+// uses (the lib-storage Upload fans out its PUT-part requests through it). The
+// download path builds its own @actions/http-client HttpClient from a presigned
+// URL (see downloadUtils.ts / downloadCacheHttpClientConcurrent) and never
+// touches s3Client, so download concurrency is governed separately there. Size
+// the pool to the upload queue, plus headroom.
+const s3Client = new S3Client({
+    region,
+    forcePathStyle,
+    endpoint,
+    requestHandler: new NodeHttpHandler({
+        httpsAgent: new Agent({
+            keepAlive: true,
+            maxSockets: uploadQueueSize + 8
+        })
+    })
+});
 
 export function getCacheVersion(
     paths: string[],
@@ -151,67 +180,140 @@ export async function downloadCache(
         throw new Error("Environment variable RUNS_ON_AWS_REGION not set");
     }
 
+    // Narrow the module-level env consts to non-undefined for use inside the
+    // closure below (the guards above already asserted them).
+    const bucket = bucketName;
+
     const archiveUrl = new URL(archiveLocation);
     const objectKey = archiveUrl.pathname.slice(1);
 
-    // Retry logic for download validation failures
-    const maxRetries = 3;
-    let lastError: Error | undefined;
+    // Node fallback: presigned-URL ranged downloader with validation retries.
+    // This is the always-present safety net used when s5cmd/aws-cli are missing
+    // or fail. The presigned URL is signed with the same S3Client credentials the
+    // direct engine path uses, so read access is identical either way.
+    const nodeDownload = async (): Promise<void> => {
+        const maxRetries = 3;
+        let lastError: Error | undefined;
 
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-            const command = new GetObjectCommand({
-                Bucket: bucketName,
-                Key: objectKey
-            });
-            const url = await getSignedUrl(s3Client, command, {
-                expiresIn: 3600
-            });
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                const command = new GetObjectCommand({
+                    Bucket: bucket,
+                    Key: objectKey
+                });
+                const url = await getSignedUrl(s3Client, command, {
+                    expiresIn: 3600
+                });
 
-            await downloadCacheHttpClientConcurrent(url, archivePath, {
-                ...options,
-                downloadConcurrency: downloadQueueSize,
-                concurrentBlobDownloads: true,
-                partSize: downloadPartSize
-            });
+                await downloadCacheHttpClientConcurrent(url, archivePath, {
+                    ...options,
+                    downloadConcurrency: downloadQueueSize,
+                    concurrentBlobDownloads: true,
+                    partSize: downloadPartSize
+                });
 
-            // If we get here, download succeeded
-            return;
-        } catch (error) {
-            const errorMessage = (error as Error).message;
-            lastError = error as Error;
+                // If we get here, download succeeded
+                return;
+            } catch (error) {
+                const errorMessage = (error as Error).message;
+                lastError = error as Error;
 
-            // Only retry on validation failures, not on other errors
-            if (
-                errorMessage.includes("Download validation failed") ||
-                errorMessage.includes("Range request not supported") ||
-                errorMessage.includes("Content-Range header")
-            ) {
-                if (attempt < maxRetries) {
-                    const delayMs = Math.pow(2, attempt - 1) * 1000; // exponential backoff
-                    core.warning(
-                        `Download attempt ${attempt} failed: ${errorMessage}. Retrying in ${delayMs}ms...`
-                    );
-                    await new Promise(resolve => setTimeout(resolve, delayMs));
-                    continue;
+                // Only retry on validation failures, not on other errors
+                if (
+                    errorMessage.includes("Download validation failed") ||
+                    errorMessage.includes("Range request not supported") ||
+                    errorMessage.includes("Content-Range header")
+                ) {
+                    if (attempt < maxRetries) {
+                        const delayMs = Math.pow(2, attempt - 1) * 1000; // exponential backoff
+                        core.warning(
+                            `Download attempt ${attempt} failed: ${errorMessage}. Retrying in ${delayMs}ms...`
+                        );
+                        await new Promise(resolve =>
+                            setTimeout(resolve, delayMs)
+                        );
+                        continue;
+                    }
                 }
+
+                // For non-retryable errors or max retries reached, throw the error
+                throw error;
             }
-
-            // For non-retryable errors or max retries reached, throw the error
-            throw error;
         }
-    }
 
-    // This should never be reached, but just in case
-    throw lastError || new Error("Download failed after all retry attempts");
+        // This should never be reached, but just in case
+        throw (
+            lastError || new Error("Download failed after all retry attempts")
+        );
+    };
+
+    // Defense-in-depth: s5cmd/aws-cli exit 0 is trusted blindly, so after a
+    // native download independently confirm the object landed whole by comparing
+    // the on-disk size against the S3 object's ContentLength (HeadObject via the
+    // same credentialed s3Client). A mismatch throws, which transferArchive
+    // treats as an engine failure and falls through to the next engine rather
+    // than hard-failing. A HeadObject that itself fails is not a mismatch, so we
+    // swallow it and trust the native result (the node fallback would re-validate
+    // byte counts anyway). The node engine validates its own download internally.
+    const verifyNativeDownload = async (): Promise<void> => {
+        let expectedBytes: number | undefined;
+        try {
+            const head = await s3Client.send(
+                new HeadObjectCommand({ Bucket: bucket, Key: objectKey })
+            );
+            expectedBytes = head.ContentLength;
+        } catch (error) {
+            core.debug(
+                `Skipping native-download size check (HeadObject failed: ${
+                    (error as Error).message
+                }).`
+            );
+            return;
+        }
+        if (typeof expectedBytes !== "number") {
+            return;
+        }
+        const actualBytes = statSync(archivePath).size;
+        if (expectedBytes !== actualBytes) {
+            throw new Error(
+                `native download size mismatch: S3 ContentLength ${expectedBytes} B != local file ${actualBytes} B`
+            );
+        }
+    };
+
+    // Engine chain: s5cmd -> aws-cli -> node. The native engines pull the object
+    // directly by bucket+key (same credential chain the S3Client signs with);
+    // the node presigned downloader is the guaranteed fallback if a native
+    // engine is unavailable or fails. The archive key is derived identically to
+    // the upload path, so any engine restores any engine's cache.
+    await transferArchive(
+        "download",
+        {
+            bucket,
+            key: objectKey,
+            archivePath,
+            endpoint,
+            region,
+            forcePathStyle
+        },
+        nodeDownload,
+        undefined,
+        verifyNativeDownload
+    );
 }
 
 export async function saveCache(
     key: string,
     paths: string[],
     archivePath: string,
-    { compressionMethod, enableCrossOsArchive, cacheSize: archiveFileSize }
+    {
+        compressionMethod,
+        enableCrossOsArchive,
+        cacheSize: archiveFileSize,
+        uploadChunkSize
+    }
 ): Promise<void> {
+    void archiveFileSize;
     if (!bucketName) {
         throw new Error("Environment variable RUNS_ON_S3_BUCKET_CACHE not set");
     }
@@ -220,50 +322,110 @@ export async function saveCache(
         throw new Error("Environment variable RUNS_ON_AWS_REGION not set");
     }
 
+    // Narrow the module-level env const to non-undefined for use inside the
+    // closure below (the guard above already asserted it).
+    const bucket = bucketName;
+
     const s3Prefix = getS3Prefix(paths, {
         compressionMethod,
         enableCrossOsArchive
     });
     const s3Key = `${s3Prefix}/${key}`;
 
-    const multipartUpload = new Upload({
-        client: s3Client,
-        params: {
-            Bucket: bucketName,
-            Key: s3Key,
-            Body: createReadStream(archivePath)
-        },
-        // Part size in bytes
-        partSize: uploadPartSize,
-        // Max concurrency
-        queueSize: uploadQueueSize
-    });
+    // Stat the archive up front so we can both report its size and size the
+    // multipart upload against it.
+    const cacheSize = utils.getArchiveFileSizeInBytes(archivePath);
+
+    // @aws-sdk/lib-storage enforces a hard MAX_PARTS = 10000 ceiling. With a fixed
+    // part size, any payload larger than partSize * 10000 throws
+    // "Exceeded 10000 parts" (e.g. 32 MB parts cap out at ~320 GB, 64 MB at ~640 GB).
+    // computeEffectivePartSize raises the part size adaptively so any payload is
+    // representable in <= ~9500 parts (headroom under 10000), scales the part size
+    // UP for large archives (fewer parts => less per-part main-loop overhead), and
+    // floors it at S3's 5 MiB multipart minimum so a small upload-chunk-size on a
+    // mid-size cache can't produce a sub-5 MiB part that S3 rejects with
+    // EntityTooSmall. `upload-chunk-size` (bytes), when provided, acts as a part-
+    // size floor but is still raised here for very large archives.
+    const configuredPartSize =
+        uploadChunkSize && uploadChunkSize > 0
+            ? uploadChunkSize
+            : uploadPartSize;
+    const effectivePartSize = computeEffectivePartSize(
+        cacheSize,
+        configuredPartSize
+    );
 
     // Commit Cache
-    const cacheSize = utils.getArchiveFileSizeInBytes(archivePath);
     core.info(
         `Cache Size: ~${Math.round(
             cacheSize / (1024 * 1024)
         )} MB (${cacheSize} B)`
     );
 
-    core.info(`Uploading cache from ${archivePath} to ${bucketName}/${s3Key}`);
+    core.info(`Uploading cache from ${archivePath} to ${bucket}/${s3Key}`);
 
-    const progress = new UploadProgress(cacheSize);
-    progress.startDisplayTimer();
+    // Node fallback upload: the @aws-sdk/lib-storage multipart Upload through the
+    // pooled s3Client. Always present; used when s5cmd/aws-cli are missing or fail.
+    const nodeUpload = async (): Promise<void> => {
+        const estimatedParts = Math.max(
+            1,
+            Math.ceil(cacheSize / effectivePartSize)
+        );
+        core.info(
+            `Multipart upload (node/lib-storage): part size ~${Math.round(
+                effectivePartSize / (1024 * 1024)
+            )} MB, queue size ${uploadQueueSize}, ~${estimatedParts} parts for ${cacheSize} B.`
+        );
 
-    multipartUpload.on("httpUploadProgress", event => {
-        if (typeof event.loaded === "number") {
-            progress.setUploadedBytes(event.loaded);
+        const multipartUpload = new Upload({
+            client: s3Client,
+            params: {
+                Bucket: bucket,
+                Key: s3Key,
+                Body: createReadStream(archivePath)
+            },
+            // Part size in bytes (adaptively floored to stay under the 10000-part cap)
+            partSize: effectivePartSize,
+            // Max concurrency
+            queueSize: uploadQueueSize
+        });
+
+        const progress = new UploadProgress(cacheSize);
+        progress.startDisplayTimer();
+
+        multipartUpload.on("httpUploadProgress", event => {
+            if (typeof event.loaded === "number") {
+                progress.setUploadedBytes(event.loaded);
+            }
+        });
+
+        try {
+            await multipartUpload.done();
+            progress.setUploadedBytes(cacheSize);
+        } finally {
+            progress.stopDisplayTimer();
         }
-    });
+    };
 
-    try {
-        await multipartUpload.done();
-        progress.setUploadedBytes(cacheSize);
-    } finally {
-        progress.stopDisplayTimer();
-    }
+    // Engine chain: s5cmd -> aws-cli -> node. The native engines push the single
+    // archive to the exact same s3://bucket/key the node path would, using the
+    // same credential chain the S3Client uses; a missing/failing engine
+    // transparently falls through to the next.
+    await transferArchive(
+        "upload",
+        {
+            bucket,
+            key: s3Key,
+            archivePath,
+            endpoint,
+            region,
+            forcePathStyle,
+            sizeBytes: cacheSize,
+            partSizeMb: effectivePartSize / (1024 * 1024)
+        },
+        nodeUpload
+    );
+
     core.info(`Cache saved successfully.`);
 }
 

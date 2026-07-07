@@ -2,15 +2,18 @@
 
 import * as core from "@actions/core";
 import * as path from "path";
-import * as utils from "@actions/cache/lib/internal/cacheUtils";
-import * as cacheHttpClient from "./backend";
-import { CompressionMethod } from "@actions/cache/lib/internal/constants";
+
 import {
+    cacheUtils as utils,
+    CompressionMethod,
     createTar as defaultCreateTar,
+    DownloadOptions,
     extractTar as defaultExtractTar,
-    listTar as defaultListTar
-} from "@actions/cache/lib/internal/tar";
-import { DownloadOptions, UploadOptions } from "@actions/cache/lib/options";
+    listTar as defaultListTar,
+    UploadOptions
+} from "../actionsCacheShims.js";
+import * as cacheHttpClient from "./backend";
+import { expandWindowsReparsePoints } from "./utils/reparsePoints";
 import {
     createTar as uncompressedCreateTar,
     extractTar as uncompressedExtractTar,
@@ -280,7 +283,15 @@ export async function saveCache(
     const tarFns = getTarFunctions();
     let cacheId = -1;
 
-    const cachePaths = await utils.resolvePaths(paths);
+    // resolvePaths returns the directory name for a cached directory and relies
+    // on tar recursing into it. A Windows junction (Premier routes Unity's
+    // Library/ onto instance-store NVMe with `mklink /J`) is stored by tar as an
+    // un-followed symlink entry, so the archive would capture zero files. Expand
+    // any such reparse point into its real relative contents so tar archives
+    // them (no-op off Windows and for ordinary directories).
+    const cachePaths = expandWindowsReparsePoints(
+        await utils.resolvePaths(paths)
+    );
     core.debug("Cache Paths:");
     core.debug(`${JSON.stringify(cachePaths)}`);
 
@@ -309,7 +320,11 @@ export async function saveCache(
         await cacheHttpClient.saveCache(key, paths, archivePath, {
             compressionMethod,
             enableCrossOsArchive,
-            cacheSize: archiveFileSize
+            cacheSize: archiveFileSize,
+            // Forward the `upload-chunk-size` input (bytes) so it can override the
+            // default multipart part size in the S3 backend. Previously dropped here,
+            // which silently made the action's `upload-chunk-size` input a no-op.
+            uploadChunkSize: options?.uploadChunkSize
         });
 
         // dummy cacheId, if we get there without raising, it means the cache has been saved
