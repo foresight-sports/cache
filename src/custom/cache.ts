@@ -2,6 +2,7 @@
 
 import * as core from "@actions/core";
 import * as path from "path";
+
 import {
     cacheUtils as utils,
     CompressionMethod,
@@ -12,6 +13,7 @@ import {
     UploadOptions
 } from "../actionsCacheShims.js";
 import * as cacheHttpClient from "./backend";
+import { expandWindowsReparsePoints } from "./utils/reparsePoints";
 import {
     createTar as uncompressedCreateTar,
     extractTar as uncompressedExtractTar,
@@ -281,7 +283,15 @@ export async function saveCache(
     const tarFns = getTarFunctions();
     let cacheId = -1;
 
-    const cachePaths = await utils.resolvePaths(paths);
+    // resolvePaths returns the directory name for a cached directory and relies
+    // on tar recursing into it. A Windows junction (Premier routes Unity's
+    // Library/ onto instance-store NVMe with `mklink /J`) is stored by tar as an
+    // un-followed symlink entry, so the archive would capture zero files. Expand
+    // any such reparse point into its real relative contents so tar archives
+    // them (no-op off Windows and for ordinary directories).
+    const cachePaths = expandWindowsReparsePoints(
+        await utils.resolvePaths(paths)
+    );
     core.debug("Cache Paths:");
     core.debug(`${JSON.stringify(cachePaths)}`);
 
