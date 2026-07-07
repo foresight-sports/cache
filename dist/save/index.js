@@ -126833,10 +126833,10 @@ const RefKey = "GITHUB_REF";
 
 // EXTERNAL MODULE: ./node_modules/@aws-sdk/client-s3/dist-cjs/index.js
 var dist_cjs = __nccwpck_require__(3711);
-// EXTERNAL MODULE: ./node_modules/@smithy/node-http-handler/dist-cjs/index.js
-var node_http_handler_dist_cjs = __nccwpck_require__(1279);
 // EXTERNAL MODULE: ./node_modules/@aws-sdk/lib-storage/dist-cjs/index.js
 var lib_storage_dist_cjs = __nccwpck_require__(2358);
+// EXTERNAL MODULE: ./node_modules/@smithy/node-http-handler/dist-cjs/index.js
+var node_http_handler_dist_cjs = __nccwpck_require__(1279);
 ;// CONCATENATED MODULE: ./src/custom/downloadUtils.ts
 // Just a copy of the original file from the toolkit/actions/cache repository, with a change for byte range used in the downloadCacheHttpClientConcurrent function.
 
@@ -126960,9 +126960,18 @@ class downloadUtils_DownloadProgress {
  */
 async function custom_downloadUtils_downloadCacheHttpClientConcurrent(archiveLocation, archivePath, options) {
     const archiveDescriptor = await fs.promises.open(archivePath, "w");
+    // This downloader builds its OWN @actions/http-client (it does not use the
+    // pooled s3Client in backend.ts, whose NodeHttpHandler maxSockets governs
+    // only the upload path). @actions/http-client's keepAlive agent otherwise
+    // inherits http.globalAgent.maxSockets, so raising downloadConcurrency would
+    // not actually add sockets. Size the socket pool to the download concurrency
+    // (+ headroom for the initial Range 0-1 metadata probe) so concurrent range
+    // requests each get their own connection.
+    const downloadConcurrency = options.downloadConcurrency ?? 8;
     const httpClient = new HttpClient("actions/cache", undefined, {
         socketTimeout: options.timeoutInMs,
-        keepAlive: true
+        keepAlive: true,
+        maxSockets: downloadConcurrency + 4
     });
     let progress;
     try {
@@ -127076,6 +127085,249 @@ const downloadUtils_promiseWithTimeout = async (timeoutMs, promise) => {
     });
 };
 
+;// CONCATENATED MODULE: ./src/custom/transferEngine.ts
+// Transfer-engine fallback chain for the single cache archive (cache.tzst).
+//
+// Single-process Node TLS caps out well below the NIC (~2.5 Gbps / ~330 MB/s on
+// a 16xlarge, ~100 MB/s on a 4xlarge) and adding Node concurrency scales
+// sub-linearly (one event loop). Native multi-threaded S3 engines break that
+// ceiling by using the otherwise-idle cores:
+//
+//   1. s5cmd  — Go, goroutine worker pool, no GIL/event-loop ceiling.
+//   2. aws-cli v2 — CRT (C++) transfer manager, native threads.
+//   3. node   — the always-present @actions/lib-storage upload / hand-rolled
+//               ranged downloader; the last-resort safety net.
+//
+// Engines are tried in order; a missing binary is skipped and a failing engine
+// falls through to the next, so a transfer never hard-fails just because s5cmd
+// or aws-cli is absent or errors. This mirrors the pattern Premier already uses
+// for its R2 publish (s5cmd primary, aws-cli fallback).
+//
+// The engine ONLY moves the single archive file to/from s3://<bucket>/<key>.
+// Archive handling (zstd, the junction-following manifest, versionSalt, the
+// adaptive part-size floor) is unchanged and lives in cache.ts / backend.ts.
+// Because every engine transfers byte-identical archive bytes to/from the same
+// content-addressed key, a cache written by any engine is restorable by any
+// engine (integrity is the content-hash baked into the key + a size/extract
+// check downstream, never the multipart ETag, which legitimately differs
+// between engines that pick different part boundaries).
+
+
+
+
+
+// s5cmd's global worker pool. Scale to cores so the goroutine fan-out actually
+// uses the box, with a floor so tiny runners still parallelize and a ceiling
+// matching s5cmd's own default.
+const S5CMD_MIN_WORKERS = 32;
+const S5CMD_MAX_WORKERS = 256;
+// aws-cli's max_concurrent_requests. Same core-scaling idea; the CRT default of
+// 10 is the flat-26-MB/s bottleneck Premier measured, so lift it well above.
+const AWS_CLI_MIN_CONCURRENCY = 16;
+const AWS_CLI_MAX_CONCURRENCY = 256;
+function scaleToCores(cpuCount, min, max, factor = 4) {
+    const cores = Number.isFinite(cpuCount) && cpuCount > 0 ? cpuCount : 1;
+    return Math.min(max, Math.max(min, Math.floor(cores) * factor));
+}
+/** s5cmd `--numworkers`, scaled to cores (floor 32, ceiling 256). */
+function computeS5cmdWorkers(cpuCount = external_os_.cpus().length) {
+    return scaleToCores(cpuCount, S5CMD_MIN_WORKERS, S5CMD_MAX_WORKERS);
+}
+/** aws-cli `max_concurrent_requests`, scaled to cores (floor 16, ceiling 256). */
+function computeAwsCliConcurrency(cpuCount = external_os_.cpus().length) {
+    return scaleToCores(cpuCount, AWS_CLI_MIN_CONCURRENCY, AWS_CLI_MAX_CONCURRENCY);
+}
+/** Region for the engines; "auto" when unset (S3-compatible endpoints/R2). */
+function resolveRegion(region) {
+    return region && region.length > 0 ? region : "auto";
+}
+function s3Uri(params) {
+    return `s3://${params.bucket}/${params.key}`;
+}
+/**
+ * Build the full s5cmd argv: `[global flags] cp [cp flags] <src> <dst>`.
+ * s5cmd auto-selects path-style addressing whenever a custom --endpoint-url is
+ * given, so no explicit path-style flag is needed (there isn't one).
+ */
+function buildS5cmdArgs(direction, params, cpuCount = external_os_.cpus().length) {
+    const workers = computeS5cmdWorkers(cpuCount);
+    // Global flags precede the subcommand. --stat prints an end-of-run summary;
+    // --log error drops per-object success chatter.
+    const args = [
+        "--numworkers",
+        String(workers),
+        "--stat",
+        "--log",
+        "error"
+    ];
+    if (params.endpoint) {
+        args.push("--endpoint-url", params.endpoint);
+    }
+    // cp flags: --concurrency is the per-object part parallelism (what actually
+    // multiparts a single large archive across the worker pool); --part-size is
+    // in MiB.
+    args.push("cp", "--concurrency", String(workers));
+    if (params.partSizeMb && params.partSizeMb > 0) {
+        args.push("--part-size", String(Math.max(5, Math.round(params.partSizeMb))));
+    }
+    if (direction === "upload") {
+        args.push(params.archivePath, s3Uri(params));
+    }
+    else {
+        args.push(s3Uri(params), params.archivePath);
+    }
+    return args;
+}
+/**
+ * `aws configure set default.s3.*` argv batches to run before the cp. These
+ * tuning knobs have no CLI flag — they live only in the aws config file — so
+ * they must be set this way first.
+ */
+function buildAwsCliConfigureArgs(params, cpuCount = external_os_.cpus().length) {
+    const concurrency = computeAwsCliConcurrency(cpuCount);
+    const chunkMb = params.partSizeMb && params.partSizeMb > 0
+        ? Math.max(5, Math.round(params.partSizeMb))
+        : 64;
+    const batches = [
+        [
+            "configure",
+            "set",
+            "default.s3.max_concurrent_requests",
+            String(concurrency)
+        ],
+        ["configure", "set", "default.s3.max_queue_size", "100000"],
+        ["configure", "set", "default.s3.multipart_threshold", "64MB"],
+        ["configure", "set", "default.s3.multipart_chunksize", `${chunkMb}MB`]
+    ];
+    if (params.forcePathStyle) {
+        batches.push([
+            "configure",
+            "set",
+            "default.s3.addressing_style",
+            "path"
+        ]);
+    }
+    return batches;
+}
+/** `aws s3 cp <src> <dst> --endpoint-url <ep> --only-show-errors`. */
+function buildAwsCliCpArgs(direction, params) {
+    const args = ["s3", "cp"];
+    if (direction === "upload") {
+        args.push(params.archivePath, s3Uri(params));
+    }
+    else {
+        args.push(s3Uri(params), params.archivePath);
+    }
+    if (params.endpoint) {
+        args.push("--endpoint-url", params.endpoint);
+    }
+    args.push("--only-show-errors");
+    return args;
+}
+function sanitizeEnv(env) {
+    const sanitized = {};
+    for (const [key, value] of Object.entries(env)) {
+        if (value !== undefined) {
+            sanitized[key] = value;
+        }
+    }
+    return sanitized;
+}
+// s5cmd / aws-cli inherit AWS credentials from the same default chain the
+// S3Client uses (env vars, shared file, or — on RunsOn, where backend.ts unsets
+// the static keys — the EC2 IAM instance profile). We only pin AWS_REGION so a
+// missing region resolves to "auto" for S3-compatible endpoints.
+function buildEngineEnv(params) {
+    return sanitizeEnv({
+        ...process.env,
+        AWS_REGION: resolveRegion(params.region)
+    });
+}
+async function runS5cmd(direction, params, execPath) {
+    await exec_exec(`"${execPath}"`, buildS5cmdArgs(direction, params), {
+        env: buildEngineEnv(params)
+    });
+}
+async function runAwsCli(direction, params, execPath) {
+    const env = buildEngineEnv(params);
+    for (const configureArgs of buildAwsCliConfigureArgs(params)) {
+        await exec_exec(`"${execPath}"`, configureArgs, { env, silent: true });
+    }
+    await exec_exec(`"${execPath}"`, buildAwsCliCpArgs(direction, params), { env });
+}
+/** Resolve a binary on PATH cross-platform (io.which honors PATHEXT on Windows). */
+async function findExecutable(name) {
+    try {
+        const resolved = await which(name, false);
+        return resolved || undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+function logThroughput(engine, direction, params, startedAtMs) {
+    const elapsedSec = Math.max((Date.now() - startedAtMs) / 1000, 0.001);
+    let bytes = params.sizeBytes ?? 0;
+    if (bytes <= 0) {
+        try {
+            bytes = external_fs_namespaceObject.statSync(params.archivePath).size;
+        }
+        catch {
+            bytes = 0;
+        }
+    }
+    const mb = bytes / (1024 * 1024);
+    const mbPerSec = (mb / elapsedSec).toFixed(1);
+    info(`Cache ${direction} via ${engine}: ${bytes} B (~${Math.round(mb)} MB) in ${elapsedSec.toFixed(1)}s = ${mbPerSec} MB/s`);
+}
+const defaultDeps = {
+    findExecutable,
+    runS5cmd,
+    runAwsCli
+};
+/**
+ * Move the single archive to/from s3://bucket/key using the first available,
+ * working engine: s5cmd -> aws-cli -> node. `nodeFallback` performs the
+ * existing Node transfer (lib-storage upload for "upload", the presigned ranged
+ * downloader for "download") and is the guaranteed last resort. Returns the
+ * engine that actually completed the transfer.
+ */
+async function transferEngine_transferArchive(direction, params, nodeFallback, deps = defaultDeps) {
+    const startedAtMs = Date.now();
+    // Engine 1: s5cmd.
+    const s5cmdPath = await deps.findExecutable("s5cmd");
+    if (s5cmdPath) {
+        try {
+            info(`Cache ${direction}: engine s5cmd (${s5cmdPath}).`);
+            await deps.runS5cmd(direction, params, s5cmdPath);
+            logThroughput("s5cmd", direction, params, startedAtMs);
+            return "s5cmd";
+        }
+        catch (error) {
+            warning(`s5cmd ${direction} failed (${error.message}); falling back to aws-cli.`);
+        }
+    }
+    // Engine 2: aws-cli.
+    const awsPath = await deps.findExecutable("aws");
+    if (awsPath) {
+        try {
+            info(`Cache ${direction}: engine aws-cli (${awsPath}).`);
+            await deps.runAwsCli(direction, params, awsPath);
+            logThroughput("aws-cli", direction, params, startedAtMs);
+            return "aws-cli";
+        }
+        catch (error) {
+            warning(`aws-cli ${direction} failed (${error.message}); falling back to node.`);
+        }
+    }
+    // Engine 3: node — always present, so this always completes or throws the
+    // node error (never a "no engine available" failure).
+    info(`Cache ${direction}: engine node (${direction === "upload" ? "lib-storage" : "http-client"}).`);
+    await nodeFallback();
+    logThroughput("node", direction, params, startedAtMs);
+    return "node";
+}
+
 ;// CONCATENATED MODULE: ./src/custom/utils/partSize.ts
 // S3 multipart-upload part-size math, centralized here so it is unit testable in
 // isolation without pulling in the S3 client / AWS SDK (see __tests__/partSize.test.ts).
@@ -127086,18 +127338,40 @@ const downloadUtils_promiseWithTimeout = async (timeoutMs, promise) => {
 //  - S3 requires every part except the last to be at least 5 MiB. A small
 //    upload-chunk-size on a mid-size cache could otherwise yield a sub-5 MiB part
 //    that S3 rejects with EntityTooSmall.
+//  - Beyond just staying under the hard ceiling, a very large archive at the
+//    default (e.g. 64 MB) part size produces thousands of parts; each part
+//    completion is main-loop work in the single-threaded Node uploader. So we
+//    also scale the part size UP for large archives — targeting ~PREFERRED parts
+//    (fewer, bigger parts => less per-part overhead) — capped at MAX_PART_SIZE so
+//    we keep enough parts for multipart concurrency and bound the lib-storage
+//    in-flight buffer memory (queueSize * partSize).
 const MAX_MULTIPART_PARTS_TARGET = 9500;
+const PREFERRED_MULTIPART_PARTS = 2000;
 const S3_MIN_PART_SIZE = 5 * 1024 * 1024;
+const MAX_PART_SIZE = 128 * 1024 * 1024;
 /**
- * Compute the multipart part size (in bytes) for a cache upload: the configured
- * part size, floored so the payload fits in <= ~9500 parts and never drops below
- * S3's 5 MiB per-part minimum.
+ * Compute the multipart part size (in bytes) for a cache upload: the largest of
+ *  - the configured part size (a floor: the upload-chunk-size input or default),
+ *  - the hard floor that keeps the payload under the ~9500-part ceiling,
+ *  - the upward "preferred" size that targets ~PREFERRED_MULTIPART_PARTS parts
+ *    for large archives (capped at MAX_PART_SIZE), and
+ *  - S3's 5 MiB per-part minimum.
+ *
+ * Taking the max means the part count is always < ~9500 (the hard floor is one
+ * of the terms) and never below 5 MiB, while large archives get bigger parts to
+ * cut per-part overhead.
  */
 function computeEffectivePartSize(cacheSize, configuredPartSize) {
-    return Math.max(configuredPartSize, Math.ceil(cacheSize / MAX_MULTIPART_PARTS_TARGET), S3_MIN_PART_SIZE);
+    // Hard floor: guarantees ceil(cacheSize / partSize) <= ~9500 parts.
+    const partCeilingFloor = Math.ceil(cacheSize / MAX_MULTIPART_PARTS_TARGET);
+    // Upward scaling for large archives: aim for ~PREFERRED parts, but never let
+    // a single part exceed MAX_PART_SIZE (preserves concurrency + bounds memory).
+    const preferredForSize = Math.min(MAX_PART_SIZE, Math.ceil(cacheSize / PREFERRED_MULTIPART_PARTS));
+    return Math.max(configuredPartSize, partCeilingFloor, preferredForSize, S3_MIN_PART_SIZE);
 }
 
 ;// CONCATENATED MODULE: ./src/custom/backend.ts
+
 
 
 
@@ -127132,8 +127406,8 @@ const forcePathStyle = process.env.RUNS_ON_S3_FORCE_PATH_STYLE === "true" ||
     process.env.AWS_S3_FORCE_PATH_STYLE === "true";
 const uploadQueueSize = Number(process.env.UPLOAD_QUEUE_SIZE || "16");
 const uploadPartSize = Number(process.env.UPLOAD_PART_SIZE || "64") * 1024 * 1024;
-const downloadQueueSize = Number(process.env.DOWNLOAD_QUEUE_SIZE || "8");
-const downloadPartSize = Number(process.env.DOWNLOAD_PART_SIZE || "16") * 1024 * 1024;
+const downloadQueueSize = Number(process.env.DOWNLOAD_QUEUE_SIZE || "16");
+const downloadPartSize = Number(process.env.DOWNLOAD_PART_SIZE || "32") * 1024 * 1024;
 // The AWS SDK's default HTTP handler caps concurrent sockets at maxSockets=50,
 // which throttles multipart concurrency above ~48 no matter how large the queue
 // size is. This socket pool is attached to s3Client, which only the upload path
@@ -127212,49 +127486,70 @@ async function backend_downloadCache(archiveLocation, archivePath, options) {
     if (!region) {
         throw new Error("Environment variable RUNS_ON_AWS_REGION not set");
     }
+    // Narrow the module-level env consts to non-undefined for use inside the
+    // closure below (the guards above already asserted them).
+    const bucket = bucketName;
     const archiveUrl = new URL(archiveLocation);
     const objectKey = archiveUrl.pathname.slice(1);
-    // Retry logic for download validation failures
-    const maxRetries = 3;
-    let lastError;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-            const command = new GetObjectCommand({
-                Bucket: bucketName,
-                Key: objectKey
-            });
-            const url = await getSignedUrl(s3Client, command, {
-                expiresIn: 3600
-            });
-            await downloadCacheHttpClientConcurrent(url, archivePath, {
-                ...options,
-                downloadConcurrency: downloadQueueSize,
-                concurrentBlobDownloads: true,
-                partSize: downloadPartSize
-            });
-            // If we get here, download succeeded
-            return;
-        }
-        catch (error) {
-            const errorMessage = error.message;
-            lastError = error;
-            // Only retry on validation failures, not on other errors
-            if (errorMessage.includes("Download validation failed") ||
-                errorMessage.includes("Range request not supported") ||
-                errorMessage.includes("Content-Range header")) {
-                if (attempt < maxRetries) {
-                    const delayMs = Math.pow(2, attempt - 1) * 1000; // exponential backoff
-                    core.warning(`Download attempt ${attempt} failed: ${errorMessage}. Retrying in ${delayMs}ms...`);
-                    await new Promise(resolve => setTimeout(resolve, delayMs));
-                    continue;
-                }
+    // Node fallback: presigned-URL ranged downloader with validation retries.
+    // This is the always-present safety net used when s5cmd/aws-cli are missing
+    // or fail. The presigned URL is signed with the same S3Client credentials the
+    // direct engine path uses, so read access is identical either way.
+    const nodeDownload = async () => {
+        const maxRetries = 3;
+        let lastError;
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                const command = new GetObjectCommand({
+                    Bucket: bucket,
+                    Key: objectKey
+                });
+                const url = await getSignedUrl(s3Client, command, {
+                    expiresIn: 3600
+                });
+                await downloadCacheHttpClientConcurrent(url, archivePath, {
+                    ...options,
+                    downloadConcurrency: downloadQueueSize,
+                    concurrentBlobDownloads: true,
+                    partSize: downloadPartSize
+                });
+                // If we get here, download succeeded
+                return;
             }
-            // For non-retryable errors or max retries reached, throw the error
-            throw error;
+            catch (error) {
+                const errorMessage = error.message;
+                lastError = error;
+                // Only retry on validation failures, not on other errors
+                if (errorMessage.includes("Download validation failed") ||
+                    errorMessage.includes("Range request not supported") ||
+                    errorMessage.includes("Content-Range header")) {
+                    if (attempt < maxRetries) {
+                        const delayMs = Math.pow(2, attempt - 1) * 1000; // exponential backoff
+                        core.warning(`Download attempt ${attempt} failed: ${errorMessage}. Retrying in ${delayMs}ms...`);
+                        await new Promise(resolve => setTimeout(resolve, delayMs));
+                        continue;
+                    }
+                }
+                // For non-retryable errors or max retries reached, throw the error
+                throw error;
+            }
         }
-    }
-    // This should never be reached, but just in case
-    throw lastError || new Error("Download failed after all retry attempts");
+        // This should never be reached, but just in case
+        throw (lastError || new Error("Download failed after all retry attempts"));
+    };
+    // Engine chain: s5cmd -> aws-cli -> node. The native engines pull the object
+    // directly by bucket+key (same credential chain the S3Client signs with);
+    // the node presigned downloader is the guaranteed fallback if a native
+    // engine is unavailable or fails. The archive key is derived identically to
+    // the upload path, so any engine restores any engine's cache.
+    await transferArchive("download", {
+        bucket,
+        key: objectKey,
+        archivePath,
+        endpoint,
+        region,
+        forcePathStyle
+    }, nodeDownload);
 }
 async function backend_saveCache(key, paths, archivePath, { compressionMethod, enableCrossOsArchive, cacheSize: archiveFileSize, uploadChunkSize }) {
     void archiveFileSize;
@@ -127264,6 +127559,9 @@ async function backend_saveCache(key, paths, archivePath, { compressionMethod, e
     if (!region) {
         throw new Error("Environment variable RUNS_ON_AWS_REGION not set");
     }
+    // Narrow the module-level env const to non-undefined for use inside the
+    // closure below (the guard above already asserted it).
+    const bucket = bucketName;
     const s3Prefix = getS3Prefix(paths, {
         compressionMethod,
         enableCrossOsArchive
@@ -127276,46 +127574,65 @@ async function backend_saveCache(key, paths, archivePath, { compressionMethod, e
     // part size, any payload larger than partSize * 10000 throws
     // "Exceeded 10000 parts" (e.g. 32 MB parts cap out at ~320 GB, 64 MB at ~640 GB).
     // computeEffectivePartSize raises the part size adaptively so any payload is
-    // representable in <= ~9500 parts (headroom under 10000), and also floors it at
-    // S3's 5 MiB multipart minimum so a small upload-chunk-size on a mid-size cache
-    // can't produce a sub-5 MiB part that S3 rejects with EntityTooSmall.
-    // `upload-chunk-size` (bytes), when provided, overrides the default part size
-    // but is still floored here.
+    // representable in <= ~9500 parts (headroom under 10000), scales the part size
+    // UP for large archives (fewer parts => less per-part main-loop overhead), and
+    // floors it at S3's 5 MiB multipart minimum so a small upload-chunk-size on a
+    // mid-size cache can't produce a sub-5 MiB part that S3 rejects with
+    // EntityTooSmall. `upload-chunk-size` (bytes), when provided, acts as a part-
+    // size floor but is still raised here for very large archives.
     const configuredPartSize = uploadChunkSize && uploadChunkSize > 0
         ? uploadChunkSize
         : uploadPartSize;
     const effectivePartSize = computeEffectivePartSize(cacheSize, configuredPartSize);
-    const estimatedParts = Math.max(1, Math.ceil(cacheSize / effectivePartSize));
-    info(`Multipart upload: part size ~${Math.round(effectivePartSize / (1024 * 1024))} MB, queue size ${uploadQueueSize}, ~${estimatedParts} parts for ${cacheSize} B.`);
-    const multipartUpload = new lib_storage_dist_cjs/* Upload */._({
-        client: s3Client,
-        params: {
-            Bucket: bucketName,
-            Key: s3Key,
-            Body: (0,external_fs_namespaceObject.createReadStream)(archivePath)
-        },
-        // Part size in bytes (adaptively floored to stay under the 10000-part cap)
-        partSize: effectivePartSize,
-        // Max concurrency
-        queueSize: uploadQueueSize
-    });
     // Commit Cache
     info(`Cache Size: ~${Math.round(cacheSize / (1024 * 1024))} MB (${cacheSize} B)`);
-    info(`Uploading cache from ${archivePath} to ${bucketName}/${s3Key}`);
-    const progress = new backend_UploadProgress(cacheSize);
-    progress.startDisplayTimer();
-    multipartUpload.on("httpUploadProgress", event => {
-        if (typeof event.loaded === "number") {
-            progress.setUploadedBytes(event.loaded);
+    info(`Uploading cache from ${archivePath} to ${bucket}/${s3Key}`);
+    // Node fallback upload: the @aws-sdk/lib-storage multipart Upload through the
+    // pooled s3Client. Always present; used when s5cmd/aws-cli are missing or fail.
+    const nodeUpload = async () => {
+        const estimatedParts = Math.max(1, Math.ceil(cacheSize / effectivePartSize));
+        info(`Multipart upload (node/lib-storage): part size ~${Math.round(effectivePartSize / (1024 * 1024))} MB, queue size ${uploadQueueSize}, ~${estimatedParts} parts for ${cacheSize} B.`);
+        const multipartUpload = new lib_storage_dist_cjs/* Upload */._({
+            client: s3Client,
+            params: {
+                Bucket: bucket,
+                Key: s3Key,
+                Body: (0,external_fs_namespaceObject.createReadStream)(archivePath)
+            },
+            // Part size in bytes (adaptively floored to stay under the 10000-part cap)
+            partSize: effectivePartSize,
+            // Max concurrency
+            queueSize: uploadQueueSize
+        });
+        const progress = new backend_UploadProgress(cacheSize);
+        progress.startDisplayTimer();
+        multipartUpload.on("httpUploadProgress", event => {
+            if (typeof event.loaded === "number") {
+                progress.setUploadedBytes(event.loaded);
+            }
+        });
+        try {
+            await multipartUpload.done();
+            progress.setUploadedBytes(cacheSize);
         }
-    });
-    try {
-        await multipartUpload.done();
-        progress.setUploadedBytes(cacheSize);
-    }
-    finally {
-        progress.stopDisplayTimer();
-    }
+        finally {
+            progress.stopDisplayTimer();
+        }
+    };
+    // Engine chain: s5cmd -> aws-cli -> node. The native engines push the single
+    // archive to the exact same s3://bucket/key the node path would, using the
+    // same credential chain the S3Client uses; a missing/failing engine
+    // transparently falls through to the next.
+    await transferEngine_transferArchive("upload", {
+        bucket,
+        key: s3Key,
+        archivePath,
+        endpoint,
+        region,
+        forcePathStyle,
+        sizeBytes: cacheSize,
+        partSizeMb: effectivePartSize / (1024 * 1024)
+    }, nodeUpload);
     info(`Cache saved successfully.`);
 }
 class backend_UploadProgress {
@@ -127549,7 +127866,7 @@ function appendPlatformSpecificArgs(tool, args) {
         }
     }
 }
-function sanitizeEnv(env) {
+function uncompressedTar_sanitizeEnv(env) {
     const sanitized = {};
     for (const [key, value] of Object.entries(env)) {
         if (value !== undefined) {
@@ -127559,7 +127876,7 @@ function sanitizeEnv(env) {
     return sanitized;
 }
 function getExecEnv() {
-    return sanitizeEnv({ ...process.env, MSYS: "winsymlinks:nativestrict" });
+    return uncompressedTar_sanitizeEnv({ ...process.env, MSYS: "winsymlinks:nativestrict" });
 }
 // createTar shells out to `zstd` (the no-compression fast path compresses with
 // multithreaded zstd). If zstd isn't on PATH the tar invocation fails and the

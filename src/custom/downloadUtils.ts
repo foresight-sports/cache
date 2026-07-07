@@ -3,7 +3,11 @@ import * as core from "@actions/core";
 import { HttpClient } from "@actions/http-client";
 import { TransferProgressEvent } from "@azure/core-rest-pipeline";
 import * as fs from "fs";
-import { DownloadOptions, retryHttpClientResponse } from "../actionsCacheShims.js";
+
+import {
+    DownloadOptions,
+    retryHttpClientResponse
+} from "../actionsCacheShims.js";
 
 export interface RunsOnDownloadOptions extends DownloadOptions {
     partSize: number;
@@ -155,9 +159,18 @@ export async function downloadCacheHttpClientConcurrent(
     options: RunsOnDownloadOptions
 ): Promise<void> {
     const archiveDescriptor = await fs.promises.open(archivePath, "w");
+    // This downloader builds its OWN @actions/http-client (it does not use the
+    // pooled s3Client in backend.ts, whose NodeHttpHandler maxSockets governs
+    // only the upload path). @actions/http-client's keepAlive agent otherwise
+    // inherits http.globalAgent.maxSockets, so raising downloadConcurrency would
+    // not actually add sockets. Size the socket pool to the download concurrency
+    // (+ headroom for the initial Range 0-1 metadata probe) so concurrent range
+    // requests each get their own connection.
+    const downloadConcurrency = options.downloadConcurrency ?? 8;
     const httpClient = new HttpClient("actions/cache", undefined, {
         socketTimeout: options.timeoutInMs,
-        keepAlive: true
+        keepAlive: true,
+        maxSockets: downloadConcurrency + 4
     });
     let progress: DownloadProgress | undefined;
     try {
