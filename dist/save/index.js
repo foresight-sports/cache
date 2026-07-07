@@ -126835,6 +126835,8 @@ const RefKey = "GITHUB_REF";
 var dist_cjs = __nccwpck_require__(3711);
 // EXTERNAL MODULE: ./node_modules/@aws-sdk/lib-storage/dist-cjs/index.js
 var lib_storage_dist_cjs = __nccwpck_require__(2358);
+// EXTERNAL MODULE: ./node_modules/@smithy/node-http-handler/dist-cjs/index.js
+var node_http_handler_dist_cjs = __nccwpck_require__(1279);
 ;// CONCATENATED MODULE: ./src/custom/downloadUtils.ts
 // Just a copy of the original file from the toolkit/actions/cache repository, with a change for byte range used in the downloadCacheHttpClientConcurrent function.
 
@@ -126958,9 +126960,18 @@ class downloadUtils_DownloadProgress {
  */
 async function custom_downloadUtils_downloadCacheHttpClientConcurrent(archiveLocation, archivePath, options) {
     const archiveDescriptor = await fs.promises.open(archivePath, "w");
+    // This downloader builds its OWN @actions/http-client (it does not use the
+    // pooled s3Client in backend.ts, whose NodeHttpHandler maxSockets governs
+    // only the upload path). @actions/http-client's keepAlive agent otherwise
+    // inherits http.globalAgent.maxSockets, so raising downloadConcurrency would
+    // not actually add sockets. Size the socket pool to the download concurrency
+    // (+ headroom for the initial Range 0-1 metadata probe) so concurrent range
+    // requests each get their own connection.
+    const downloadConcurrency = options.downloadConcurrency ?? 8;
     const httpClient = new HttpClient("actions/cache", undefined, {
         socketTimeout: options.timeoutInMs,
-        keepAlive: true
+        keepAlive: true,
+        maxSockets: downloadConcurrency + 4
     });
     let progress;
     try {
@@ -127010,7 +127021,11 @@ async function custom_downloadUtils_downloadCacheHttpClientConcurrent(archiveLoc
         while ((nextDownload = downloads.pop())) {
             activeDownloads[nextDownload.offset] = nextDownload.promiseGetter();
             actives++;
-            if (actives >= (options.downloadConcurrency ?? 10)) {
+            // Reuse the same downloadConcurrency computed above (default 8) that
+            // sized the socket pool, so the in-flight gate can never exceed the
+            // number of sockets available to serve it (previously this defaulted
+            // to 10 while the pool was sized for 8).
+            if (actives >= downloadConcurrency) {
                 await waitAndWrite();
             }
         }
@@ -127074,7 +127089,355 @@ const downloadUtils_promiseWithTimeout = async (timeoutMs, promise) => {
     });
 };
 
+;// CONCATENATED MODULE: ./src/custom/transferEngine.ts
+// Transfer-engine fallback chain for the single cache archive (cache.tzst).
+//
+// Single-process Node TLS caps out well below the NIC (~2.5 Gbps / ~330 MB/s on
+// a 16xlarge, ~100 MB/s on a 4xlarge) and adding Node concurrency scales
+// sub-linearly (one event loop). Native multi-threaded S3 engines break that
+// ceiling by using the otherwise-idle cores:
+//
+//   1. s5cmd  — Go, goroutine worker pool, no GIL/event-loop ceiling.
+//   2. aws-cli v2 — CRT (C++) transfer manager, native threads.
+//   3. node   — the always-present @actions/lib-storage upload / hand-rolled
+//               ranged downloader; the last-resort safety net.
+//
+// Engines are tried in order; a missing binary is skipped and a failing engine
+// falls through to the next, so a transfer never hard-fails just because s5cmd
+// or aws-cli is absent or errors. This mirrors the pattern Premier already uses
+// for its R2 publish (s5cmd primary, aws-cli fallback).
+//
+// The engine ONLY moves the single archive file to/from s3://<bucket>/<key>.
+// Archive handling (zstd, the junction-following manifest, versionSalt, the
+// adaptive part-size floor) is unchanged and lives in cache.ts / backend.ts.
+// Because every engine transfers byte-identical archive bytes to/from the same
+// content-addressed key, a cache written by any engine is restorable by any
+// engine (integrity is the content-hash baked into the key + a size/extract
+// check downstream, never the multipart ETag, which legitimately differs
+// between engines that pick different part boundaries).
+
+
+
+
+
+
+// s5cmd's global worker pool. Scale to cores so the goroutine fan-out actually
+// uses the box, with a floor so tiny runners still parallelize and a ceiling
+// matching s5cmd's own default.
+const S5CMD_MIN_WORKERS = 32;
+const S5CMD_MAX_WORKERS = 256;
+// aws-cli's max_concurrent_requests. Same core-scaling idea; the CRT default of
+// 10 is the flat-26-MB/s bottleneck Premier measured, so lift it well above.
+const AWS_CLI_MIN_CONCURRENCY = 16;
+const AWS_CLI_MAX_CONCURRENCY = 256;
+function scaleToCores(cpuCount, min, max, factor = 4) {
+    const cores = Number.isFinite(cpuCount) && cpuCount > 0 ? cpuCount : 1;
+    return Math.min(max, Math.max(min, Math.floor(cores) * factor));
+}
+/** s5cmd `--numworkers`, scaled to cores (floor 32, ceiling 256). */
+function computeS5cmdWorkers(cpuCount = external_os_.cpus().length) {
+    return scaleToCores(cpuCount, S5CMD_MIN_WORKERS, S5CMD_MAX_WORKERS);
+}
+/** aws-cli `max_concurrent_requests`, scaled to cores (floor 16, ceiling 256). */
+function computeAwsCliConcurrency(cpuCount = external_os_.cpus().length) {
+    return scaleToCores(cpuCount, AWS_CLI_MIN_CONCURRENCY, AWS_CLI_MAX_CONCURRENCY);
+}
+/** Region for the engines; "auto" when unset (S3-compatible endpoints/R2). */
+function resolveRegion(region) {
+    return region && region.length > 0 ? region : "auto";
+}
+function s3Uri(params) {
+    return `s3://${params.bucket}/${params.key}`;
+}
+/**
+ * Build the full s5cmd argv: `[global flags] cp [cp flags] <src> <dst>`.
+ * s5cmd auto-selects path-style addressing whenever a custom --endpoint-url is
+ * given, so no explicit path-style flag is needed (there isn't one). Note this
+ * means a hypothetical custom endpoint that requires virtual-host addressing
+ * (params.forcePathStyle === false) is NOT handled here — s5cmd would still
+ * force path-style for it — but that is not a RunsOn scenario (RunsOn / R2 /
+ * MinIO custom endpoints are all path-style), so it is left intentionally
+ * unaddressed rather than adding a code path that can never run.
+ */
+function buildS5cmdArgs(direction, params, cpuCount = external_os_.cpus().length) {
+    const workers = computeS5cmdWorkers(cpuCount);
+    // Global flags precede the subcommand. --stat prints an end-of-run summary;
+    // --log error drops per-object success chatter.
+    const args = [
+        "--numworkers",
+        String(workers),
+        "--stat",
+        "--log",
+        "error"
+    ];
+    if (params.endpoint) {
+        args.push("--endpoint-url", params.endpoint);
+    }
+    // cp flags: --concurrency is the per-object part parallelism (what actually
+    // multiparts a single large archive across the worker pool); --part-size is
+    // in MiB.
+    args.push("cp", "--concurrency", String(workers));
+    if (params.partSizeMb && params.partSizeMb > 0) {
+        args.push("--part-size", String(Math.max(5, Math.round(params.partSizeMb))));
+    }
+    if (direction === "upload") {
+        args.push(params.archivePath, s3Uri(params));
+    }
+    else {
+        args.push(s3Uri(params), params.archivePath);
+    }
+    return args;
+}
+/**
+ * `aws configure set default.s3.*` argv batches to run before the cp. These
+ * tuning knobs have no CLI flag — they live only in the aws config file — so
+ * they must be set this way first.
+ */
+function buildAwsCliConfigureArgs(params, cpuCount = external_os_.cpus().length) {
+    const concurrency = computeAwsCliConcurrency(cpuCount);
+    const chunkMb = params.partSizeMb && params.partSizeMb > 0
+        ? Math.max(5, Math.round(params.partSizeMb))
+        : 64;
+    const batches = [
+        [
+            "configure",
+            "set",
+            "default.s3.max_concurrent_requests",
+            String(concurrency)
+        ],
+        ["configure", "set", "default.s3.max_queue_size", "100000"],
+        ["configure", "set", "default.s3.multipart_threshold", "64MB"],
+        ["configure", "set", "default.s3.multipart_chunksize", `${chunkMb}MB`]
+    ];
+    if (params.forcePathStyle) {
+        batches.push([
+            "configure",
+            "set",
+            "default.s3.addressing_style",
+            "path"
+        ]);
+    }
+    return batches;
+}
+/** `aws s3 cp <src> <dst> --endpoint-url <ep> --only-show-errors`. */
+function buildAwsCliCpArgs(direction, params) {
+    const args = ["s3", "cp"];
+    if (direction === "upload") {
+        args.push(params.archivePath, s3Uri(params));
+    }
+    else {
+        args.push(s3Uri(params), params.archivePath);
+    }
+    if (params.endpoint) {
+        args.push("--endpoint-url", params.endpoint);
+    }
+    args.push("--only-show-errors");
+    return args;
+}
+function sanitizeEnv(env) {
+    const sanitized = {};
+    for (const [key, value] of Object.entries(env)) {
+        if (value !== undefined) {
+            sanitized[key] = value;
+        }
+    }
+    return sanitized;
+}
+// s5cmd / aws-cli inherit AWS credentials from the same default chain the
+// S3Client uses (env vars, shared file, or — on RunsOn, where backend.ts unsets
+// the static keys — the EC2 IAM instance profile). We pin AWS_REGION so a
+// missing region resolves to "auto" for S3-compatible endpoints, and we point
+// AWS_CONFIG_FILE / AWS_SHARED_CREDENTIALS_FILE at PER-TRANSFER temp files so
+// aws-cli's `configure set default.s3.*` writes land in a throwaway scoped
+// config instead of persistently mutating the shared ~/.aws/config [default]
+// profile (a side-effect two concurrent `aws` runs would also race on); the
+// subsequent `aws s3 cp` reads that same scoped file. Isolating these files
+// does NOT change which credentials the engines use — env-var creds take
+// priority over files, and the RunsOn IAM instance profile is discovered via
+// IMDS (not a file) — so the engine credential source stays identical to the
+// S3Client's. Only static creds living solely in the default shared file (a
+// non-RunsOn dev setup, where env-var creds are the norm) would be bypassed.
+function buildEngineEnv(params) {
+    const unique = `${process.pid}-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2)}`;
+    const configFile = external_path_.join(external_os_.tmpdir(), `runs-on-aws-config-${unique}`);
+    const credentialsFile = external_path_.join(external_os_.tmpdir(), `runs-on-aws-credentials-${unique}`);
+    const env = sanitizeEnv({
+        ...process.env,
+        AWS_REGION: resolveRegion(params.region),
+        AWS_CONFIG_FILE: configFile,
+        AWS_SHARED_CREDENTIALS_FILE: credentialsFile
+    });
+    const cleanup = () => {
+        for (const file of [configFile, credentialsFile]) {
+            try {
+                external_fs_namespaceObject.rmSync(file, { force: true });
+            }
+            catch {
+                /* best-effort temp cleanup */
+            }
+        }
+    };
+    return { env, cleanup };
+}
+async function runS5cmd(direction, params, execPath) {
+    const { env, cleanup } = buildEngineEnv(params);
+    try {
+        await exec_exec(`"${execPath}"`, buildS5cmdArgs(direction, params), { env });
+    }
+    finally {
+        cleanup();
+    }
+}
+async function runAwsCli(direction, params, execPath) {
+    const { env, cleanup } = buildEngineEnv(params);
+    try {
+        for (const configureArgs of buildAwsCliConfigureArgs(params)) {
+            await exec_exec(`"${execPath}"`, configureArgs, { env, silent: true });
+        }
+        await exec_exec(`"${execPath}"`, buildAwsCliCpArgs(direction, params), {
+            env
+        });
+    }
+    finally {
+        cleanup();
+    }
+}
+/** Resolve a binary on PATH cross-platform (io.which honors PATHEXT on Windows). */
+async function findExecutable(name) {
+    try {
+        const resolved = await which(name, false);
+        return resolved || undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+function logThroughput(engine, direction, params, startedAtMs) {
+    const elapsedSec = Math.max((Date.now() - startedAtMs) / 1000, 0.001);
+    let bytes = params.sizeBytes ?? 0;
+    if (bytes <= 0) {
+        try {
+            bytes = external_fs_namespaceObject.statSync(params.archivePath).size;
+        }
+        catch {
+            bytes = 0;
+        }
+    }
+    const mb = bytes / (1024 * 1024);
+    const mbPerSec = (mb / elapsedSec).toFixed(1);
+    info(`Cache ${direction} via ${engine}: ${bytes} B (~${Math.round(mb)} MB) in ${elapsedSec.toFixed(1)}s = ${mbPerSec} MB/s`);
+}
+const defaultDeps = {
+    findExecutable,
+    runS5cmd,
+    runAwsCli
+};
+/**
+ * Move the single archive to/from s3://bucket/key using the first available,
+ * working engine: s5cmd -> aws-cli -> node. `nodeFallback` performs the
+ * existing Node transfer (lib-storage upload for "upload", the presigned ranged
+ * downloader for "download") and is the guaranteed last resort. Returns the
+ * engine that actually completed the transfer.
+ *
+ * `verifyNativeDownload` (downloads only) is an optional integrity check run
+ * after a NATIVE engine (s5cmd/aws-cli) reports success: s5cmd/aws-cli exit 0
+ * is otherwise trusted blindly, so the caller can compare the on-disk size
+ * against the object's HeadObject ContentLength here. Throwing from it is
+ * treated exactly like an engine failure — the chain falls through to the next
+ * engine (never a hard fail). The node fallback validates its own byte count,
+ * and uploads never expose a partial object, so neither needs this hook.
+ */
+async function transferEngine_transferArchive(direction, params, nodeFallback, deps = defaultDeps, verifyNativeDownload) {
+    const startedAtMs = Date.now();
+    // Engine 1: s5cmd.
+    const s5cmdPath = await deps.findExecutable("s5cmd");
+    if (s5cmdPath) {
+        try {
+            info(`Cache ${direction}: engine s5cmd (${s5cmdPath}).`);
+            await deps.runS5cmd(direction, params, s5cmdPath);
+            if (direction === "download" && verifyNativeDownload) {
+                await verifyNativeDownload();
+            }
+            logThroughput("s5cmd", direction, params, startedAtMs);
+            return "s5cmd";
+        }
+        catch (error) {
+            warning(`s5cmd ${direction} failed (${error.message}); falling back to aws-cli.`);
+        }
+    }
+    // Engine 2: aws-cli.
+    const awsPath = await deps.findExecutable("aws");
+    if (awsPath) {
+        try {
+            info(`Cache ${direction}: engine aws-cli (${awsPath}).`);
+            await deps.runAwsCli(direction, params, awsPath);
+            if (direction === "download" && verifyNativeDownload) {
+                await verifyNativeDownload();
+            }
+            logThroughput("aws-cli", direction, params, startedAtMs);
+            return "aws-cli";
+        }
+        catch (error) {
+            warning(`aws-cli ${direction} failed (${error.message}); falling back to node.`);
+        }
+    }
+    // Engine 3: node — always present, so this always completes or throws the
+    // node error (never a "no engine available" failure).
+    info(`Cache ${direction}: engine node (${direction === "upload" ? "lib-storage" : "http-client"}).`);
+    await nodeFallback();
+    logThroughput("node", direction, params, startedAtMs);
+    return "node";
+}
+
+;// CONCATENATED MODULE: ./src/custom/utils/partSize.ts
+// S3 multipart-upload part-size math, centralized here so it is unit testable in
+// isolation without pulling in the S3 client / AWS SDK (see __tests__/partSize.test.ts).
+//
+//  - @aws-sdk/lib-storage enforces a hard MAX_PARTS = 10000 ceiling. Targeting
+//    <= ~9500 parts (headroom under 10000) keeps any payload representable
+//    without throwing "Exceeded 10000 parts".
+//  - S3 requires every part except the last to be at least 5 MiB. A small
+//    upload-chunk-size on a mid-size cache could otherwise yield a sub-5 MiB part
+//    that S3 rejects with EntityTooSmall.
+//  - Beyond just staying under the hard ceiling, a very large archive at the
+//    default (e.g. 64 MB) part size produces thousands of parts; each part
+//    completion is main-loop work in the single-threaded Node uploader. So we
+//    also scale the part size UP for large archives — targeting ~PREFERRED parts
+//    (fewer, bigger parts => less per-part overhead) — capped at MAX_PART_SIZE so
+//    we keep enough parts for multipart concurrency and bound the lib-storage
+//    in-flight buffer memory (queueSize * partSize).
+const MAX_MULTIPART_PARTS_TARGET = 9500;
+const PREFERRED_MULTIPART_PARTS = 2000;
+const S3_MIN_PART_SIZE = 5 * 1024 * 1024;
+const MAX_PART_SIZE = 128 * 1024 * 1024;
+/**
+ * Compute the multipart part size (in bytes) for a cache upload: the largest of
+ *  - the configured part size (a floor: the upload-chunk-size input or default),
+ *  - the hard floor that keeps the payload under the ~9500-part ceiling,
+ *  - the upward "preferred" size that targets ~PREFERRED_MULTIPART_PARTS parts
+ *    for large archives (capped at MAX_PART_SIZE), and
+ *  - S3's 5 MiB per-part minimum.
+ *
+ * Taking the max means the part count is always < ~9500 (the hard floor is one
+ * of the terms) and never below 5 MiB, while large archives get bigger parts to
+ * cut per-part overhead.
+ */
+function computeEffectivePartSize(cacheSize, configuredPartSize) {
+    // Hard floor: guarantees ceil(cacheSize / partSize) <= ~9500 parts.
+    const partCeilingFloor = Math.ceil(cacheSize / MAX_MULTIPART_PARTS_TARGET);
+    // Upward scaling for large archives: aim for ~PREFERRED parts, but never let
+    // a single part exceed MAX_PART_SIZE (preserves concurrency + bounds memory).
+    const preferredForSize = Math.min(MAX_PART_SIZE, Math.ceil(cacheSize / PREFERRED_MULTIPART_PARTS));
+    return Math.max(configuredPartSize, partCeilingFloor, preferredForSize, S3_MIN_PART_SIZE);
+}
+
 ;// CONCATENATED MODULE: ./src/custom/backend.ts
+
+
+
+
 
 
 
@@ -127091,7 +127454,12 @@ if (process.env.RUNS_ON_RUNNER_NAME && process.env.RUNS_ON_RUNNER_NAME !== "") {
     delete process.env.AWS_SECRET_ACCESS_KEY;
     delete process.env.AWS_SESSION_TOKEN;
 }
-const backend_versionSalt = "1.0";
+// Bumped 1.0 -> 2.0 to start a fresh cache generation: the no-compression fast
+// path now writes zstd-compressed archives (see custom/utils/uncompressedTar.ts),
+// which are not byte-compatible with previously stored raw-tar archives that share
+// the same file extension. Bumping the salt namespaces old and new archives apart
+// so a stale raw-tar entry is never fetched and fed to the zstd extractor.
+const backend_versionSalt = "2.0";
 const bucketName = process.env.RUNS_ON_S3_BUCKET_CACHE;
 const endpoint = process.env.RUNS_ON_S3_BUCKET_ENDPOINT;
 const region = process.env.RUNS_ON_AWS_REGION ||
@@ -127099,11 +127467,29 @@ const region = process.env.RUNS_ON_AWS_REGION ||
     process.env.AWS_DEFAULT_REGION;
 const forcePathStyle = process.env.RUNS_ON_S3_FORCE_PATH_STYLE === "true" ||
     process.env.AWS_S3_FORCE_PATH_STYLE === "true";
-const uploadQueueSize = Number(process.env.UPLOAD_QUEUE_SIZE || "4");
-const uploadPartSize = Number(process.env.UPLOAD_PART_SIZE || "32") * 1024 * 1024;
-const downloadQueueSize = Number(process.env.DOWNLOAD_QUEUE_SIZE || "8");
-const downloadPartSize = Number(process.env.DOWNLOAD_PART_SIZE || "16") * 1024 * 1024;
-const s3Client = new dist_cjs.S3Client({ region, forcePathStyle, endpoint });
+const uploadQueueSize = Number(process.env.UPLOAD_QUEUE_SIZE || "16");
+const uploadPartSize = Number(process.env.UPLOAD_PART_SIZE || "64") * 1024 * 1024;
+const downloadQueueSize = Number(process.env.DOWNLOAD_QUEUE_SIZE || "16");
+const downloadPartSize = Number(process.env.DOWNLOAD_PART_SIZE || "32") * 1024 * 1024;
+// The AWS SDK's default HTTP handler caps concurrent sockets at maxSockets=50,
+// which throttles multipart concurrency above ~48 no matter how large the queue
+// size is. This socket pool is attached to s3Client, which only the upload path
+// uses (the lib-storage Upload fans out its PUT-part requests through it). The
+// download path builds its own @actions/http-client HttpClient from a presigned
+// URL (see downloadUtils.ts / downloadCacheHttpClientConcurrent) and never
+// touches s3Client, so download concurrency is governed separately there. Size
+// the pool to the upload queue, plus headroom.
+const s3Client = new dist_cjs.S3Client({
+    region,
+    forcePathStyle,
+    endpoint,
+    requestHandler: new node_http_handler_dist_cjs.NodeHttpHandler({
+        httpsAgent: new external_https_.Agent({
+            keepAlive: true,
+            maxSockets: uploadQueueSize + 8
+        })
+    })
+});
 function backend_getCacheVersion(paths, compressionMethod, enableCrossOsArchive = false) {
     // don't pass changes upstream
     const components = paths.slice();
@@ -127163,92 +127549,179 @@ async function backend_downloadCache(archiveLocation, archivePath, options) {
     if (!region) {
         throw new Error("Environment variable RUNS_ON_AWS_REGION not set");
     }
+    // Narrow the module-level env consts to non-undefined for use inside the
+    // closure below (the guards above already asserted them).
+    const bucket = bucketName;
     const archiveUrl = new URL(archiveLocation);
     const objectKey = archiveUrl.pathname.slice(1);
-    // Retry logic for download validation failures
-    const maxRetries = 3;
-    let lastError;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    // Node fallback: presigned-URL ranged downloader with validation retries.
+    // This is the always-present safety net used when s5cmd/aws-cli are missing
+    // or fail. The presigned URL is signed with the same S3Client credentials the
+    // direct engine path uses, so read access is identical either way.
+    const nodeDownload = async () => {
+        const maxRetries = 3;
+        let lastError;
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                const command = new GetObjectCommand({
+                    Bucket: bucket,
+                    Key: objectKey
+                });
+                const url = await getSignedUrl(s3Client, command, {
+                    expiresIn: 3600
+                });
+                await downloadCacheHttpClientConcurrent(url, archivePath, {
+                    ...options,
+                    downloadConcurrency: downloadQueueSize,
+                    concurrentBlobDownloads: true,
+                    partSize: downloadPartSize
+                });
+                // If we get here, download succeeded
+                return;
+            }
+            catch (error) {
+                const errorMessage = error.message;
+                lastError = error;
+                // Only retry on validation failures, not on other errors
+                if (errorMessage.includes("Download validation failed") ||
+                    errorMessage.includes("Range request not supported") ||
+                    errorMessage.includes("Content-Range header")) {
+                    if (attempt < maxRetries) {
+                        const delayMs = Math.pow(2, attempt - 1) * 1000; // exponential backoff
+                        core.warning(`Download attempt ${attempt} failed: ${errorMessage}. Retrying in ${delayMs}ms...`);
+                        await new Promise(resolve => setTimeout(resolve, delayMs));
+                        continue;
+                    }
+                }
+                // For non-retryable errors or max retries reached, throw the error
+                throw error;
+            }
+        }
+        // This should never be reached, but just in case
+        throw (lastError || new Error("Download failed after all retry attempts"));
+    };
+    // Defense-in-depth: s5cmd/aws-cli exit 0 is trusted blindly, so after a
+    // native download independently confirm the object landed whole by comparing
+    // the on-disk size against the S3 object's ContentLength (HeadObject via the
+    // same credentialed s3Client). A mismatch throws, which transferArchive
+    // treats as an engine failure and falls through to the next engine rather
+    // than hard-failing. A HeadObject that itself fails is not a mismatch, so we
+    // swallow it and trust the native result (the node fallback would re-validate
+    // byte counts anyway). The node engine validates its own download internally.
+    const verifyNativeDownload = async () => {
+        let expectedBytes;
         try {
-            const command = new GetObjectCommand({
-                Bucket: bucketName,
-                Key: objectKey
-            });
-            const url = await getSignedUrl(s3Client, command, {
-                expiresIn: 3600
-            });
-            await downloadCacheHttpClientConcurrent(url, archivePath, {
-                ...options,
-                downloadConcurrency: downloadQueueSize,
-                concurrentBlobDownloads: true,
-                partSize: downloadPartSize
-            });
-            // If we get here, download succeeded
-            return;
+            const head = await s3Client.send(new HeadObjectCommand({ Bucket: bucket, Key: objectKey }));
+            expectedBytes = head.ContentLength;
         }
         catch (error) {
-            const errorMessage = error.message;
-            lastError = error;
-            // Only retry on validation failures, not on other errors
-            if (errorMessage.includes("Download validation failed") ||
-                errorMessage.includes("Range request not supported") ||
-                errorMessage.includes("Content-Range header")) {
-                if (attempt < maxRetries) {
-                    const delayMs = Math.pow(2, attempt - 1) * 1000; // exponential backoff
-                    core.warning(`Download attempt ${attempt} failed: ${errorMessage}. Retrying in ${delayMs}ms...`);
-                    await new Promise(resolve => setTimeout(resolve, delayMs));
-                    continue;
-                }
-            }
-            // For non-retryable errors or max retries reached, throw the error
-            throw error;
+            core.debug(`Skipping native-download size check (HeadObject failed: ${error.message}).`);
+            return;
         }
-    }
-    // This should never be reached, but just in case
-    throw lastError || new Error("Download failed after all retry attempts");
+        if (typeof expectedBytes !== "number") {
+            return;
+        }
+        const actualBytes = statSync(archivePath).size;
+        if (expectedBytes !== actualBytes) {
+            throw new Error(`native download size mismatch: S3 ContentLength ${expectedBytes} B != local file ${actualBytes} B`);
+        }
+    };
+    // Engine chain: s5cmd -> aws-cli -> node. The native engines pull the object
+    // directly by bucket+key (same credential chain the S3Client signs with);
+    // the node presigned downloader is the guaranteed fallback if a native
+    // engine is unavailable or fails. The archive key is derived identically to
+    // the upload path, so any engine restores any engine's cache.
+    await transferArchive("download", {
+        bucket,
+        key: objectKey,
+        archivePath,
+        endpoint,
+        region,
+        forcePathStyle
+    }, nodeDownload, undefined, verifyNativeDownload);
 }
-async function backend_saveCache(key, paths, archivePath, { compressionMethod, enableCrossOsArchive, cacheSize: archiveFileSize }) {
+async function backend_saveCache(key, paths, archivePath, { compressionMethod, enableCrossOsArchive, cacheSize: archiveFileSize, uploadChunkSize }) {
+    void archiveFileSize;
     if (!bucketName) {
         throw new Error("Environment variable RUNS_ON_S3_BUCKET_CACHE not set");
     }
     if (!region) {
         throw new Error("Environment variable RUNS_ON_AWS_REGION not set");
     }
+    // Narrow the module-level env const to non-undefined for use inside the
+    // closure below (the guard above already asserted it).
+    const bucket = bucketName;
     const s3Prefix = getS3Prefix(paths, {
         compressionMethod,
         enableCrossOsArchive
     });
     const s3Key = `${s3Prefix}/${key}`;
-    const multipartUpload = new lib_storage_dist_cjs/* Upload */._({
-        client: s3Client,
-        params: {
-            Bucket: bucketName,
-            Key: s3Key,
-            Body: (0,external_fs_namespaceObject.createReadStream)(archivePath)
-        },
-        // Part size in bytes
-        partSize: uploadPartSize,
-        // Max concurrency
-        queueSize: uploadQueueSize
-    });
-    // Commit Cache
+    // Stat the archive up front so we can both report its size and size the
+    // multipart upload against it.
     const cacheSize = getArchiveFileSizeInBytes(archivePath);
+    // @aws-sdk/lib-storage enforces a hard MAX_PARTS = 10000 ceiling. With a fixed
+    // part size, any payload larger than partSize * 10000 throws
+    // "Exceeded 10000 parts" (e.g. 32 MB parts cap out at ~320 GB, 64 MB at ~640 GB).
+    // computeEffectivePartSize raises the part size adaptively so any payload is
+    // representable in <= ~9500 parts (headroom under 10000), scales the part size
+    // UP for large archives (fewer parts => less per-part main-loop overhead), and
+    // floors it at S3's 5 MiB multipart minimum so a small upload-chunk-size on a
+    // mid-size cache can't produce a sub-5 MiB part that S3 rejects with
+    // EntityTooSmall. `upload-chunk-size` (bytes), when provided, acts as a part-
+    // size floor but is still raised here for very large archives.
+    const configuredPartSize = uploadChunkSize && uploadChunkSize > 0
+        ? uploadChunkSize
+        : uploadPartSize;
+    const effectivePartSize = computeEffectivePartSize(cacheSize, configuredPartSize);
+    // Commit Cache
     info(`Cache Size: ~${Math.round(cacheSize / (1024 * 1024))} MB (${cacheSize} B)`);
-    info(`Uploading cache from ${archivePath} to ${bucketName}/${s3Key}`);
-    const progress = new backend_UploadProgress(cacheSize);
-    progress.startDisplayTimer();
-    multipartUpload.on("httpUploadProgress", event => {
-        if (typeof event.loaded === "number") {
-            progress.setUploadedBytes(event.loaded);
+    info(`Uploading cache from ${archivePath} to ${bucket}/${s3Key}`);
+    // Node fallback upload: the @aws-sdk/lib-storage multipart Upload through the
+    // pooled s3Client. Always present; used when s5cmd/aws-cli are missing or fail.
+    const nodeUpload = async () => {
+        const estimatedParts = Math.max(1, Math.ceil(cacheSize / effectivePartSize));
+        info(`Multipart upload (node/lib-storage): part size ~${Math.round(effectivePartSize / (1024 * 1024))} MB, queue size ${uploadQueueSize}, ~${estimatedParts} parts for ${cacheSize} B.`);
+        const multipartUpload = new lib_storage_dist_cjs/* Upload */._({
+            client: s3Client,
+            params: {
+                Bucket: bucket,
+                Key: s3Key,
+                Body: (0,external_fs_namespaceObject.createReadStream)(archivePath)
+            },
+            // Part size in bytes (adaptively floored to stay under the 10000-part cap)
+            partSize: effectivePartSize,
+            // Max concurrency
+            queueSize: uploadQueueSize
+        });
+        const progress = new backend_UploadProgress(cacheSize);
+        progress.startDisplayTimer();
+        multipartUpload.on("httpUploadProgress", event => {
+            if (typeof event.loaded === "number") {
+                progress.setUploadedBytes(event.loaded);
+            }
+        });
+        try {
+            await multipartUpload.done();
+            progress.setUploadedBytes(cacheSize);
         }
-    });
-    try {
-        await multipartUpload.done();
-        progress.setUploadedBytes(cacheSize);
-    }
-    finally {
-        progress.stopDisplayTimer();
-    }
+        finally {
+            progress.stopDisplayTimer();
+        }
+    };
+    // Engine chain: s5cmd -> aws-cli -> node. The native engines push the single
+    // archive to the exact same s3://bucket/key the node path would, using the
+    // same credential chain the S3Client uses; a missing/failing engine
+    // transparently falls through to the next.
+    await transferEngine_transferArchive("upload", {
+        bucket,
+        key: s3Key,
+        archivePath,
+        endpoint,
+        region,
+        forcePathStyle,
+        sizeBytes: cacheSize,
+        partSizeMb: effectivePartSize / (1024 * 1024)
+    }, nodeUpload);
     info(`Cache saved successfully.`);
 }
 class backend_UploadProgress {
@@ -127299,7 +127772,132 @@ class backend_UploadProgress {
     }
 }
 
+;// CONCATENATED MODULE: ./src/custom/utils/reparsePoints.ts
+// Windows directory-junction (reparse point) handling for the cache file scan.
+//
+// @actions/cache's resolvePaths() returns the *directory name* for a cached
+// directory (e.g. "Library") and relies on tar recursing into it. That breaks
+// when the directory is a Windows junction: Premier's CI routes Unity's
+// Library/ onto instance-store NVMe with `cmd /c mklink /J Library Z:\...`.
+// tar treats the junction as a symbolic link and stores an un-followed link
+// entry instead of descending, so the archive captures ZERO files and the save
+// produces an empty (~218 B) archive.
+//
+// The fix (see expandWindowsReparsePoints) descends *through* the junction and
+// emits each real child under the SAME relative name ("Library/..."), never the
+// junction's absolute target. That keeps the tar `-C <workspace>
+// --files-from manifest` invocation intact while making it archive the real
+// contents. It is a no-op on non-Windows and for ordinary files/directories, so
+// Linux/macOS and the normal (restore-hit, real-directory) path are unchanged.
+
+
+// Normalize an OS path to the forward-slash manifest form, matching the
+// separator normalization @actions/cache's resolvePaths() applies to its output.
+function toManifestPath(relativePath) {
+    return relativePath.split(external_path_.sep).join("/");
+}
+/**
+ * Whether `absolutePath` is a directory reparse point — a Windows junction
+ * (`mklink /J`) or a directory symlink. lstat reports these as a symbolic link
+ * whose stat() target is a directory; an ordinary directory is not a symlink.
+ */
+function isReparsePointDirectory(absolutePath) {
+    let linkStats;
+    try {
+        linkStats = external_fs_namespaceObject.lstatSync(absolutePath);
+    }
+    catch {
+        return false;
+    }
+    if (!linkStats.isSymbolicLink()) {
+        return false;
+    }
+    try {
+        // stat() follows the reparse point to its target.
+        return external_fs_namespaceObject.statSync(absolutePath).isDirectory();
+    }
+    catch {
+        return false;
+    }
+}
+// Recursively collect the contents of a directory (reached through a reparse
+// point), pushing each real file — and each empty directory — as a
+// workspace-relative, forward-slash manifest path into `out`.
+function collectReparsePointEntries(absoluteDir, workspaceRoot, out) {
+    let children;
+    try {
+        children = external_fs_namespaceObject.readdirSync(absoluteDir, { withFileTypes: true });
+    }
+    catch {
+        // Unreadable directory: skip it, mirroring the globber's tolerance.
+        return;
+    }
+    if (children.length === 0) {
+        // Preserve an otherwise-lost empty directory as its own entry.
+        out.push(toManifestPath(external_path_.relative(workspaceRoot, absoluteDir)));
+        return;
+    }
+    for (const child of children) {
+        const absoluteChild = external_path_.join(absoluteDir, child.name);
+        let isDirectory;
+        try {
+            // stat() (not lstat) so nested junctions / directory symlinks are
+            // descended too, rather than emitted as un-followed link entries.
+            isDirectory = external_fs_namespaceObject.statSync(absoluteChild).isDirectory();
+        }
+        catch {
+            // Broken/dangling link or vanished entry: skip it, matching the
+            // globber's omitBrokenSymbolicLinks behavior.
+            continue;
+        }
+        if (isDirectory) {
+            collectReparsePointEntries(absoluteChild, workspaceRoot, out);
+        }
+        else {
+            out.push(toManifestPath(external_path_.relative(workspaceRoot, absoluteChild)));
+        }
+    }
+}
+/**
+ * Expand any Windows directory junction / reparse point in a resolved cache
+ * file list into the real relative paths of its contents, preserving the
+ * original relative prefix (e.g. "Library" -> "Library/a.txt",
+ * "Library/sub/b.txt"). Ordinary files and directories pass through unchanged,
+ * and the whole function is a no-op off Windows.
+ *
+ * @param cachePaths workspace-relative paths from @actions/cache resolvePaths()
+ * @param workspaceRoot root the paths are relative to (tar's `-C` directory);
+ *   defaults to GITHUB_WORKSPACE, matching resolvePaths() / the tar invocation
+ */
+function expandWindowsReparsePoints(cachePaths, workspaceRoot = process.env["GITHUB_WORKSPACE"] ?? process.cwd()) {
+    if (process.platform !== "win32") {
+        return cachePaths;
+    }
+    const expanded = [];
+    for (const cachePath of cachePaths) {
+        // "." is resolvePaths' marker for "the workspace itself" — leave as-is.
+        if (cachePath === ".") {
+            expanded.push(cachePath);
+            continue;
+        }
+        const absolutePath = external_path_.resolve(workspaceRoot, cachePath);
+        if (!isReparsePointDirectory(absolutePath)) {
+            expanded.push(cachePath);
+            continue;
+        }
+        const before = expanded.length;
+        collectReparsePointEntries(absolutePath, workspaceRoot, expanded);
+        if (expanded.length === before) {
+            // Empty/unreadable junction target: keep the original entry so
+            // behavior is never worse than before the fix.
+            expanded.push(cachePath);
+        }
+    }
+    return expanded;
+}
+
 ;// CONCATENATED MODULE: ./src/custom/utils/uncompressedTar.ts
+
 
 
 
@@ -127357,7 +127955,7 @@ function appendPlatformSpecificArgs(tool, args) {
         }
     }
 }
-function sanitizeEnv(env) {
+function uncompressedTar_sanitizeEnv(env) {
     const sanitized = {};
     for (const [key, value] of Object.entries(env)) {
         if (value !== undefined) {
@@ -127367,13 +127965,29 @@ function sanitizeEnv(env) {
     return sanitized;
 }
 function getExecEnv() {
-    return sanitizeEnv({ ...process.env, MSYS: "winsymlinks:nativestrict" });
+    return uncompressedTar_sanitizeEnv({ ...process.env, MSYS: "winsymlinks:nativestrict" });
+}
+// createTar shells out to `zstd` (the no-compression fast path compresses with
+// multithreaded zstd). If zstd isn't on PATH the tar invocation fails and the
+// cache is silently skipped upstream — surface one clear warning so the cause is
+// obvious in the log instead of a generic tar error. Emitted at most once.
+let zstdMissingWarned = false;
+async function warnIfZstdMissing() {
+    if (zstdMissingWarned) {
+        return;
+    }
+    const zstdPath = await which("zstd", false);
+    if (!zstdPath) {
+        zstdMissingWarned = true;
+        warning("zstd not found on PATH — cache disabled for this run. Install zstd to enable caching.");
+    }
 }
 async function runTar(tool, args, options) {
     await exec_exec(`"${tool.path}"`, args, options);
 }
 async function uncompressedTar_createTar(archiveFolder, sourceDirectories, compressionMethod) {
     const tool = await getTarTool();
+    await warnIfZstdMissing();
     const cacheFileName = getCacheFileName(compressionMethod);
     const normalizedArchiveName = normalizeForTar(cacheFileName);
     const normalizedManifestPath = normalizeForTar(external_path_.join(archiveFolder, ManifestFilename));
@@ -127381,6 +127995,13 @@ async function uncompressedTar_createTar(archiveFolder, sourceDirectories, compr
     (0,external_fs_namespaceObject.writeFileSync)(normalizedManifestPath, sourceDirectories.join("\n"));
     const args = [
         "--posix",
+        // Multithreaded zstd (-T0 = all cores) at the fast level 3, with long-range
+        // matching (--long=30 = 1 GiB window). tar splits this value on whitespace
+        // and runs it as the compression filter. This replaces the previous raw
+        // (uncompressed) tar so the payload is both smaller and produced in parallel.
+        // The matching decompressor in extractTar/listTar uses `zstd -d --long=30`.
+        "--use-compress-program",
+        "zstd -T0 -3 --long=30",
         "-cf",
         normalizedArchiveName,
         "--exclude",
@@ -127403,6 +128024,13 @@ async function uncompressedTar_extractTar(archivePath, _compressionMethod) {
     const workingDirectory = normalizeForTar(uncompressedTar_getWorkingDirectory());
     await mkdirP(workingDirectory);
     const args = [
+        // Decompress with zstd (long-range window must match the create side).
+        // `zstd -d` is used rather than `unzstd` because it is the form proven on the
+        // Windows Git tar bundle used by the runner (the toolkit's own zstd path and
+        // the observed restore log both invoke `zstd -d`), and it is equally valid on
+        // Linux/macOS.
+        "--use-compress-program",
+        "zstd -d --long=30",
         "-xf",
         normalizeForTar(archivePath),
         "-P",
@@ -127417,7 +128045,15 @@ async function uncompressedTar_extractTar(archivePath, _compressionMethod) {
 async function uncompressedTar_listTar(archivePath, _compressionMethod) {
     void _compressionMethod;
     const tool = await getTarTool();
-    const args = ["-tf", normalizeForTar(archivePath), "-P"];
+    // Same zstd decompressor as extractTar so debug listing works on the
+    // now-compressed archive.
+    const args = [
+        "--use-compress-program",
+        "zstd -d --long=30",
+        "-tf",
+        normalizeForTar(archivePath),
+        "-P"
+    ];
     appendPlatformSpecificArgs(tool, args);
     await runTar(tool, args, {
         env: getExecEnv()
@@ -127426,6 +128062,7 @@ async function uncompressedTar_listTar(archivePath, _compressionMethod) {
 
 ;// CONCATENATED MODULE: ./src/custom/cache.ts
 // https://github.com/actions/toolkit/blob/%40actions/cache%403.2.2/packages/cache/src/cache.ts
+
 
 
 
@@ -127613,7 +128250,13 @@ async function custom_cache_saveCache(paths, key, options, enableCrossOsArchive 
     const compressionMethod = await resolveCompressionMethod();
     const tarFns = getTarFunctions();
     let cacheId = -1;
-    const cachePaths = await resolvePaths(paths);
+    // resolvePaths returns the directory name for a cached directory and relies
+    // on tar recursing into it. A Windows junction (Premier routes Unity's
+    // Library/ onto instance-store NVMe with `mklink /J`) is stored by tar as an
+    // un-followed symlink entry, so the archive would capture zero files. Expand
+    // any such reparse point into its real relative contents so tar archives
+    // them (no-op off Windows and for ordinary directories).
+    const cachePaths = expandWindowsReparsePoints(await resolvePaths(paths));
     core_debug("Cache Paths:");
     core_debug(`${JSON.stringify(cachePaths)}`);
     if (cachePaths.length === 0) {
@@ -127632,7 +128275,11 @@ async function custom_cache_saveCache(paths, key, options, enableCrossOsArchive 
         await backend_saveCache(key, paths, archivePath, {
             compressionMethod,
             enableCrossOsArchive,
-            cacheSize: archiveFileSize
+            cacheSize: archiveFileSize,
+            // Forward the `upload-chunk-size` input (bytes) so it can override the
+            // default multipart part size in the S3 backend. Previously dropped here,
+            // which silently made the action's `upload-chunk-size` input a no-op.
+            uploadChunkSize: options?.uploadChunkSize
         });
         // dummy cacheId, if we get there without raising, it means the cache has been saved
         cacheId = 1;

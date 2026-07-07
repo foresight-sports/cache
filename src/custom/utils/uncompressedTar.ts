@@ -5,6 +5,7 @@ import {
     ManifestFilename,
     SystemTarPathOnWindows
 } from "../../actionsCacheShims.js";
+import * as core from "@actions/core";
 import type { ExecOptions } from "@actions/exec";
 import { exec } from "@actions/exec";
 import * as io from "@actions/io";
@@ -86,6 +87,24 @@ function getExecEnv(): { [key: string]: string } {
     return sanitizeEnv({ ...process.env, MSYS: "winsymlinks:nativestrict" });
 }
 
+// createTar shells out to `zstd` (the no-compression fast path compresses with
+// multithreaded zstd). If zstd isn't on PATH the tar invocation fails and the
+// cache is silently skipped upstream — surface one clear warning so the cause is
+// obvious in the log instead of a generic tar error. Emitted at most once.
+let zstdMissingWarned = false;
+async function warnIfZstdMissing(): Promise<void> {
+    if (zstdMissingWarned) {
+        return;
+    }
+    const zstdPath = await io.which("zstd", false);
+    if (!zstdPath) {
+        zstdMissingWarned = true;
+        core.warning(
+            "zstd not found on PATH — cache disabled for this run. Install zstd to enable caching."
+        );
+    }
+}
+
 async function runTar(
     tool: TarToolInfo,
     args: string[],
@@ -100,6 +119,7 @@ export async function createTar(
     compressionMethod: CompressionMethod
 ): Promise<void> {
     const tool = await getTarTool();
+    await warnIfZstdMissing();
     const cacheFileName = utils.getCacheFileName(compressionMethod);
     const normalizedArchiveName = normalizeForTar(cacheFileName);
     const normalizedManifestPath = normalizeForTar(
@@ -111,6 +131,13 @@ export async function createTar(
 
     const args = [
         "--posix",
+        // Multithreaded zstd (-T0 = all cores) at the fast level 3, with long-range
+        // matching (--long=30 = 1 GiB window). tar splits this value on whitespace
+        // and runs it as the compression filter. This replaces the previous raw
+        // (uncompressed) tar so the payload is both smaller and produced in parallel.
+        // The matching decompressor in extractTar/listTar uses `zstd -d --long=30`.
+        "--use-compress-program",
+        "zstd -T0 -3 --long=30",
         "-cf",
         normalizedArchiveName,
         "--exclude",
@@ -141,6 +168,13 @@ export async function extractTar(
     await io.mkdirP(workingDirectory);
 
     const args = [
+        // Decompress with zstd (long-range window must match the create side).
+        // `zstd -d` is used rather than `unzstd` because it is the form proven on the
+        // Windows Git tar bundle used by the runner (the toolkit's own zstd path and
+        // the observed restore log both invoke `zstd -d`), and it is equally valid on
+        // Linux/macOS.
+        "--use-compress-program",
+        "zstd -d --long=30",
         "-xf",
         normalizeForTar(archivePath),
         "-P",
@@ -162,7 +196,15 @@ export async function listTar(
     void _compressionMethod;
     const tool = await getTarTool();
 
-    const args = ["-tf", normalizeForTar(archivePath), "-P"];
+    // Same zstd decompressor as extractTar so debug listing works on the
+    // now-compressed archive.
+    const args = [
+        "--use-compress-program",
+        "zstd -d --long=30",
+        "-tf",
+        normalizeForTar(archivePath),
+        "-P"
+    ];
 
     appendPlatformSpecificArgs(tool, args);
 
