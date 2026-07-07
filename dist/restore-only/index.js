@@ -127163,7 +127163,11 @@ async function downloadUtils_downloadCacheHttpClientConcurrent(archiveLocation, 
         while ((nextDownload = downloads.pop())) {
             activeDownloads[nextDownload.offset] = nextDownload.promiseGetter();
             actives++;
-            if (actives >= (options.downloadConcurrency ?? 10)) {
+            // Reuse the same downloadConcurrency computed above (default 8) that
+            // sized the socket pool, so the in-flight gate can never exceed the
+            // number of sockets available to serve it (previously this defaulted
+            // to 10 while the pool was sized for 8).
+            if (actives >= downloadConcurrency) {
                 await waitAndWrite();
             }
         }
@@ -127258,6 +127262,7 @@ const downloadUtils_promiseWithTimeout = async (timeoutMs, promise) => {
 
 
 
+
 // s5cmd's global worker pool. Scale to cores so the goroutine fan-out actually
 // uses the box, with a floor so tiny runners still parallelize and a ceiling
 // matching s5cmd's own default.
@@ -127289,7 +127294,12 @@ function s3Uri(params) {
 /**
  * Build the full s5cmd argv: `[global flags] cp [cp flags] <src> <dst>`.
  * s5cmd auto-selects path-style addressing whenever a custom --endpoint-url is
- * given, so no explicit path-style flag is needed (there isn't one).
+ * given, so no explicit path-style flag is needed (there isn't one). Note this
+ * means a hypothetical custom endpoint that requires virtual-host addressing
+ * (params.forcePathStyle === false) is NOT handled here — s5cmd would still
+ * force path-style for it — but that is not a RunsOn scenario (RunsOn / R2 /
+ * MinIO custom endpoints are all path-style), so it is left intentionally
+ * unaddressed rather than adding a code path that can never run.
  */
 function buildS5cmdArgs(direction, params, cpuCount = external_os_.cpus().length) {
     const workers = computeS5cmdWorkers(cpuCount);
@@ -127377,25 +127387,64 @@ function sanitizeEnv(env) {
 }
 // s5cmd / aws-cli inherit AWS credentials from the same default chain the
 // S3Client uses (env vars, shared file, or — on RunsOn, where backend.ts unsets
-// the static keys — the EC2 IAM instance profile). We only pin AWS_REGION so a
-// missing region resolves to "auto" for S3-compatible endpoints.
+// the static keys — the EC2 IAM instance profile). We pin AWS_REGION so a
+// missing region resolves to "auto" for S3-compatible endpoints, and we point
+// AWS_CONFIG_FILE / AWS_SHARED_CREDENTIALS_FILE at PER-TRANSFER temp files so
+// aws-cli's `configure set default.s3.*` writes land in a throwaway scoped
+// config instead of persistently mutating the shared ~/.aws/config [default]
+// profile (a side-effect two concurrent `aws` runs would also race on); the
+// subsequent `aws s3 cp` reads that same scoped file. Isolating these files
+// does NOT change which credentials the engines use — env-var creds take
+// priority over files, and the RunsOn IAM instance profile is discovered via
+// IMDS (not a file) — so the engine credential source stays identical to the
+// S3Client's. Only static creds living solely in the default shared file (a
+// non-RunsOn dev setup, where env-var creds are the norm) would be bypassed.
 function buildEngineEnv(params) {
-    return sanitizeEnv({
+    const unique = `${process.pid}-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2)}`;
+    const configFile = external_path_.join(external_os_.tmpdir(), `runs-on-aws-config-${unique}`);
+    const credentialsFile = external_path_.join(external_os_.tmpdir(), `runs-on-aws-credentials-${unique}`);
+    const env = sanitizeEnv({
         ...process.env,
-        AWS_REGION: resolveRegion(params.region)
+        AWS_REGION: resolveRegion(params.region),
+        AWS_CONFIG_FILE: configFile,
+        AWS_SHARED_CREDENTIALS_FILE: credentialsFile
     });
+    const cleanup = () => {
+        for (const file of [configFile, credentialsFile]) {
+            try {
+                external_fs_namespaceObject.rmSync(file, { force: true });
+            }
+            catch {
+                /* best-effort temp cleanup */
+            }
+        }
+    };
+    return { env, cleanup };
 }
 async function runS5cmd(direction, params, execPath) {
-    await exec_exec(`"${execPath}"`, buildS5cmdArgs(direction, params), {
-        env: buildEngineEnv(params)
-    });
+    const { env, cleanup } = buildEngineEnv(params);
+    try {
+        await exec_exec(`"${execPath}"`, buildS5cmdArgs(direction, params), { env });
+    }
+    finally {
+        cleanup();
+    }
 }
 async function runAwsCli(direction, params, execPath) {
-    const env = buildEngineEnv(params);
-    for (const configureArgs of buildAwsCliConfigureArgs(params)) {
-        await exec_exec(`"${execPath}"`, configureArgs, { env, silent: true });
+    const { env, cleanup } = buildEngineEnv(params);
+    try {
+        for (const configureArgs of buildAwsCliConfigureArgs(params)) {
+            await exec_exec(`"${execPath}"`, configureArgs, { env, silent: true });
+        }
+        await exec_exec(`"${execPath}"`, buildAwsCliCpArgs(direction, params), {
+            env
+        });
     }
-    await exec_exec(`"${execPath}"`, buildAwsCliCpArgs(direction, params), { env });
+    finally {
+        cleanup();
+    }
 }
 /** Resolve a binary on PATH cross-platform (io.which honors PATHEXT on Windows). */
 async function findExecutable(name) {
@@ -127433,8 +127482,16 @@ const defaultDeps = {
  * existing Node transfer (lib-storage upload for "upload", the presigned ranged
  * downloader for "download") and is the guaranteed last resort. Returns the
  * engine that actually completed the transfer.
+ *
+ * `verifyNativeDownload` (downloads only) is an optional integrity check run
+ * after a NATIVE engine (s5cmd/aws-cli) reports success: s5cmd/aws-cli exit 0
+ * is otherwise trusted blindly, so the caller can compare the on-disk size
+ * against the object's HeadObject ContentLength here. Throwing from it is
+ * treated exactly like an engine failure — the chain falls through to the next
+ * engine (never a hard fail). The node fallback validates its own byte count,
+ * and uploads never expose a partial object, so neither needs this hook.
  */
-async function transferEngine_transferArchive(direction, params, nodeFallback, deps = defaultDeps) {
+async function transferEngine_transferArchive(direction, params, nodeFallback, deps = defaultDeps, verifyNativeDownload) {
     const startedAtMs = Date.now();
     // Engine 1: s5cmd.
     const s5cmdPath = await deps.findExecutable("s5cmd");
@@ -127442,6 +127499,9 @@ async function transferEngine_transferArchive(direction, params, nodeFallback, d
         try {
             info(`Cache ${direction}: engine s5cmd (${s5cmdPath}).`);
             await deps.runS5cmd(direction, params, s5cmdPath);
+            if (direction === "download" && verifyNativeDownload) {
+                await verifyNativeDownload();
+            }
             logThroughput("s5cmd", direction, params, startedAtMs);
             return "s5cmd";
         }
@@ -127455,6 +127515,9 @@ async function transferEngine_transferArchive(direction, params, nodeFallback, d
         try {
             info(`Cache ${direction}: engine aws-cli (${awsPath}).`);
             await deps.runAwsCli(direction, params, awsPath);
+            if (direction === "download" && verifyNativeDownload) {
+                await verifyNativeDownload();
+            }
             logThroughput("aws-cli", direction, params, startedAtMs);
             return "aws-cli";
         }
@@ -127637,6 +127700,32 @@ async function backend_downloadCache(archiveLocation, archivePath, options) {
         // This should never be reached, but just in case
         throw (lastError || new Error("Download failed after all retry attempts"));
     };
+    // Defense-in-depth: s5cmd/aws-cli exit 0 is trusted blindly, so after a
+    // native download independently confirm the object landed whole by comparing
+    // the on-disk size against the S3 object's ContentLength (HeadObject via the
+    // same credentialed s3Client). A mismatch throws, which transferArchive
+    // treats as an engine failure and falls through to the next engine rather
+    // than hard-failing. A HeadObject that itself fails is not a mismatch, so we
+    // swallow it and trust the native result (the node fallback would re-validate
+    // byte counts anyway). The node engine validates its own download internally.
+    const verifyNativeDownload = async () => {
+        let expectedBytes;
+        try {
+            const head = await s3Client.send(new dist_cjs.HeadObjectCommand({ Bucket: bucket, Key: objectKey }));
+            expectedBytes = head.ContentLength;
+        }
+        catch (error) {
+            core_debug(`Skipping native-download size check (HeadObject failed: ${error.message}).`);
+            return;
+        }
+        if (typeof expectedBytes !== "number") {
+            return;
+        }
+        const actualBytes = (0,external_fs_namespaceObject.statSync)(archivePath).size;
+        if (expectedBytes !== actualBytes) {
+            throw new Error(`native download size mismatch: S3 ContentLength ${expectedBytes} B != local file ${actualBytes} B`);
+        }
+    };
     // Engine chain: s5cmd -> aws-cli -> node. The native engines pull the object
     // directly by bucket+key (same credential chain the S3Client signs with);
     // the node presigned downloader is the guaranteed fallback if a native
@@ -127649,7 +127738,7 @@ async function backend_downloadCache(archiveLocation, archivePath, options) {
         endpoint,
         region,
         forcePathStyle
-    }, nodeDownload);
+    }, nodeDownload, undefined, verifyNativeDownload);
 }
 async function backend_saveCache(key, paths, archivePath, { compressionMethod, enableCrossOsArchive, cacheSize: archiveFileSize, uploadChunkSize }) {
     void archiveFileSize;

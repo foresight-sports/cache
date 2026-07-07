@@ -28,6 +28,7 @@ import { exec } from "@actions/exec";
 import * as io from "@actions/io";
 import * as fs from "fs";
 import * as os from "os";
+import * as path from "path";
 
 export type TransferDirection = "upload" | "download";
 export type TransferEngineName = "s5cmd" | "aws-cli" | "node";
@@ -105,7 +106,12 @@ function s3Uri(params: TransferParams): string {
 /**
  * Build the full s5cmd argv: `[global flags] cp [cp flags] <src> <dst>`.
  * s5cmd auto-selects path-style addressing whenever a custom --endpoint-url is
- * given, so no explicit path-style flag is needed (there isn't one).
+ * given, so no explicit path-style flag is needed (there isn't one). Note this
+ * means a hypothetical custom endpoint that requires virtual-host addressing
+ * (params.forcePathStyle === false) is NOT handled here — s5cmd would still
+ * force path-style for it — but that is not a RunsOn scenario (RunsOn / R2 /
+ * MinIO custom endpoints are all path-style), so it is left intentionally
+ * unaddressed rather than adding a code path that can never run.
  */
 export function buildS5cmdArgs(
     direction: TransferDirection,
@@ -207,15 +213,53 @@ function sanitizeEnv(env: NodeJS.ProcessEnv): { [key: string]: string } {
     return sanitized;
 }
 
+/** A per-transfer child-process env plus a cleanup for its temp aws files. */
+export interface EngineEnv {
+    /** Env passed to the `s5cmd` / `aws` child process. */
+    env: { [key: string]: string };
+    /** Best-effort removal of the per-transfer temp aws config/credentials files. */
+    cleanup: () => void;
+}
+
 // s5cmd / aws-cli inherit AWS credentials from the same default chain the
 // S3Client uses (env vars, shared file, or — on RunsOn, where backend.ts unsets
-// the static keys — the EC2 IAM instance profile). We only pin AWS_REGION so a
-// missing region resolves to "auto" for S3-compatible endpoints.
-function buildEngineEnv(params: TransferParams): { [key: string]: string } {
-    return sanitizeEnv({
+// the static keys — the EC2 IAM instance profile). We pin AWS_REGION so a
+// missing region resolves to "auto" for S3-compatible endpoints, and we point
+// AWS_CONFIG_FILE / AWS_SHARED_CREDENTIALS_FILE at PER-TRANSFER temp files so
+// aws-cli's `configure set default.s3.*` writes land in a throwaway scoped
+// config instead of persistently mutating the shared ~/.aws/config [default]
+// profile (a side-effect two concurrent `aws` runs would also race on); the
+// subsequent `aws s3 cp` reads that same scoped file. Isolating these files
+// does NOT change which credentials the engines use — env-var creds take
+// priority over files, and the RunsOn IAM instance profile is discovered via
+// IMDS (not a file) — so the engine credential source stays identical to the
+// S3Client's. Only static creds living solely in the default shared file (a
+// non-RunsOn dev setup, where env-var creds are the norm) would be bypassed.
+export function buildEngineEnv(params: TransferParams): EngineEnv {
+    const unique = `${process.pid}-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2)}`;
+    const configFile = path.join(os.tmpdir(), `runs-on-aws-config-${unique}`);
+    const credentialsFile = path.join(
+        os.tmpdir(),
+        `runs-on-aws-credentials-${unique}`
+    );
+    const env = sanitizeEnv({
         ...process.env,
-        AWS_REGION: resolveRegion(params.region)
+        AWS_REGION: resolveRegion(params.region),
+        AWS_CONFIG_FILE: configFile,
+        AWS_SHARED_CREDENTIALS_FILE: credentialsFile
     });
+    const cleanup = (): void => {
+        for (const file of [configFile, credentialsFile]) {
+            try {
+                fs.rmSync(file, { force: true });
+            } catch {
+                /* best-effort temp cleanup */
+            }
+        }
+    };
+    return { env, cleanup };
 }
 
 async function runS5cmd(
@@ -223,9 +267,12 @@ async function runS5cmd(
     params: TransferParams,
     execPath: string
 ): Promise<void> {
-    await exec(`"${execPath}"`, buildS5cmdArgs(direction, params), {
-        env: buildEngineEnv(params)
-    });
+    const { env, cleanup } = buildEngineEnv(params);
+    try {
+        await exec(`"${execPath}"`, buildS5cmdArgs(direction, params), { env });
+    } finally {
+        cleanup();
+    }
 }
 
 async function runAwsCli(
@@ -233,11 +280,17 @@ async function runAwsCli(
     params: TransferParams,
     execPath: string
 ): Promise<void> {
-    const env = buildEngineEnv(params);
-    for (const configureArgs of buildAwsCliConfigureArgs(params)) {
-        await exec(`"${execPath}"`, configureArgs, { env, silent: true });
+    const { env, cleanup } = buildEngineEnv(params);
+    try {
+        for (const configureArgs of buildAwsCliConfigureArgs(params)) {
+            await exec(`"${execPath}"`, configureArgs, { env, silent: true });
+        }
+        await exec(`"${execPath}"`, buildAwsCliCpArgs(direction, params), {
+            env
+        });
+    } finally {
+        cleanup();
     }
-    await exec(`"${execPath}"`, buildAwsCliCpArgs(direction, params), { env });
 }
 
 /** Resolve a binary on PATH cross-platform (io.which honors PATHEXT on Windows). */
@@ -304,12 +357,21 @@ const defaultDeps: TransferEngineDeps = {
  * existing Node transfer (lib-storage upload for "upload", the presigned ranged
  * downloader for "download") and is the guaranteed last resort. Returns the
  * engine that actually completed the transfer.
+ *
+ * `verifyNativeDownload` (downloads only) is an optional integrity check run
+ * after a NATIVE engine (s5cmd/aws-cli) reports success: s5cmd/aws-cli exit 0
+ * is otherwise trusted blindly, so the caller can compare the on-disk size
+ * against the object's HeadObject ContentLength here. Throwing from it is
+ * treated exactly like an engine failure — the chain falls through to the next
+ * engine (never a hard fail). The node fallback validates its own byte count,
+ * and uploads never expose a partial object, so neither needs this hook.
  */
 export async function transferArchive(
     direction: TransferDirection,
     params: TransferParams,
     nodeFallback: () => Promise<void>,
-    deps: TransferEngineDeps = defaultDeps
+    deps: TransferEngineDeps = defaultDeps,
+    verifyNativeDownload?: () => Promise<void>
 ): Promise<TransferEngineName> {
     const startedAtMs = Date.now();
 
@@ -319,6 +381,9 @@ export async function transferArchive(
         try {
             core.info(`Cache ${direction}: engine s5cmd (${s5cmdPath}).`);
             await deps.runS5cmd(direction, params, s5cmdPath);
+            if (direction === "download" && verifyNativeDownload) {
+                await verifyNativeDownload();
+            }
             logThroughput("s5cmd", direction, params, startedAtMs);
             return "s5cmd";
         } catch (error) {
@@ -336,6 +401,9 @@ export async function transferArchive(
         try {
             core.info(`Cache ${direction}: engine aws-cli (${awsPath}).`);
             await deps.runAwsCli(direction, params, awsPath);
+            if (direction === "download" && verifyNativeDownload) {
+                await verifyNativeDownload();
+            }
             logThroughput("aws-cli", direction, params, startedAtMs);
             return "aws-cli";
         } catch (error) {

@@ -1,8 +1,10 @@
 import { beforeEach, describe, expect, jest, test } from "@jest/globals";
+import * as os from "os";
 
 import {
     buildAwsCliConfigureArgs,
     buildAwsCliCpArgs,
+    buildEngineEnv,
     buildS5cmdArgs,
     computeAwsCliConcurrency,
     computeS5cmdWorkers,
@@ -144,6 +146,40 @@ describe("buildAwsCliConfigureArgs / buildAwsCliCpArgs", () => {
     });
 });
 
+describe("buildEngineEnv scoped aws config/credentials", () => {
+    test("points AWS_CONFIG_FILE and AWS_SHARED_CREDENTIALS_FILE at per-transfer temp files", () => {
+        const a = buildEngineEnv(baseParams);
+        const b = buildEngineEnv(baseParams);
+
+        for (const built of [a, b]) {
+            expect(built.env.AWS_CONFIG_FILE).toBeDefined();
+            expect(built.env.AWS_SHARED_CREDENTIALS_FILE).toBeDefined();
+            expect(built.env.AWS_CONFIG_FILE.startsWith(os.tmpdir())).toBe(
+                true
+            );
+            expect(
+                built.env.AWS_SHARED_CREDENTIALS_FILE.startsWith(os.tmpdir())
+            ).toBe(true);
+            expect(built.env.AWS_REGION).toBe("us-east-1");
+            expect(typeof built.cleanup).toBe("function");
+            // Cleanup of never-created temp files is a no-op that must not throw.
+            expect(() => built.cleanup()).not.toThrow();
+        }
+
+        // Distinct files per transfer so two concurrent `aws configure set`
+        // writes can never collide on a shared config file.
+        expect(a.env.AWS_CONFIG_FILE).not.toBe(b.env.AWS_CONFIG_FILE);
+        expect(a.env.AWS_SHARED_CREDENTIALS_FILE).not.toBe(
+            b.env.AWS_SHARED_CREDENTIALS_FILE
+        );
+    });
+
+    test("resolves region to auto when unset", () => {
+        const built = buildEngineEnv({ ...baseParams, region: undefined });
+        expect(built.env.AWS_REGION).toBe("auto");
+    });
+});
+
 describe("transferArchive engine selection + fallthrough", () => {
     let runS5cmd: AnyMock;
     let runAwsCli: AnyMock;
@@ -244,5 +280,67 @@ describe("transferArchive engine selection + fallthrough", () => {
         );
         expect(engine).toBe("node");
         expect(nodeFallback).toHaveBeenCalledTimes(1);
+    });
+
+    test("download: a passing verifyNativeDownload keeps the native engine result", async () => {
+        const verify = jest.fn(async () => undefined);
+        const engine = await transferArchive(
+            "download",
+            baseParams,
+            nodeFallback as () => Promise<void>,
+            makeDeps({ s5cmd: true, aws: true }),
+            verify as () => Promise<void>
+        );
+        expect(engine).toBe("s5cmd");
+        expect(verify).toHaveBeenCalledTimes(1);
+        expect(nodeFallback).not.toHaveBeenCalled();
+    });
+
+    test("download: a failing verifyNativeDownload falls through to the next engine", async () => {
+        const verify = jest.fn(async () => undefined);
+        // s5cmd's transfer "succeeds" but its integrity check fails; aws-cli's
+        // then passes verification.
+        verify.mockRejectedValueOnce(new Error("size mismatch"));
+        const engine = await transferArchive(
+            "download",
+            baseParams,
+            nodeFallback as () => Promise<void>,
+            makeDeps({ s5cmd: true, aws: true }),
+            verify as () => Promise<void>
+        );
+        expect(engine).toBe("aws-cli");
+        expect(runS5cmd).toHaveBeenCalledTimes(1);
+        expect(runAwsCli).toHaveBeenCalledTimes(1);
+        expect(verify).toHaveBeenCalledTimes(2);
+        expect(nodeFallback).not.toHaveBeenCalled();
+    });
+
+    test("download: verify failing on every native engine still reaches node (never hard-fails)", async () => {
+        const verify = jest.fn(async () => undefined);
+        verify.mockRejectedValue(new Error("size mismatch"));
+        const engine = await transferArchive(
+            "download",
+            baseParams,
+            nodeFallback as () => Promise<void>,
+            makeDeps({ s5cmd: true, aws: true }),
+            verify as () => Promise<void>
+        );
+        expect(engine).toBe("node");
+        // Verified after s5cmd and after aws-cli, but never for the node engine.
+        expect(verify).toHaveBeenCalledTimes(2);
+        expect(nodeFallback).toHaveBeenCalledTimes(1);
+    });
+
+    test("upload: verifyNativeDownload is never invoked (uploads self-validate)", async () => {
+        const verify = jest.fn(async () => undefined);
+        const engine = await transferArchive(
+            "upload",
+            baseParams,
+            nodeFallback as () => Promise<void>,
+            makeDeps({ s5cmd: true, aws: true }),
+            verify as () => Promise<void>
+        );
+        expect(engine).toBe("s5cmd");
+        expect(verify).not.toHaveBeenCalled();
     });
 });

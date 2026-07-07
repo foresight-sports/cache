@@ -251,7 +251,11 @@ export async function downloadCacheHttpClientConcurrent(
             activeDownloads[nextDownload.offset] = nextDownload.promiseGetter();
             actives++;
 
-            if (actives >= (options.downloadConcurrency ?? 10)) {
+            // Reuse the same downloadConcurrency computed above (default 8) that
+            // sized the socket pool, so the in-flight gate can never exceed the
+            // number of sockets available to serve it (previously this defaulted
+            // to 10 while the pool was sized for 8).
+            if (actives >= downloadConcurrency) {
                 await waitAndWrite();
             }
         }

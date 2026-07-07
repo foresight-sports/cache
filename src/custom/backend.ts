@@ -1,6 +1,7 @@
 import * as core from "@actions/core";
 import {
     GetObjectCommand,
+    HeadObjectCommand,
     ListObjectsV2Command,
     S3Client
 } from "@aws-sdk/client-s3";
@@ -8,7 +9,7 @@ import { Upload } from "@aws-sdk/lib-storage";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import * as crypto from "crypto";
-import { createReadStream } from "fs";
+import { createReadStream, statSync } from "fs";
 import { Agent } from "https";
 
 import {
@@ -246,6 +247,40 @@ export async function downloadCache(
         );
     };
 
+    // Defense-in-depth: s5cmd/aws-cli exit 0 is trusted blindly, so after a
+    // native download independently confirm the object landed whole by comparing
+    // the on-disk size against the S3 object's ContentLength (HeadObject via the
+    // same credentialed s3Client). A mismatch throws, which transferArchive
+    // treats as an engine failure and falls through to the next engine rather
+    // than hard-failing. A HeadObject that itself fails is not a mismatch, so we
+    // swallow it and trust the native result (the node fallback would re-validate
+    // byte counts anyway). The node engine validates its own download internally.
+    const verifyNativeDownload = async (): Promise<void> => {
+        let expectedBytes: number | undefined;
+        try {
+            const head = await s3Client.send(
+                new HeadObjectCommand({ Bucket: bucket, Key: objectKey })
+            );
+            expectedBytes = head.ContentLength;
+        } catch (error) {
+            core.debug(
+                `Skipping native-download size check (HeadObject failed: ${
+                    (error as Error).message
+                }).`
+            );
+            return;
+        }
+        if (typeof expectedBytes !== "number") {
+            return;
+        }
+        const actualBytes = statSync(archivePath).size;
+        if (expectedBytes !== actualBytes) {
+            throw new Error(
+                `native download size mismatch: S3 ContentLength ${expectedBytes} B != local file ${actualBytes} B`
+            );
+        }
+    };
+
     // Engine chain: s5cmd -> aws-cli -> node. The native engines pull the object
     // directly by bucket+key (same credential chain the S3Client signs with);
     // the node presigned downloader is the guaranteed fallback if a native
@@ -261,7 +296,9 @@ export async function downloadCache(
             region,
             forcePathStyle
         },
-        nodeDownload
+        nodeDownload,
+        undefined,
+        verifyNativeDownload
     );
 }
 
