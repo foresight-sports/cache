@@ -3,8 +3,10 @@ import {
     GetObjectCommand,
     ListObjectsV2Command
 } from "@aws-sdk/client-s3";
+import { NodeHttpHandler } from "@smithy/node-http-handler";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createReadStream } from "fs";
+import { Agent } from "https";
 import * as crypto from "crypto";
 import {
     DownloadOptions,
@@ -33,7 +35,12 @@ if (process.env.RUNS_ON_RUNNER_NAME && process.env.RUNS_ON_RUNNER_NAME !== "") {
     delete process.env.AWS_SESSION_TOKEN;
 }
 
-const versionSalt = "1.0";
+// Bumped 1.0 -> 2.0 to start a fresh cache generation: the no-compression fast
+// path now writes zstd-compressed archives (see custom/utils/uncompressedTar.ts),
+// which are not byte-compatible with previously stored raw-tar archives that share
+// the same file extension. Bumping the salt namespaces old and new archives apart
+// so a stale raw-tar entry is never fetched and fed to the zstd extractor.
+const versionSalt = "2.0";
 const bucketName = process.env.RUNS_ON_S3_BUCKET_CACHE;
 const endpoint = process.env.RUNS_ON_S3_BUCKET_ENDPOINT;
 const region =
@@ -44,14 +51,27 @@ const forcePathStyle =
     process.env.RUNS_ON_S3_FORCE_PATH_STYLE === "true" ||
     process.env.AWS_S3_FORCE_PATH_STYLE === "true";
 
-const uploadQueueSize = Number(process.env.UPLOAD_QUEUE_SIZE || "4");
+const uploadQueueSize = Number(process.env.UPLOAD_QUEUE_SIZE || "16");
 const uploadPartSize =
-    Number(process.env.UPLOAD_PART_SIZE || "32") * 1024 * 1024;
+    Number(process.env.UPLOAD_PART_SIZE || "64") * 1024 * 1024;
 const downloadQueueSize = Number(process.env.DOWNLOAD_QUEUE_SIZE || "8");
 const downloadPartSize =
     Number(process.env.DOWNLOAD_PART_SIZE || "16") * 1024 * 1024;
 
-const s3Client = new S3Client({ region, forcePathStyle, endpoint });
+// The AWS SDK's default HTTP handler caps concurrent sockets at maxSockets=50,
+// which throttles multipart concurrency above ~48 no matter how large the queue
+// size is. Size the socket pool to the largest queue we use, plus headroom.
+const s3Client = new S3Client({
+    region,
+    forcePathStyle,
+    endpoint,
+    requestHandler: new NodeHttpHandler({
+        httpsAgent: new Agent({
+            keepAlive: true,
+            maxSockets: Math.max(uploadQueueSize, downloadQueueSize) + 8
+        })
+    })
+});
 
 export function getCacheVersion(
     paths: string[],
@@ -210,8 +230,14 @@ export async function saveCache(
     key: string,
     paths: string[],
     archivePath: string,
-    { compressionMethod, enableCrossOsArchive, cacheSize: archiveFileSize }
+    {
+        compressionMethod,
+        enableCrossOsArchive,
+        cacheSize: archiveFileSize,
+        uploadChunkSize
+    }
 ): Promise<void> {
+    void archiveFileSize;
     if (!bucketName) {
         throw new Error("Environment variable RUNS_ON_S3_BUCKET_CACHE not set");
     }
@@ -226,6 +252,35 @@ export async function saveCache(
     });
     const s3Key = `${s3Prefix}/${key}`;
 
+    // Stat the archive up front so we can both report its size and size the
+    // multipart upload against it.
+    const cacheSize = utils.getArchiveFileSizeInBytes(archivePath);
+
+    // @aws-sdk/lib-storage enforces a hard MAX_PARTS = 10000 ceiling. With a fixed
+    // part size, any payload larger than partSize * 10000 throws
+    // "Exceeded 10000 parts" (e.g. 32 MB parts cap out at ~320 GB, 64 MB at ~640 GB).
+    // Raise the part size adaptively so any payload is representable in <= ~9500
+    // parts (9500 leaves headroom under 10000), making that crash impossible
+    // regardless of the configured/overridden part size. `upload-chunk-size` (bytes),
+    // when provided, overrides the default part size but is still floored here.
+    const configuredPartSize =
+        uploadChunkSize && uploadChunkSize > 0
+            ? uploadChunkSize
+            : uploadPartSize;
+    const effectivePartSize = Math.max(
+        configuredPartSize,
+        Math.ceil(cacheSize / 9500)
+    );
+    const estimatedParts = Math.max(
+        1,
+        Math.ceil(cacheSize / effectivePartSize)
+    );
+    core.info(
+        `Multipart upload: part size ~${Math.round(
+            effectivePartSize / (1024 * 1024)
+        )} MB, queue size ${uploadQueueSize}, ~${estimatedParts} parts for ${cacheSize} B.`
+    );
+
     const multipartUpload = new Upload({
         client: s3Client,
         params: {
@@ -233,14 +288,13 @@ export async function saveCache(
             Key: s3Key,
             Body: createReadStream(archivePath)
         },
-        // Part size in bytes
-        partSize: uploadPartSize,
+        // Part size in bytes (adaptively floored to stay under the 10000-part cap)
+        partSize: effectivePartSize,
         // Max concurrency
         queueSize: uploadQueueSize
     });
 
     // Commit Cache
-    const cacheSize = utils.getArchiveFileSizeInBytes(archivePath);
     core.info(
         `Cache Size: ~${Math.round(
             cacheSize / (1024 * 1024)

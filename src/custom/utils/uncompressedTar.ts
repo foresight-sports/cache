@@ -111,6 +111,13 @@ export async function createTar(
 
     const args = [
         "--posix",
+        // Multithreaded zstd (-T0 = all cores) at the fast level 3, with long-range
+        // matching (--long=30 = 1 GiB window). tar splits this value on whitespace
+        // and runs it as the compression filter. This replaces the previous raw
+        // (uncompressed) tar so the payload is both smaller and produced in parallel.
+        // The matching decompressor in extractTar/listTar uses `zstd -d --long=30`.
+        "--use-compress-program",
+        "zstd -T0 -3 --long=30",
         "-cf",
         normalizedArchiveName,
         "--exclude",
@@ -141,6 +148,13 @@ export async function extractTar(
     await io.mkdirP(workingDirectory);
 
     const args = [
+        // Decompress with zstd (long-range window must match the create side).
+        // `zstd -d` is used rather than `unzstd` because it is the form proven on the
+        // Windows Git tar bundle used by the runner (the toolkit's own zstd path and
+        // the observed restore log both invoke `zstd -d`), and it is equally valid on
+        // Linux/macOS.
+        "--use-compress-program",
+        "zstd -d --long=30",
         "-xf",
         normalizeForTar(archivePath),
         "-P",
@@ -162,7 +176,15 @@ export async function listTar(
     void _compressionMethod;
     const tool = await getTarTool();
 
-    const args = ["-tf", normalizeForTar(archivePath), "-P"];
+    // Same zstd decompressor as extractTar so debug listing works on the
+    // now-compressed archive.
+    const args = [
+        "--use-compress-program",
+        "zstd -d --long=30",
+        "-tf",
+        normalizeForTar(archivePath),
+        "-P"
+    ];
 
     appendPlatformSpecificArgs(tool, args);
 

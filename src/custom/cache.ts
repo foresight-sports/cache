@@ -310,7 +310,11 @@ export async function saveCache(
         await cacheHttpClient.saveCache(key, paths, archivePath, {
             compressionMethod,
             enableCrossOsArchive,
-            cacheSize: archiveFileSize
+            cacheSize: archiveFileSize,
+            // Forward the `upload-chunk-size` input (bytes) so it can override the
+            // default multipart part size in the S3 backend. Previously dropped here,
+            // which silently made the action's `upload-chunk-size` input a no-op.
+            uploadChunkSize: options?.uploadChunkSize
         });
 
         // dummy cacheId, if we get there without raising, it means the cache has been saved

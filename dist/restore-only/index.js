@@ -126973,6 +126973,8 @@ const RefKey = "GITHUB_REF";
 
 // EXTERNAL MODULE: ./node_modules/@aws-sdk/client-s3/dist-cjs/index.js
 var dist_cjs = __nccwpck_require__(3711);
+// EXTERNAL MODULE: ./node_modules/@smithy/node-http-handler/dist-cjs/index.js
+var node_http_handler_dist_cjs = __nccwpck_require__(1279);
 // EXTERNAL MODULE: ./node_modules/@aws-sdk/s3-request-presigner/dist-cjs/index.js
 var s3_request_presigner_dist_cjs = __nccwpck_require__(8505);
 // EXTERNAL MODULE: ./node_modules/@aws-sdk/lib-storage/dist-cjs/index.js
@@ -127225,6 +127227,8 @@ const downloadUtils_promiseWithTimeout = async (timeoutMs, promise) => {
 
 
 
+
+
 // if executing from RunsOn, unset any existing AWS credential env variables so that we can use the IAM instance profile for credentials
 // see unsetCredentials() in https://github.com/aws-actions/configure-aws-credentials/blob/v4.0.2/src/helpers.ts#L44
 // Note: we preserve AWS_REGION and AWS_DEFAULT_REGION as they are needed for SDK initialization
@@ -127233,7 +127237,12 @@ if (process.env.RUNS_ON_RUNNER_NAME && process.env.RUNS_ON_RUNNER_NAME !== "") {
     delete process.env.AWS_SECRET_ACCESS_KEY;
     delete process.env.AWS_SESSION_TOKEN;
 }
-const backend_versionSalt = "1.0";
+// Bumped 1.0 -> 2.0 to start a fresh cache generation: the no-compression fast
+// path now writes zstd-compressed archives (see custom/utils/uncompressedTar.ts),
+// which are not byte-compatible with previously stored raw-tar archives that share
+// the same file extension. Bumping the salt namespaces old and new archives apart
+// so a stale raw-tar entry is never fetched and fed to the zstd extractor.
+const backend_versionSalt = "2.0";
 const bucketName = process.env.RUNS_ON_S3_BUCKET_CACHE;
 const endpoint = process.env.RUNS_ON_S3_BUCKET_ENDPOINT;
 const region = process.env.RUNS_ON_AWS_REGION ||
@@ -127241,11 +127250,24 @@ const region = process.env.RUNS_ON_AWS_REGION ||
     process.env.AWS_DEFAULT_REGION;
 const forcePathStyle = process.env.RUNS_ON_S3_FORCE_PATH_STYLE === "true" ||
     process.env.AWS_S3_FORCE_PATH_STYLE === "true";
-const uploadQueueSize = Number(process.env.UPLOAD_QUEUE_SIZE || "4");
-const uploadPartSize = Number(process.env.UPLOAD_PART_SIZE || "32") * 1024 * 1024;
+const uploadQueueSize = Number(process.env.UPLOAD_QUEUE_SIZE || "16");
+const uploadPartSize = Number(process.env.UPLOAD_PART_SIZE || "64") * 1024 * 1024;
 const downloadQueueSize = Number(process.env.DOWNLOAD_QUEUE_SIZE || "8");
 const downloadPartSize = Number(process.env.DOWNLOAD_PART_SIZE || "16") * 1024 * 1024;
-const s3Client = new dist_cjs.S3Client({ region, forcePathStyle, endpoint });
+// The AWS SDK's default HTTP handler caps concurrent sockets at maxSockets=50,
+// which throttles multipart concurrency above ~48 no matter how large the queue
+// size is. Size the socket pool to the largest queue we use, plus headroom.
+const s3Client = new dist_cjs.S3Client({
+    region,
+    forcePathStyle,
+    endpoint,
+    requestHandler: new node_http_handler_dist_cjs.NodeHttpHandler({
+        httpsAgent: new external_https_.Agent({
+            keepAlive: true,
+            maxSockets: Math.max(uploadQueueSize, downloadQueueSize) + 8
+        })
+    })
+});
 function backend_getCacheVersion(paths, compressionMethod, enableCrossOsArchive = false) {
     // don't pass changes upstream
     const components = paths.slice();
@@ -127349,7 +127371,8 @@ async function backend_downloadCache(archiveLocation, archivePath, options) {
     // This should never be reached, but just in case
     throw lastError || new Error("Download failed after all retry attempts");
 }
-async function backend_saveCache(key, paths, archivePath, { compressionMethod, enableCrossOsArchive, cacheSize: archiveFileSize }) {
+async function backend_saveCache(key, paths, archivePath, { compressionMethod, enableCrossOsArchive, cacheSize: archiveFileSize, uploadChunkSize }) {
+    void archiveFileSize;
     if (!bucketName) {
         throw new Error("Environment variable RUNS_ON_S3_BUCKET_CACHE not set");
     }
@@ -127361,6 +127384,22 @@ async function backend_saveCache(key, paths, archivePath, { compressionMethod, e
         enableCrossOsArchive
     });
     const s3Key = `${s3Prefix}/${key}`;
+    // Stat the archive up front so we can both report its size and size the
+    // multipart upload against it.
+    const cacheSize = utils.getArchiveFileSizeInBytes(archivePath);
+    // @aws-sdk/lib-storage enforces a hard MAX_PARTS = 10000 ceiling. With a fixed
+    // part size, any payload larger than partSize * 10000 throws
+    // "Exceeded 10000 parts" (e.g. 32 MB parts cap out at ~320 GB, 64 MB at ~640 GB).
+    // Raise the part size adaptively so any payload is representable in <= ~9500
+    // parts (9500 leaves headroom under 10000), making that crash impossible
+    // regardless of the configured/overridden part size. `upload-chunk-size` (bytes),
+    // when provided, overrides the default part size but is still floored here.
+    const configuredPartSize = uploadChunkSize && uploadChunkSize > 0
+        ? uploadChunkSize
+        : uploadPartSize;
+    const effectivePartSize = Math.max(configuredPartSize, Math.ceil(cacheSize / 9500));
+    const estimatedParts = Math.max(1, Math.ceil(cacheSize / effectivePartSize));
+    core.info(`Multipart upload: part size ~${Math.round(effectivePartSize / (1024 * 1024))} MB, queue size ${uploadQueueSize}, ~${estimatedParts} parts for ${cacheSize} B.`);
     const multipartUpload = new Upload({
         client: s3Client,
         params: {
@@ -127368,13 +127407,12 @@ async function backend_saveCache(key, paths, archivePath, { compressionMethod, e
             Key: s3Key,
             Body: createReadStream(archivePath)
         },
-        // Part size in bytes
-        partSize: uploadPartSize,
+        // Part size in bytes (adaptively floored to stay under the 10000-part cap)
+        partSize: effectivePartSize,
         // Max concurrency
         queueSize: uploadQueueSize
     });
     // Commit Cache
-    const cacheSize = utils.getArchiveFileSizeInBytes(archivePath);
     core.info(`Cache Size: ~${Math.round(cacheSize / (1024 * 1024))} MB (${cacheSize} B)`);
     core.info(`Uploading cache from ${archivePath} to ${bucketName}/${s3Key}`);
     const progress = new backend_UploadProgress(cacheSize);
@@ -127523,6 +127561,13 @@ async function uncompressedTar_createTar(archiveFolder, sourceDirectories, compr
     (0,external_fs_namespaceObject.writeFileSync)(normalizedManifestPath, sourceDirectories.join("\n"));
     const args = [
         "--posix",
+        // Multithreaded zstd (-T0 = all cores) at the fast level 3, with long-range
+        // matching (--long=30 = 1 GiB window). tar splits this value on whitespace
+        // and runs it as the compression filter. This replaces the previous raw
+        // (uncompressed) tar so the payload is both smaller and produced in parallel.
+        // The matching decompressor in extractTar/listTar uses `zstd -d --long=30`.
+        "--use-compress-program",
+        "zstd -T0 -3 --long=30",
         "-cf",
         normalizedArchiveName,
         "--exclude",
@@ -127545,6 +127590,13 @@ async function uncompressedTar_extractTar(archivePath, _compressionMethod) {
     const workingDirectory = normalizeForTar(uncompressedTar_getWorkingDirectory());
     await mkdirP(workingDirectory);
     const args = [
+        // Decompress with zstd (long-range window must match the create side).
+        // `zstd -d` is used rather than `unzstd` because it is the form proven on the
+        // Windows Git tar bundle used by the runner (the toolkit's own zstd path and
+        // the observed restore log both invoke `zstd -d`), and it is equally valid on
+        // Linux/macOS.
+        "--use-compress-program",
+        "zstd -d --long=30",
         "-xf",
         normalizeForTar(archivePath),
         "-P",
@@ -127559,7 +127611,15 @@ async function uncompressedTar_extractTar(archivePath, _compressionMethod) {
 async function uncompressedTar_listTar(archivePath, _compressionMethod) {
     void _compressionMethod;
     const tool = await getTarTool();
-    const args = ["-tf", normalizeForTar(archivePath), "-P"];
+    // Same zstd decompressor as extractTar so debug listing works on the
+    // now-compressed archive.
+    const args = [
+        "--use-compress-program",
+        "zstd -d --long=30",
+        "-tf",
+        normalizeForTar(archivePath),
+        "-P"
+    ];
     appendPlatformSpecificArgs(tool, args);
     await runTar(tool, args, {
         env: getExecEnv()
@@ -127774,7 +127834,11 @@ async function custom_cache_saveCache(paths, key, options, enableCrossOsArchive 
         await cacheHttpClient.saveCache(key, paths, archivePath, {
             compressionMethod,
             enableCrossOsArchive,
-            cacheSize: archiveFileSize
+            cacheSize: archiveFileSize,
+            // Forward the `upload-chunk-size` input (bytes) so it can override the
+            // default multipart part size in the S3 backend. Previously dropped here,
+            // which silently made the action's `upload-chunk-size` input a no-op.
+            uploadChunkSize: options?.uploadChunkSize
         });
         // dummy cacheId, if we get there without raising, it means the cache has been saved
         cacheId = 1;
