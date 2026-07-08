@@ -129,6 +129,30 @@ const ENV_DOWNLOAD_CONCURRENCY = "CACHE_DOWNLOAD_CONCURRENCY";
 const ENV_DOWNLOAD_PART_SIZE_MB = "CACHE_DOWNLOAD_PART_SIZE";
 const CONCURRENCY_HARD_MAX = 1024;
 
+// ---------------------------------------------------------------------------
+// STREAMING s5cmd `cat` part-parallelism — DISTINCT from the 256-way `cp`
+// download concurrency above, on purpose.
+//
+// `cat` fetches up to `--concurrency` parts in parallel but must emit them to
+// stdout IN ORDER, so a SLOW consumer (the filesystem-bound tar+zstd extract of
+// tens of thousands of small files on Windows NTFS+Defender) makes the ordered
+// writer buffer every out-of-order-completed part while it waits. At the high
+// `cp` download concurrency (256) that buffer + the many idle connections grew
+// until the writer truncated the stream — the real-runner failure (s5cmd cat
+// exit 1, tar "Unexpected EOF in archive"). So the streamed `cat` path gets its
+// OWN small, bounded concurrency + modest part size: the peak buffer is
+// ~concurrency * part-size (default 6 * 16 MiB ~= 96 MiB) and only a handful of
+// connections idle behind the slow tar. aws-cli's `cp - ` (bounded ring buffer)
+// is the PRIMARY streaming engine; this bounded `cat` is the secondary.
+const STREAM_S5CMD_CONCURRENCY_DEFAULT = 6;
+const STREAM_S5CMD_PART_SIZE_MB_DEFAULT = 16;
+// s5cmd global worker pool for the single-object `cat`: only needs to cover the
+// in-flight parts, so keep it small (NOT the cp path's 256) so the log/footprint
+// match the low-concurrency intent. Pinned >= concurrency as a cheap hedge.
+const STREAM_S5CMD_NUMWORKERS_MIN = 16;
+const ENV_STREAM_S5CMD_CONCURRENCY = "CACHE_STREAM_S5CMD_CONCURRENCY";
+const ENV_STREAM_S5CMD_PART_SIZE_MB = "CACHE_STREAM_S5CMD_PART_SIZE";
+
 function scaleToCores(
     cpuCount: number,
     min: number,
@@ -230,6 +254,37 @@ export function computePartSizeMb(
     }
     const override = parseEnvInt(env[ENV_DOWNLOAD_PART_SIZE_MB]);
     return clampPartSizeMb(override ?? DOWNLOAD_PART_SIZE_MB);
+}
+
+/**
+ * STREAMING s5cmd `cat` part-parallelism. A distinct, LOW, bounded value —
+ * deliberately NOT the 256-way `cp` download concurrency — because `cat`'s
+ * ordered writer buffers out-of-order parts behind a slow tar consumer; a small
+ * concurrency keeps that buffer to a few hundred MB and few idle connections
+ * (the fix for the observed truncated-stream / premature-EOF failure). Default
+ * 6, env-overridable via CACHE_STREAM_S5CMD_CONCURRENCY (clamped to the sanity
+ * ceiling; blank/non-positive overrides ignored).
+ */
+export function computeStreamS5cmdConcurrency(
+    env: NodeJS.ProcessEnv = process.env
+): number {
+    const override = parseEnvInt(env[ENV_STREAM_S5CMD_CONCURRENCY]);
+    if (override !== undefined) {
+        return Math.min(override, CONCURRENCY_HARD_MAX);
+    }
+    return STREAM_S5CMD_CONCURRENCY_DEFAULT;
+}
+
+/**
+ * STREAMING s5cmd `cat` part size (whole MiB). Modest by default (16 MiB) so the
+ * concurrency*part-size ordered-writer buffer stays small; env-overridable via
+ * CACHE_STREAM_S5CMD_PART_SIZE and floored at S3's 5 MiB multipart minimum.
+ */
+export function computeStreamS5cmdPartSizeMb(
+    env: NodeJS.ProcessEnv = process.env
+): number {
+    const override = parseEnvInt(env[ENV_STREAM_S5CMD_PART_SIZE_MB]);
+    return clampPartSizeMb(override ?? STREAM_S5CMD_PART_SIZE_MB_DEFAULT);
 }
 
 /** Region for the engines; "auto" when unset (S3-compatible endpoints/R2). */
@@ -356,32 +411,36 @@ export function buildAwsCliCpArgs(
 // ============================================================================
 
 /**
- * s5cmd streaming-download argv: `[global flags] cat [--concurrency N]
- * [--part-size M] s3://bucket/key`. `cat` writes the object to stdout using
- * concurrent multipart (peak/s5cmd concurrent-cat support), reusing the SAME
- * single-file download concurrency/part-size the `cp` path uses so the tuned
- * defaults (and the CACHE_DOWNLOAD_* env overrides) apply to streaming too.
+ * s5cmd streaming-download argv: `[global flags] cat --concurrency N
+ * --part-size M s3://bucket/key`. `cat` writes the object to stdout using
+ * concurrent multipart, but with a DISTINCT LOW streaming concurrency/part-size
+ * (computeStreamS5cmdConcurrency / computeStreamS5cmdPartSizeMb) — deliberately
+ * NOT the 256-way `cp` download tuning.
  *
- * MEMORY: `cat` fetches up to `--concurrency` parts in parallel but must emit
- * them to stdout IN ORDER, so if `tar` stalls the ordered writer buffers
- * out-of-order-completed parts. That buffer is bounded by ~concurrency *
- * part-size (256 * 16 MiB ~= 4 GiB with the defaults here) — within budget on
- * the 16-64 GiB runners. Shrink it on a memory-constrained runner by lowering
- * CACHE_DOWNLOAD_CONCURRENCY / CACHE_DOWNLOAD_PART_SIZE, or force the inherently
- * bounded aws-cli stream (or CACHE_STREAM_RESTORE=0 for no streaming at all).
+ * WHY LOW: `cat` fetches up to `--concurrency` parts in parallel but must emit
+ * them to stdout IN ORDER, so a SLOW consumer (the filesystem-bound tar+zstd
+ * extract) makes the ordered writer buffer every out-of-order-completed part. At
+ * the 256-way `cp` download concurrency that buffer + idle-connection set grew
+ * until the writer truncated the stream (observed on a real runner: s5cmd cat
+ * exit 1, tar "Unexpected EOF"). The low default (6 * 16 MiB ~= 96 MiB peak)
+ * bounds the buffer and keeps few idle connections; override with
+ * CACHE_STREAM_S5CMD_CONCURRENCY / CACHE_STREAM_S5CMD_PART_SIZE. aws-cli's
+ * inherently bounded `cp - ` stream is the PRIMARY streaming engine — this
+ * bounded `cat` is the secondary (CACHE_STREAM_RESTORE=0 disables streaming).
  *
  * NOTE: unlike the `cp` path this omits `--stat`: for `cat` the object bytes go
  * to stdout, and a stats line printed to stdout would corrupt the tar stream.
  */
 export function buildS5cmdCatArgs(
     params: TransferParams,
-    cpuCount: number = os.cpus().length,
     env: NodeJS.ProcessEnv = process.env
 ): string[] {
-    const concurrency = computeTransferConcurrency("download", cpuCount, env);
+    const concurrency = computeStreamS5cmdConcurrency(env);
+    const partSizeMb = computeStreamS5cmdPartSizeMb(env);
     // --numworkers only limits how many SEPARATE objects run at once (we move
-    // exactly one), so it is pinned; keep it >= concurrency as a cheap hedge.
-    const numworkers = Math.max(S5CMD_NUMWORKERS_MIN, concurrency);
+    // exactly one), so it is pinned small (>= concurrency) — NOT the cp path's
+    // 256 — so the footprint matches the low-concurrency intent.
+    const numworkers = Math.max(STREAM_S5CMD_NUMWORKERS_MIN, concurrency);
     const args: string[] = [
         "--numworkers",
         String(numworkers),
@@ -392,10 +451,7 @@ export function buildS5cmdCatArgs(
         args.push("--endpoint-url", params.endpoint);
     }
     args.push("cat", "--concurrency", String(concurrency));
-    const partSizeMb = computePartSizeMb("download", params, env);
-    if (partSizeMb !== undefined) {
-        args.push("--part-size", String(partSizeMb));
-    }
+    args.push("--part-size", String(partSizeMb));
     args.push(s3Uri(params));
     return args;
 }

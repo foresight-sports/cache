@@ -10,6 +10,8 @@ import {
     buildS5cmdCatArgs,
     computeDownloadConcurrency,
     computePartSizeMb,
+    computeStreamS5cmdConcurrency,
+    computeStreamS5cmdPartSizeMb,
     computeTransferConcurrency,
     computeUploadConcurrency,
     resolveRegion,
@@ -243,35 +245,98 @@ describe("buildS5cmdArgs", () => {
     });
 });
 
+describe("computeStreamS5cmdConcurrency / computeStreamS5cmdPartSizeMb (LOW bounded cat stream)", () => {
+    test("streaming cat concurrency defaults LOW (6) and is DECOUPLED from the 256 cp download concurrency", () => {
+        // The fix: cat's ordered writer at the 256-way cp concurrency truncated
+        // the stream behind a slow tar consumer; the streaming cat gets its own
+        // small default (6) so the peak buffer stays ~a few hundred MB.
+        expect(computeStreamS5cmdConcurrency(noEnv)).toBe(6);
+        // It is NOT the (much higher) cp download concurrency.
+        expect(computeStreamS5cmdConcurrency(noEnv)).toBeLessThan(
+            computeDownloadConcurrency(16, noEnv)
+        );
+    });
+
+    test("streaming cat concurrency is env-overridable (CACHE_STREAM_S5CMD_CONCURRENCY) and clamped", () => {
+        expect(
+            computeStreamS5cmdConcurrency({
+                CACHE_STREAM_S5CMD_CONCURRENCY: "8"
+            } as NodeJS.ProcessEnv)
+        ).toBe(8);
+        // Absurd override clamped to the hard ceiling.
+        expect(
+            computeStreamS5cmdConcurrency({
+                CACHE_STREAM_S5CMD_CONCURRENCY: "99999"
+            } as NodeJS.ProcessEnv)
+        ).toBe(1024);
+        // Non-positive / non-numeric ignored -> default.
+        expect(
+            computeStreamS5cmdConcurrency({
+                CACHE_STREAM_S5CMD_CONCURRENCY: "0"
+            } as NodeJS.ProcessEnv)
+        ).toBe(6);
+        expect(
+            computeStreamS5cmdConcurrency({
+                CACHE_STREAM_S5CMD_CONCURRENCY: "abc"
+            } as NodeJS.ProcessEnv)
+        ).toBe(6);
+    });
+
+    test("streaming cat part size defaults to 16 MiB, env-overridable and floored at 5 MiB", () => {
+        expect(computeStreamS5cmdPartSizeMb(noEnv)).toBe(16);
+        expect(
+            computeStreamS5cmdPartSizeMb({
+                CACHE_STREAM_S5CMD_PART_SIZE: "32"
+            } as NodeJS.ProcessEnv)
+        ).toBe(32);
+        expect(
+            computeStreamS5cmdPartSizeMb({
+                CACHE_STREAM_S5CMD_PART_SIZE: "2"
+            } as NodeJS.ProcessEnv)
+        ).toBe(5);
+    });
+
+    test("default cat concurrency*part-size peak buffer stays small (~96 MiB, a few hundred MB budget)", () => {
+        const buffMiB =
+            computeStreamS5cmdConcurrency(noEnv) *
+            computeStreamS5cmdPartSizeMb(noEnv);
+        expect(buffMiB).toBeLessThanOrEqual(256); // << the old 256*16 = 4096 MiB
+    });
+});
+
 describe("buildS5cmdCatArgs (streaming download to stdout)", () => {
-    test("emits `cat` with the reused download concurrency/part-size + s3 uri last", () => {
-        const args = buildS5cmdCatArgs(baseParams, 16, noEnv);
+    test("emits `cat` with the LOW streaming concurrency/part-size (NOT the 256 cp download tuning) + s3 uri last", () => {
+        const args = buildS5cmdCatArgs(baseParams, noEnv);
         expect(args).toEqual([
             "--numworkers",
-            "256", // pinned >= concurrency
+            "16", // small pool (>= concurrency), NOT the cp path's 256
             "--log",
             "error",
             "--endpoint-url",
             "https://s3.example.com",
             "cat",
             "--concurrency",
-            "256", // SAME decoupled download concurrency the cp path uses
+            "6", // distinct LOW streaming concurrency (bounds ordered-writer buffer)
             "--part-size",
-            "16", // SAME small download part size (bounds ordered-writer buffer)
+            "16", // modest streaming part size
             "s3://cache-bucket/cache/owner/repo/abc123/my-key"
         ]);
+    });
+
+    test("does NOT reuse the 256-way cp download concurrency (the truncation root cause)", () => {
+        const args = buildS5cmdCatArgs(baseParams, noEnv);
+        expect(args[args.indexOf("--concurrency") + 1]).toBe("6");
+        expect(args).not.toContain("256");
     });
 
     test("omits --stat so no stats line can corrupt the object byte stream on stdout", () => {
         // (--stat would print a summary to stdout, which for `cat` carries the
         // archive bytes; the cp path keeps --stat, the cat path must not.)
-        expect(buildS5cmdCatArgs(baseParams, 16, noEnv)).not.toContain(
-            "--stat"
-        );
+        expect(buildS5cmdCatArgs(baseParams, noEnv)).not.toContain("--stat");
     });
 
     test("streams via argv only — the s3 uri is a single token, never a shell string", () => {
-        const args = buildS5cmdCatArgs(baseParams, 16, noEnv);
+        const args = buildS5cmdCatArgs(baseParams, noEnv);
         // Exactly one operand token and it is the bare s3:// uri (no pipe, no
         // redirection, no `tar`, no interpolation into a composite string).
         expect(args[args.length - 1]).toBe(
@@ -282,19 +347,23 @@ describe("buildS5cmdCatArgs (streaming download to stdout)", () => {
         );
     });
 
-    test("honors CACHE_DOWNLOAD_* env overrides (same knobs as the cp path)", () => {
-        const args = buildS5cmdCatArgs(baseParams, 16, {
-            CACHE_DOWNLOAD_CONCURRENCY: "128",
-            CACHE_DOWNLOAD_PART_SIZE: "32"
+    test("honors the distinct streaming env knobs (CACHE_STREAM_S5CMD_*), not the cp CACHE_DOWNLOAD_*", () => {
+        const args = buildS5cmdCatArgs(baseParams, {
+            CACHE_STREAM_S5CMD_CONCURRENCY: "8",
+            CACHE_STREAM_S5CMD_PART_SIZE: "32",
+            // The cp-path knobs must NOT influence the streaming cat path.
+            CACHE_DOWNLOAD_CONCURRENCY: "256",
+            CACHE_DOWNLOAD_PART_SIZE: "64"
         } as NodeJS.ProcessEnv);
-        expect(args[args.indexOf("--concurrency") + 1]).toBe("128");
+        expect(args[args.indexOf("--concurrency") + 1]).toBe("8");
         expect(args[args.indexOf("--part-size") + 1]).toBe("32");
+        // numworkers pinned >= concurrency but still small.
+        expect(args[args.indexOf("--numworkers") + 1]).toBe("16");
     });
 
     test("omits --endpoint-url for real AWS S3", () => {
         const args = buildS5cmdCatArgs(
             { ...baseParams, endpoint: undefined },
-            16,
             noEnv
         );
         expect(args).not.toContain("--endpoint-url");

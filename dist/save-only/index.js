@@ -127187,6 +127187,29 @@ const ENV_UPLOAD_CONCURRENCY = "CACHE_UPLOAD_CONCURRENCY";
 const ENV_DOWNLOAD_CONCURRENCY = "CACHE_DOWNLOAD_CONCURRENCY";
 const ENV_DOWNLOAD_PART_SIZE_MB = "CACHE_DOWNLOAD_PART_SIZE";
 const CONCURRENCY_HARD_MAX = 1024;
+// ---------------------------------------------------------------------------
+// STREAMING s5cmd `cat` part-parallelism — DISTINCT from the 256-way `cp`
+// download concurrency above, on purpose.
+//
+// `cat` fetches up to `--concurrency` parts in parallel but must emit them to
+// stdout IN ORDER, so a SLOW consumer (the filesystem-bound tar+zstd extract of
+// tens of thousands of small files on Windows NTFS+Defender) makes the ordered
+// writer buffer every out-of-order-completed part while it waits. At the high
+// `cp` download concurrency (256) that buffer + the many idle connections grew
+// until the writer truncated the stream — the real-runner failure (s5cmd cat
+// exit 1, tar "Unexpected EOF in archive"). So the streamed `cat` path gets its
+// OWN small, bounded concurrency + modest part size: the peak buffer is
+// ~concurrency * part-size (default 6 * 16 MiB ~= 96 MiB) and only a handful of
+// connections idle behind the slow tar. aws-cli's `cp - ` (bounded ring buffer)
+// is the PRIMARY streaming engine; this bounded `cat` is the secondary.
+const STREAM_S5CMD_CONCURRENCY_DEFAULT = 6;
+const STREAM_S5CMD_PART_SIZE_MB_DEFAULT = 16;
+// s5cmd global worker pool for the single-object `cat`: only needs to cover the
+// in-flight parts, so keep it small (NOT the cp path's 256) so the log/footprint
+// match the low-concurrency intent. Pinned >= concurrency as a cheap hedge.
+const STREAM_S5CMD_NUMWORKERS_MIN = 16;
+const ENV_STREAM_S5CMD_CONCURRENCY = "CACHE_STREAM_S5CMD_CONCURRENCY";
+const ENV_STREAM_S5CMD_PART_SIZE_MB = "CACHE_STREAM_S5CMD_PART_SIZE";
 function scaleToCores(cpuCount, min, max, factor) {
     const cores = Number.isFinite(cpuCount) && cpuCount > 0 ? cpuCount : 1;
     return Math.min(max, Math.max(min, Math.floor(cores) * factor));
@@ -127253,6 +127276,31 @@ function computePartSizeMb(direction, params, env = process.env) {
     }
     const override = parseEnvInt(env[ENV_DOWNLOAD_PART_SIZE_MB]);
     return clampPartSizeMb(override ?? DOWNLOAD_PART_SIZE_MB);
+}
+/**
+ * STREAMING s5cmd `cat` part-parallelism. A distinct, LOW, bounded value —
+ * deliberately NOT the 256-way `cp` download concurrency — because `cat`'s
+ * ordered writer buffers out-of-order parts behind a slow tar consumer; a small
+ * concurrency keeps that buffer to a few hundred MB and few idle connections
+ * (the fix for the observed truncated-stream / premature-EOF failure). Default
+ * 6, env-overridable via CACHE_STREAM_S5CMD_CONCURRENCY (clamped to the sanity
+ * ceiling; blank/non-positive overrides ignored).
+ */
+function computeStreamS5cmdConcurrency(env = process.env) {
+    const override = parseEnvInt(env[ENV_STREAM_S5CMD_CONCURRENCY]);
+    if (override !== undefined) {
+        return Math.min(override, CONCURRENCY_HARD_MAX);
+    }
+    return STREAM_S5CMD_CONCURRENCY_DEFAULT;
+}
+/**
+ * STREAMING s5cmd `cat` part size (whole MiB). Modest by default (16 MiB) so the
+ * concurrency*part-size ordered-writer buffer stays small; env-overridable via
+ * CACHE_STREAM_S5CMD_PART_SIZE and floored at S3's 5 MiB multipart minimum.
+ */
+function computeStreamS5cmdPartSizeMb(env = process.env) {
+    const override = parseEnvInt(env[ENV_STREAM_S5CMD_PART_SIZE_MB]);
+    return clampPartSizeMb(override ?? STREAM_S5CMD_PART_SIZE_MB_DEFAULT);
 }
 /** Region for the engines; "auto" when unset (S3-compatible endpoints/R2). */
 function resolveRegion(region) {
@@ -127360,28 +127408,33 @@ function buildAwsCliCpArgs(direction, params) {
 // a shell string — so the pipeline stays injection-safe.
 // ============================================================================
 /**
- * s5cmd streaming-download argv: `[global flags] cat [--concurrency N]
- * [--part-size M] s3://bucket/key`. `cat` writes the object to stdout using
- * concurrent multipart (peak/s5cmd concurrent-cat support), reusing the SAME
- * single-file download concurrency/part-size the `cp` path uses so the tuned
- * defaults (and the CACHE_DOWNLOAD_* env overrides) apply to streaming too.
+ * s5cmd streaming-download argv: `[global flags] cat --concurrency N
+ * --part-size M s3://bucket/key`. `cat` writes the object to stdout using
+ * concurrent multipart, but with a DISTINCT LOW streaming concurrency/part-size
+ * (computeStreamS5cmdConcurrency / computeStreamS5cmdPartSizeMb) — deliberately
+ * NOT the 256-way `cp` download tuning.
  *
- * MEMORY: `cat` fetches up to `--concurrency` parts in parallel but must emit
- * them to stdout IN ORDER, so if `tar` stalls the ordered writer buffers
- * out-of-order-completed parts. That buffer is bounded by ~concurrency *
- * part-size (256 * 16 MiB ~= 4 GiB with the defaults here) — within budget on
- * the 16-64 GiB runners. Shrink it on a memory-constrained runner by lowering
- * CACHE_DOWNLOAD_CONCURRENCY / CACHE_DOWNLOAD_PART_SIZE, or force the inherently
- * bounded aws-cli stream (or CACHE_STREAM_RESTORE=0 for no streaming at all).
+ * WHY LOW: `cat` fetches up to `--concurrency` parts in parallel but must emit
+ * them to stdout IN ORDER, so a SLOW consumer (the filesystem-bound tar+zstd
+ * extract) makes the ordered writer buffer every out-of-order-completed part. At
+ * the 256-way `cp` download concurrency that buffer + idle-connection set grew
+ * until the writer truncated the stream (observed on a real runner: s5cmd cat
+ * exit 1, tar "Unexpected EOF"). The low default (6 * 16 MiB ~= 96 MiB peak)
+ * bounds the buffer and keeps few idle connections; override with
+ * CACHE_STREAM_S5CMD_CONCURRENCY / CACHE_STREAM_S5CMD_PART_SIZE. aws-cli's
+ * inherently bounded `cp - ` stream is the PRIMARY streaming engine — this
+ * bounded `cat` is the secondary (CACHE_STREAM_RESTORE=0 disables streaming).
  *
  * NOTE: unlike the `cp` path this omits `--stat`: for `cat` the object bytes go
  * to stdout, and a stats line printed to stdout would corrupt the tar stream.
  */
-function transferEngine_buildS5cmdCatArgs(params, cpuCount = os.cpus().length, env = process.env) {
-    const concurrency = computeTransferConcurrency("download", cpuCount, env);
+function transferEngine_buildS5cmdCatArgs(params, env = process.env) {
+    const concurrency = computeStreamS5cmdConcurrency(env);
+    const partSizeMb = computeStreamS5cmdPartSizeMb(env);
     // --numworkers only limits how many SEPARATE objects run at once (we move
-    // exactly one), so it is pinned; keep it >= concurrency as a cheap hedge.
-    const numworkers = Math.max(S5CMD_NUMWORKERS_MIN, concurrency);
+    // exactly one), so it is pinned small (>= concurrency) — NOT the cp path's
+    // 256 — so the footprint matches the low-concurrency intent.
+    const numworkers = Math.max(STREAM_S5CMD_NUMWORKERS_MIN, concurrency);
     const args = [
         "--numworkers",
         String(numworkers),
@@ -127392,10 +127445,7 @@ function transferEngine_buildS5cmdCatArgs(params, cpuCount = os.cpus().length, e
         args.push("--endpoint-url", params.endpoint);
     }
     args.push("cat", "--concurrency", String(concurrency));
-    const partSizeMb = computePartSizeMb("download", params, env);
-    if (partSizeMb !== undefined) {
-        args.push("--part-size", String(partSizeMb));
-    }
+    args.push("--part-size", String(partSizeMb));
     args.push(s3Uri(params));
     return args;
 }
@@ -127791,13 +127841,20 @@ async function uncompressedTar_listTar(archivePath, _compressionMethod) {
 // into a shell string. Both child processes are spawned with argv arrays and
 // shell:false, so nothing is ever parsed by a shell (injection-safe).
 //
-// Streaming is the default for the s5cmd and aws-cli engines. On ANY streaming
-// failure (downloader non-zero exit, tar/zstd error, broken pipe) the chain
-// tries the next streaming engine and ultimately signals the caller to fall
-// back to the proven file-based download-to-file + extract path (which also
-// re-runs the s5cmd/aws/node cp engines). The node presigned-URL engine is
-// intentionally NOT streamed — it stays file-based as the always-present safety
-// net. `CACHE_STREAM_RESTORE=0` forces the old file-based behavior entirely.
+// Streaming is the default. The PRIMARY streaming engine is aws-cli `s3 cp - |
+// tar`: its download uses a bounded internal ring buffer, so it stays robust
+// even when the tar consumer is slow (the fs-bound untar of tens of thousands
+// of small files), which is exactly the case that truncated the s5cmd path on a
+// real runner. The SECONDARY streaming engine is s5cmd `cat | tar`, run at a
+// distinct LOW, bounded streaming concurrency (NOT the 256-way cp download
+// concurrency) so its ordered writer buffers only a few hundred MB behind a slow
+// consumer instead of growing until it truncates. On ANY streaming failure
+// (downloader non-zero exit, tar/zstd error, broken pipe) the chain tries the
+// next streaming engine and ultimately signals the caller to fall back to the
+// proven file-based download-to-file + extract path (which also re-runs the
+// s5cmd/aws/node cp engines). The node presigned-URL engine is intentionally NOT
+// streamed — it stays file-based as the always-present safety net.
+// `CACHE_STREAM_RESTORE=0` forces the old file-based behavior entirely.
 
 
 
@@ -127920,13 +127977,15 @@ const streamingRestore_defaultDeps = {
 };
 /**
  * Attempt a streamed restore of s3://bucket/key straight into the workspace,
- * overlapping download and extraction. Tries `s5cmd cat | tar` first, then
- * `aws s3 cp - | tar`; each streaming engine that is missing or fails falls
- * through to the next. Returns the engine that completed the restore, or THROWS
- * if no streaming engine succeeded — the backend wrapper turns that throw into
- * a clean fall-back to the file-based download+extract path. The node
- * presigned-URL engine is deliberately absent here (it is the file-based safety
- * net, not a streaming engine).
+ * overlapping download and extraction. Tries the PRIMARY `aws s3 cp - | tar`
+ * (bounded ring buffer — robust with a slow, fs-bound tar consumer) first, then
+ * the SECONDARY `s5cmd cat | tar` at a LOW bounded streaming concurrency; each
+ * streaming engine that is missing or fails falls through to the next. Returns
+ * the engine that completed the restore, or THROWS if no streaming engine
+ * succeeded — the backend wrapper turns that throw into a clean fall-back to the
+ * file-based download+extract path. The node presigned-URL engine is
+ * deliberately absent here (it is the file-based safety net, not a streaming
+ * engine).
  */
 async function streamingRestore_streamedRestore(params, deps = streamingRestore_defaultDeps) {
     const startedAtMs = Date.now();
@@ -127934,25 +127993,11 @@ async function streamingRestore_streamedRestore(params, deps = streamingRestore_
         const elapsedSec = Math.max((Date.now() - startedAtMs) / 1000, 0.001);
         core.info(`Cache restored via streamed ${engine} (download|extract overlapped) in ${elapsedSec.toFixed(1)}s.`);
     };
-    // Engine 1: s5cmd cat | tar.
-    const s5cmdPath = await deps.findExecutable("s5cmd");
-    if (s5cmdPath) {
-        const { env, cleanup } = buildEngineEnv(params);
-        try {
-            core.info(`Cache download: streaming engine s5cmd cat | tar (${s5cmdPath}).`);
-            const tar = await deps.buildExtractCommand();
-            await deps.runPipeline({ command: s5cmdPath, args: buildS5cmdCatArgs(params), env }, tar);
-            logElapsed("s5cmd");
-            return "s5cmd";
-        }
-        catch (error) {
-            core.warning(`s5cmd streamed restore failed (${error.message}); trying aws-cli stream.`);
-        }
-        finally {
-            cleanup();
-        }
-    }
-    // Engine 2: aws s3 cp - | tar (bounded ring buffer; memory-safer stream).
+    // Engine 1 (PRIMARY): aws s3 cp - | tar. aws-cli streams the object through a
+    // bounded internal ring buffer (a single streaming GET, not many concurrent
+    // parts), so it stays robust when the fs-bound tar consumer is slow — the
+    // case that truncated the s5cmd cat path on a real runner. It only needs to
+    // sustain ~200 MB/s to hide under the fs-bound extract, which it does.
     const awsPath = await deps.findExecutable("aws");
     if (awsPath) {
         const { env, cleanup } = buildEngineEnv(params);
@@ -127972,13 +128017,34 @@ async function streamingRestore_streamedRestore(params, deps = streamingRestore_
             return "aws-cli";
         }
         catch (error) {
-            core.warning(`aws-cli streamed restore failed (${error.message}); falling back to file-based restore.`);
+            core.warning(`aws-cli streamed restore failed (${error.message}); trying s5cmd cat stream.`);
         }
         finally {
             cleanup();
         }
     }
-    throw new Error("no streaming restore engine available (s5cmd/aws-cli missing or failed)");
+    // Engine 2 (SECONDARY): s5cmd cat | tar, run at a DISTINCT LOW streaming
+    // concurrency (buildS5cmdCatArgs uses computeStreamS5cmdConcurrency, NOT the
+    // 256-way cp download concurrency) so cat's ordered writer buffers only a few
+    // hundred MB behind a slow consumer instead of growing until it truncates.
+    const s5cmdPath = await deps.findExecutable("s5cmd");
+    if (s5cmdPath) {
+        const { env, cleanup } = buildEngineEnv(params);
+        try {
+            core.info(`Cache download: streaming engine s5cmd cat | tar (${s5cmdPath}).`);
+            const tar = await deps.buildExtractCommand();
+            await deps.runPipeline({ command: s5cmdPath, args: buildS5cmdCatArgs(params), env }, tar);
+            logElapsed("s5cmd");
+            return "s5cmd";
+        }
+        catch (error) {
+            core.warning(`s5cmd streamed restore failed (${error.message}); falling back to file-based restore.`);
+        }
+        finally {
+            cleanup();
+        }
+    }
+    throw new Error("no streaming restore engine available (aws-cli/s5cmd missing or failed)");
 }
 
 ;// CONCATENATED MODULE: ./src/custom/utils/partSize.ts

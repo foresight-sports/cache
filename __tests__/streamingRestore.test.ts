@@ -115,54 +115,65 @@ describe("streamedRestore engine selection + fallthrough", () => {
         runAwsConfigure = jest.fn(async () => undefined);
     });
 
-    test("uses s5cmd cat | tar when present and successful; aws never runs", async () => {
+    test("uses aws-cli cp - | tar PRIMARY when present and successful; s5cmd never runs", async () => {
         const engine = await streamedRestore(
             baseParams,
             makeDeps({ s5cmd: true, aws: true })
         );
-        expect(engine).toBe("s5cmd");
+        // aws-cli is the PRIMARY streaming engine (bounded ring buffer, robust
+        // with a slow tar consumer); s5cmd cat never runs when aws-cli succeeds.
+        expect(engine).toBe("aws-cli");
+        expect(runAwsConfigure).toHaveBeenCalledTimes(1);
         expect(runPipelineMock).toHaveBeenCalledTimes(1);
-        expect(runAwsConfigure).not.toHaveBeenCalled();
 
-        // The downloader spec fed to the pipe is `s5cmd cat …` argv (no shell
-        // string), and the tar spec is the stdin extractor.
+        // The downloader spec fed to the pipe is `aws s3 cp <uri> -` argv (no
+        // shell string), and the tar spec is the stdin extractor.
         const [downloader, tar] = runPipelineMock.mock.calls[0] as [
             SpawnSpec,
             SpawnSpec
         ];
+        expect(downloader.command).toBe("/usr/bin/aws");
+        expect(downloader.args.slice(0, 2)).toEqual(["s3", "cp"]);
+        expect(downloader.args).toContain("-"); // cp to stdout
+        expect(tar.args).toContain("-"); // tar -xf -
+    });
+
+    test("aws absent -> falls through to SECONDARY s5cmd cat | tar (no configure)", async () => {
+        const engine = await streamedRestore(
+            baseParams,
+            makeDeps({ s5cmd: true, aws: false })
+        );
+        expect(engine).toBe("s5cmd");
+        // s5cmd cat needs no aws configure.
+        expect(runAwsConfigure).not.toHaveBeenCalled();
+        expect(runPipelineMock).toHaveBeenCalledTimes(1);
+
+        const [downloader] = runPipelineMock.mock.calls[0] as [SpawnSpec];
         expect(downloader.command).toBe("/usr/bin/s5cmd");
         expect(downloader.args).toContain("cat");
         expect(downloader.args[downloader.args.length - 1]).toBe(
             "s3://cache-bucket/cache/owner/repo/abc123/my-key"
         );
-        expect(tar.args).toContain("-"); // tar -xf -
+        // The secondary s5cmd cat runs at the LOW streaming concurrency (default
+        // 6), NOT the 256-way cp download concurrency that truncated the stream.
+        expect(
+            downloader.args[downloader.args.indexOf("--concurrency") + 1]
+        ).toBe("6");
     });
 
-    test("s5cmd absent -> falls through to aws-cli cp - | tar (configure runs first)", async () => {
-        const engine = await streamedRestore(
-            baseParams,
-            makeDeps({ s5cmd: false, aws: true })
-        );
-        expect(engine).toBe("aws-cli");
-        expect(runAwsConfigure).toHaveBeenCalledTimes(1);
-        expect(runPipelineMock).toHaveBeenCalledTimes(1);
-
-        const [downloader] = runPipelineMock.mock.calls[0] as [SpawnSpec];
-        expect(downloader.command).toBe("/usr/bin/aws");
-        expect(downloader.args.slice(0, 2)).toEqual(["s3", "cp"]);
-        expect(downloader.args).toContain("-"); // cp to stdout
-    });
-
-    test("s5cmd stream FAILS -> falls through to aws-cli stream", async () => {
+    test("aws-cli stream FAILS -> falls through to s5cmd cat stream", async () => {
         runPipelineMock
-            .mockRejectedValueOnce(new Error("s5cmd broken pipe"))
+            .mockRejectedValueOnce(new Error("aws-cli broken pipe"))
             .mockResolvedValueOnce(undefined);
         const engine = await streamedRestore(
             baseParams,
             makeDeps({ s5cmd: true, aws: true })
         );
-        expect(engine).toBe("aws-cli");
+        expect(engine).toBe("s5cmd");
         expect(runPipelineMock).toHaveBeenCalledTimes(2);
+        // Primary attempt ran the aws configure; the s5cmd fallback did not add
+        // another.
+        expect(runAwsConfigure).toHaveBeenCalledTimes(1);
     });
 
     test("both streaming engines fail -> THROWS so the caller falls back to file-based", async () => {

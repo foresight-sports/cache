@@ -17,13 +17,20 @@
 // into a shell string. Both child processes are spawned with argv arrays and
 // shell:false, so nothing is ever parsed by a shell (injection-safe).
 //
-// Streaming is the default for the s5cmd and aws-cli engines. On ANY streaming
-// failure (downloader non-zero exit, tar/zstd error, broken pipe) the chain
-// tries the next streaming engine and ultimately signals the caller to fall
-// back to the proven file-based download-to-file + extract path (which also
-// re-runs the s5cmd/aws/node cp engines). The node presigned-URL engine is
-// intentionally NOT streamed — it stays file-based as the always-present safety
-// net. `CACHE_STREAM_RESTORE=0` forces the old file-based behavior entirely.
+// Streaming is the default. The PRIMARY streaming engine is aws-cli `s3 cp - |
+// tar`: its download uses a bounded internal ring buffer, so it stays robust
+// even when the tar consumer is slow (the fs-bound untar of tens of thousands
+// of small files), which is exactly the case that truncated the s5cmd path on a
+// real runner. The SECONDARY streaming engine is s5cmd `cat | tar`, run at a
+// distinct LOW, bounded streaming concurrency (NOT the 256-way cp download
+// concurrency) so its ordered writer buffers only a few hundred MB behind a slow
+// consumer instead of growing until it truncates. On ANY streaming failure
+// (downloader non-zero exit, tar/zstd error, broken pipe) the chain tries the
+// next streaming engine and ultimately signals the caller to fall back to the
+// proven file-based download-to-file + extract path (which also re-runs the
+// s5cmd/aws/node cp engines). The node presigned-URL engine is intentionally NOT
+// streamed — it stays file-based as the always-present safety net.
+// `CACHE_STREAM_RESTORE=0` forces the old file-based behavior entirely.
 import * as core from "@actions/core";
 import { exec } from "@actions/exec";
 import { spawn } from "child_process";
@@ -209,13 +216,15 @@ const defaultDeps: StreamRestoreDeps = {
 
 /**
  * Attempt a streamed restore of s3://bucket/key straight into the workspace,
- * overlapping download and extraction. Tries `s5cmd cat | tar` first, then
- * `aws s3 cp - | tar`; each streaming engine that is missing or fails falls
- * through to the next. Returns the engine that completed the restore, or THROWS
- * if no streaming engine succeeded — the backend wrapper turns that throw into
- * a clean fall-back to the file-based download+extract path. The node
- * presigned-URL engine is deliberately absent here (it is the file-based safety
- * net, not a streaming engine).
+ * overlapping download and extraction. Tries the PRIMARY `aws s3 cp - | tar`
+ * (bounded ring buffer — robust with a slow, fs-bound tar consumer) first, then
+ * the SECONDARY `s5cmd cat | tar` at a LOW bounded streaming concurrency; each
+ * streaming engine that is missing or fails falls through to the next. Returns
+ * the engine that completed the restore, or THROWS if no streaming engine
+ * succeeded — the backend wrapper turns that throw into a clean fall-back to the
+ * file-based download+extract path. The node presigned-URL engine is
+ * deliberately absent here (it is the file-based safety net, not a streaming
+ * engine).
  */
 export async function streamedRestore(
     params: TransferParams,
@@ -231,33 +240,11 @@ export async function streamedRestore(
         );
     };
 
-    // Engine 1: s5cmd cat | tar.
-    const s5cmdPath = await deps.findExecutable("s5cmd");
-    if (s5cmdPath) {
-        const { env, cleanup } = buildEngineEnv(params);
-        try {
-            core.info(
-                `Cache download: streaming engine s5cmd cat | tar (${s5cmdPath}).`
-            );
-            const tar = await deps.buildExtractCommand();
-            await deps.runPipeline(
-                { command: s5cmdPath, args: buildS5cmdCatArgs(params), env },
-                tar
-            );
-            logElapsed("s5cmd");
-            return "s5cmd";
-        } catch (error) {
-            core.warning(
-                `s5cmd streamed restore failed (${
-                    (error as Error).message
-                }); trying aws-cli stream.`
-            );
-        } finally {
-            cleanup();
-        }
-    }
-
-    // Engine 2: aws s3 cp - | tar (bounded ring buffer; memory-safer stream).
+    // Engine 1 (PRIMARY): aws s3 cp - | tar. aws-cli streams the object through a
+    // bounded internal ring buffer (a single streaming GET, not many concurrent
+    // parts), so it stays robust when the fs-bound tar consumer is slow — the
+    // case that truncated the s5cmd cat path on a real runner. It only needs to
+    // sustain ~200 MB/s to hide under the fs-bound extract, which it does.
     const awsPath = await deps.findExecutable("aws");
     if (awsPath) {
         const { env, cleanup } = buildEngineEnv(params);
@@ -288,6 +275,35 @@ export async function streamedRestore(
             core.warning(
                 `aws-cli streamed restore failed (${
                     (error as Error).message
+                }); trying s5cmd cat stream.`
+            );
+        } finally {
+            cleanup();
+        }
+    }
+
+    // Engine 2 (SECONDARY): s5cmd cat | tar, run at a DISTINCT LOW streaming
+    // concurrency (buildS5cmdCatArgs uses computeStreamS5cmdConcurrency, NOT the
+    // 256-way cp download concurrency) so cat's ordered writer buffers only a few
+    // hundred MB behind a slow consumer instead of growing until it truncates.
+    const s5cmdPath = await deps.findExecutable("s5cmd");
+    if (s5cmdPath) {
+        const { env, cleanup } = buildEngineEnv(params);
+        try {
+            core.info(
+                `Cache download: streaming engine s5cmd cat | tar (${s5cmdPath}).`
+            );
+            const tar = await deps.buildExtractCommand();
+            await deps.runPipeline(
+                { command: s5cmdPath, args: buildS5cmdCatArgs(params), env },
+                tar
+            );
+            logElapsed("s5cmd");
+            return "s5cmd";
+        } catch (error) {
+            core.warning(
+                `s5cmd streamed restore failed (${
+                    (error as Error).message
                 }); falling back to file-based restore.`
             );
         } finally {
@@ -296,6 +312,6 @@ export async function streamedRestore(
     }
 
     throw new Error(
-        "no streaming restore engine available (s5cmd/aws-cli missing or failed)"
+        "no streaming restore engine available (aws-cli/s5cmd missing or failed)"
     );
 }
