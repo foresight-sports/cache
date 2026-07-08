@@ -127423,7 +127423,7 @@ function buildAwsCliCpArgs(direction, params) {
  * bounds the buffer and keeps few idle connections; override with
  * CACHE_STREAM_S5CMD_CONCURRENCY / CACHE_STREAM_S5CMD_PART_SIZE. aws-cli's
  * inherently bounded `cp - ` stream is the PRIMARY streaming engine — this
- * bounded `cat` is the secondary (CACHE_STREAM_RESTORE=0 disables streaming).
+ * bounded `cat` is the secondary (streaming is opt-in via CACHE_STREAM_RESTORE).
  *
  * NOTE: unlike the `cp` path this omits `--stat`: for `cat` the object bytes go
  * to stdout, and a stats line printed to stdout would corrupt the tar stream.
@@ -127841,7 +127841,10 @@ async function uncompressedTar_listTar(archivePath, _compressionMethod) {
 // into a shell string. Both child processes are spawned with argv arrays and
 // shell:false, so nothing is ever parsed by a shell (injection-safe).
 //
-// Streaming is the default. The PRIMARY streaming engine is aws-cli `s3 cp - |
+// Streaming is OPT-IN (enable with CACHE_STREAM_RESTORE=1/true/yes/on); the
+// default is the file-based download-to-file + extract path, which is the fast
+// route once the archive is staged on NVMe via CACHE_ARCHIVE_DIR. When enabled,
+// the PRIMARY streaming engine is aws-cli `s3 cp - |
 // tar`: its download uses a bounded internal ring buffer, so it stays robust
 // even when the tar consumer is slow (the fs-bound untar of tens of thousands
 // of small files), which is exactly the case that truncated the s5cmd path on a
@@ -127854,25 +127857,29 @@ async function uncompressedTar_listTar(archivePath, _compressionMethod) {
 // proven file-based download-to-file + extract path (which also re-runs the
 // s5cmd/aws/node cp engines). The node presigned-URL engine is intentionally NOT
 // streamed — it stays file-based as the always-present safety net.
-// `CACHE_STREAM_RESTORE=0` forces the old file-based behavior entirely.
+// Unset (or any non-truthy value) keeps the file-based path entirely; only an
+// explicitly truthy CACHE_STREAM_RESTORE (1/true/yes/on) enables streaming.
 
 
 
 
 
-/** Env var to force the legacy file-based restore (disable streaming). */
+/** Env var that opts INTO streaming restore (default is file-based). */
 const ENV_STREAM_RESTORE = "CACHE_STREAM_RESTORE";
 /**
- * Streaming restore is ON by default. `CACHE_STREAM_RESTORE` set to
- * 0/false/no/off (case-insensitive) forces the legacy download-to-file +
- * extract path. Any other value (or unset) keeps streaming enabled.
+ * Streaming restore is OFF by default. It runs ONLY when `CACHE_STREAM_RESTORE`
+ * is explicitly truthy — `1`/`true`/`yes`/`on` (case-insensitive). Unset, blank,
+ * or any other value (including 0/false/no/off) uses the file-based
+ * download-to-file + extract path, which is the fast route once the archive is
+ * staged on NVMe via CACHE_ARCHIVE_DIR. Streaming stays an opt-in experiment
+ * because the aws-cli stdout stream caps ~95 MB/s on real runners.
  */
 function streamingRestore_isStreamRestoreEnabled(env = process.env) {
     const value = (env[ENV_STREAM_RESTORE] ?? "").trim().toLowerCase();
-    return !(value === "0" ||
-        value === "false" ||
-        value === "no" ||
-        value === "off");
+    return (value === "1" ||
+        value === "true" ||
+        value === "yes" ||
+        value === "on");
 }
 /**
  * Run `downloader | tar` as a Node-wired pipeline: spawn both children (argv
@@ -128468,6 +128475,91 @@ class backend_UploadProgress {
     }
 }
 
+;// CONCATENATED MODULE: external "fs/promises"
+const promises_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("fs/promises");
+;// CONCATENATED MODULE: ./src/custom/utils/archiveStagingDir.ts
+// Configurable staging directory for the scratch `cache.tzst` archive.
+//
+// The file-based restore/save writes the whole (tens-of-GB) archive to a temp
+// dir before extracting / uploading. Upstream stages it under
+// `utils.createTempDirectory()` -> `RUNNER_TEMP`
+// (`C:\actions-runner\_work\_temp`), which on our runners is the C: gp3 EBS
+// root (~400 MB/s, ~3000 IOPS, ~1 ms write latency). 256-way concurrent
+// positional writes to that one 61 GB file stall the download well below the
+// NIC. Instance-store NVMe (Z:, ~10x lower latency, no gp3 cap) is available,
+// but the consuming workflow only junctions Library/Builds/Temp, not
+// RUNNER_TEMP, so the archive still lands on gp3.
+//
+// `CACHE_ARCHIVE_DIR` lets the caller point the archive staging at any
+// directory (e.g. NVMe). When set and non-empty, the archive is written under a
+// unique subdirectory INSIDE `CACHE_ARCHIVE_DIR`; when unset/blank, behavior is
+// byte-for-byte the upstream default (a UUID dir under RUNNER_TEMP). A
+// missing/unwritable value falls back to the default with a warning, so a bad
+// value can never break a restore or save.
+
+
+
+
+
+/**
+ * Env var: absolute path of a directory to stage the scratch `cache.tzst`
+ * archive under (e.g. fast instance-store NVMe), overriding the default
+ * `RUNNER_TEMP` location for both restore (download) and save (createTar).
+ */
+const ENV_ARCHIVE_DIR = "CACHE_ARCHIVE_DIR";
+/**
+ * Resolve the directory that will hold the scratch `cache.tzst` archive.
+ *
+ * Default (`CACHE_ARCHIVE_DIR` unset/blank): delegate to
+ * `utils.createTempDirectory()` — a unique UUID dir under `RUNNER_TEMP` — so the
+ * behavior is byte-for-byte the upstream default.
+ *
+ * Override (`CACHE_ARCHIVE_DIR` set): create a unique UUID subdirectory INSIDE
+ * `CACHE_ARCHIVE_DIR` (recursive mkdir, so concurrent caches never collide) and
+ * return it. If that directory cannot be created (missing/unwritable path),
+ * warn and fall back to the default temp dir so a bad value can never break a
+ * restore or save.
+ */
+async function archiveStagingDir_createArchiveStagingDirectory(env = process.env) {
+    const configured = (env[ENV_ARCHIVE_DIR] ?? "").trim();
+    if (!configured) {
+        // Default: byte-for-byte upstream — a UUID dir under RUNNER_TEMP.
+        return { dir: await createTempDirectory(), isCustom: false };
+    }
+    // Override: a unique subdir inside CACHE_ARCHIVE_DIR so concurrent caches
+    // never collide, staged on the caller's fast disk (e.g. NVMe).
+    const dir = external_path_.join(configured, (0,external_crypto_namespaceObject.randomUUID)());
+    try {
+        await (0,promises_namespaceObject.mkdir)(dir, { recursive: true });
+        core_debug(`Staging cache archive under CACHE_ARCHIVE_DIR: ${dir}`);
+        return { dir, isCustom: true };
+    }
+    catch (error) {
+        warning(`CACHE_ARCHIVE_DIR="${configured}" is unusable ` +
+            `(${error.message}); falling back to the default ` +
+            `archive staging directory.`);
+        return { dir: await createTempDirectory(), isCustom: false };
+    }
+}
+/**
+ * Remove a custom staging directory (the whole unique subdir, archive file
+ * included) so neither the multi-GB archive nor the empty scratch dir leaks on
+ * the fast disk. Best effort — never throws. Only call this for
+ * `isCustom === true` dirs; the default RUNNER_TEMP path keeps upstream's
+ * file-only unlink.
+ */
+async function archiveStagingDir_removeArchiveStagingDirectory(dir) {
+    if (!dir) {
+        return;
+    }
+    try {
+        await (0,promises_namespaceObject.rm)(dir, { recursive: true, force: true });
+    }
+    catch (error) {
+        core_debug(`Failed to delete archive staging dir ${dir}: ${error}`);
+    }
+}
+
 ;// CONCATENATED MODULE: ./src/custom/utils/reparsePoints.ts
 // Windows directory-junction (reparse point) handling for the cache file scan.
 //
@@ -128601,6 +128693,7 @@ function expandWindowsReparsePoints(cachePaths, workspaceRoot = process.env["GIT
 
 
 
+
 class cache_ValidationError extends Error {
     constructor(message) {
         super(message);
@@ -128712,6 +128805,8 @@ async function cache_restoreCache(paths, primaryKey, restoreKeys, options, enabl
     const compressionMethod = await resolveCompressionMethod();
     const tarFns = getTarFunctions();
     let archivePath = "";
+    let archiveFolder = "";
+    let archiveDirIsCustom = false;
     try {
         // path are needed to compute version
         const cacheEntry = await cacheHttpClient.getCacheEntry(keys, paths, {
@@ -128730,8 +128825,10 @@ async function cache_restoreCache(paths, primaryKey, restoreKeys, options, enabl
         // archive on disk). Only for the no-compression zstd path, whose extract
         // command (`tar --use-compress-program "zstd -d --long=30" -xf -`) the
         // stream pipeline reproduces exactly; the gzip path stays file-based.
-        // Off-switch: CACHE_STREAM_RESTORE=0. Any streaming miss/failure returns
-        // false and falls through to the file-based download+extract below.
+        // Opt-in: streaming runs only when CACHE_STREAM_RESTORE is explicitly
+        // truthy (1/true/yes/on); default is the file-based download+extract
+        // below (fast once the archive is staged on NVMe via CACHE_ARCHIVE_DIR).
+        // Any streaming miss/failure returns false and falls through to it.
         if (shouldSkipCompression() && isStreamRestoreEnabled(process.env)) {
             const streamed = await cacheHttpClient.downloadCacheStreaming(cacheEntry.archiveLocation);
             if (streamed) {
@@ -128739,7 +128836,13 @@ async function cache_restoreCache(paths, primaryKey, restoreKeys, options, enabl
                 return cacheEntry.cacheKey;
             }
         }
-        archivePath = path.join(await utils.createTempDirectory(), utils.getCacheFileName(compressionMethod));
+        // Stage the scratch archive under CACHE_ARCHIVE_DIR when set (e.g. NVMe),
+        // otherwise the upstream RUNNER_TEMP default. Fall back safely on a bad
+        // value so a mis-set CACHE_ARCHIVE_DIR can never break a restore.
+        const staging = await createArchiveStagingDirectory();
+        archiveFolder = staging.dir;
+        archiveDirIsCustom = staging.isCustom;
+        archivePath = path.join(archiveFolder, utils.getCacheFileName(compressionMethod));
         core.debug(`Archive Path: ${archivePath}`);
         // Download the cache from the cache entry
         await cacheHttpClient.downloadCache(cacheEntry.archiveLocation, archivePath, options);
@@ -128771,12 +128874,20 @@ async function cache_restoreCache(paths, primaryKey, restoreKeys, options, enabl
         }
     }
     finally {
-        // Try to delete the archive to save space
-        try {
-            await utils.unlinkFile(archivePath);
+        // Try to delete the archive to save space. With a custom
+        // CACHE_ARCHIVE_DIR, remove the whole unique staging subdir (archive
+        // file included) so nothing leaks on the fast disk; the default
+        // (RUNNER_TEMP) path keeps upstream's file-only unlink byte-for-byte.
+        if (archiveDirIsCustom) {
+            await removeArchiveStagingDirectory(archiveFolder);
         }
-        catch (error) {
-            core.debug(`Failed to delete archive: ${error}`);
+        else {
+            try {
+                await utils.unlinkFile(archivePath);
+            }
+            catch (error) {
+                core.debug(`Failed to delete archive: ${error}`);
+            }
         }
     }
     return undefined;
@@ -128808,7 +128919,11 @@ async function custom_cache_saveCache(paths, key, options, enableCrossOsArchive 
     if (cachePaths.length === 0) {
         throw new Error(`Path Validation Error: Path(s) specified in the action for caching do(es) not exist, hence no cache is being saved.`);
     }
-    const archiveFolder = await createTempDirectory();
+    // Stage the scratch archive under CACHE_ARCHIVE_DIR when set (e.g. NVMe),
+    // otherwise the upstream RUNNER_TEMP default. createTar writes cache.tzst
+    // into archiveFolder, so the upload benefits from the fast disk too.
+    const staging = await archiveStagingDir_createArchiveStagingDirectory();
+    const archiveFolder = staging.dir;
     const archivePath = external_path_.join(archiveFolder, getCacheFileName(compressionMethod));
     core_debug(`Archive Path: ${archivePath}`);
     try {
@@ -128843,12 +128958,20 @@ async function custom_cache_saveCache(paths, key, options, enableCrossOsArchive 
         }
     }
     finally {
-        // Try to delete the archive to save space
-        try {
-            await unlinkFile(archivePath);
+        // Try to delete the archive to save space. With a custom
+        // CACHE_ARCHIVE_DIR, remove the whole unique staging subdir (archive
+        // file included) so nothing leaks on the fast disk; the default
+        // (RUNNER_TEMP) path keeps upstream's file-only unlink byte-for-byte.
+        if (staging.isCustom) {
+            await archiveStagingDir_removeArchiveStagingDirectory(archiveFolder);
         }
-        catch (error) {
-            core_debug(`Failed to delete archive: ${error}`);
+        else {
+            try {
+                await unlinkFile(archivePath);
+            }
+            catch (error) {
+                core_debug(`Failed to delete archive: ${error}`);
+            }
         }
     }
     return cacheId;

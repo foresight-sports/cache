@@ -426,7 +426,7 @@ export function buildAwsCliCpArgs(
  * bounds the buffer and keeps few idle connections; override with
  * CACHE_STREAM_S5CMD_CONCURRENCY / CACHE_STREAM_S5CMD_PART_SIZE. aws-cli's
  * inherently bounded `cp - ` stream is the PRIMARY streaming engine — this
- * bounded `cat` is the secondary (CACHE_STREAM_RESTORE=0 disables streaming).
+ * bounded `cat` is the secondary (streaming is opt-in via CACHE_STREAM_RESTORE).
  *
  * NOTE: unlike the `cp` path this omits `--stat`: for `cat` the object bytes go
  * to stdout, and a stats line printed to stdout would corrupt the tar stream.

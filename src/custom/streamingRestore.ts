@@ -17,7 +17,10 @@
 // into a shell string. Both child processes are spawned with argv arrays and
 // shell:false, so nothing is ever parsed by a shell (injection-safe).
 //
-// Streaming is the default. The PRIMARY streaming engine is aws-cli `s3 cp - |
+// Streaming is OPT-IN (enable with CACHE_STREAM_RESTORE=1/true/yes/on); the
+// default is the file-based download-to-file + extract path, which is the fast
+// route once the archive is staged on NVMe via CACHE_ARCHIVE_DIR. When enabled,
+// the PRIMARY streaming engine is aws-cli `s3 cp - |
 // tar`: its download uses a bounded internal ring buffer, so it stays robust
 // even when the tar consumer is slow (the fs-bound untar of tens of thousands
 // of small files), which is exactly the case that truncated the s5cmd path on a
@@ -30,7 +33,8 @@
 // proven file-based download-to-file + extract path (which also re-runs the
 // s5cmd/aws/node cp engines). The node presigned-URL engine is intentionally NOT
 // streamed — it stays file-based as the always-present safety net.
-// `CACHE_STREAM_RESTORE=0` forces the old file-based behavior entirely.
+// Unset (or any non-truthy value) keeps the file-based path entirely; only an
+// explicitly truthy CACHE_STREAM_RESTORE (1/true/yes/on) enables streaming.
 import * as core from "@actions/core";
 import { exec } from "@actions/exec";
 import { spawn } from "child_process";
@@ -53,23 +57,26 @@ export interface SpawnSpec {
     env: { [key: string]: string };
 }
 
-/** Env var to force the legacy file-based restore (disable streaming). */
+/** Env var that opts INTO streaming restore (default is file-based). */
 export const ENV_STREAM_RESTORE = "CACHE_STREAM_RESTORE";
 
 /**
- * Streaming restore is ON by default. `CACHE_STREAM_RESTORE` set to
- * 0/false/no/off (case-insensitive) forces the legacy download-to-file +
- * extract path. Any other value (or unset) keeps streaming enabled.
+ * Streaming restore is OFF by default. It runs ONLY when `CACHE_STREAM_RESTORE`
+ * is explicitly truthy — `1`/`true`/`yes`/`on` (case-insensitive). Unset, blank,
+ * or any other value (including 0/false/no/off) uses the file-based
+ * download-to-file + extract path, which is the fast route once the archive is
+ * staged on NVMe via CACHE_ARCHIVE_DIR. Streaming stays an opt-in experiment
+ * because the aws-cli stdout stream caps ~95 MB/s on real runners.
  */
 export function isStreamRestoreEnabled(
     env: NodeJS.ProcessEnv = process.env
 ): boolean {
     const value = (env[ENV_STREAM_RESTORE] ?? "").trim().toLowerCase();
-    return !(
-        value === "0" ||
-        value === "false" ||
-        value === "no" ||
-        value === "off"
+    return (
+        value === "1" ||
+        value === "true" ||
+        value === "yes" ||
+        value === "on"
     );
 }
 

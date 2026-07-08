@@ -29,35 +29,45 @@ const tarSpec: SpawnSpec = {
 };
 
 // ============================================================================
-// CACHE_STREAM_RESTORE off-switch.
+// CACHE_STREAM_RESTORE opt-in gate (default OFF -> file-based).
 // ============================================================================
-describe("isStreamRestoreEnabled (CACHE_STREAM_RESTORE off-switch)", () => {
-    test("streaming is ON by default (unset / blank)", () => {
-        expect(isStreamRestoreEnabled({} as NodeJS.ProcessEnv)).toBe(true);
+describe("isStreamRestoreEnabled (CACHE_STREAM_RESTORE opt-in, default OFF)", () => {
+    test("streaming is OFF by default (unset / blank)", () => {
+        expect(isStreamRestoreEnabled({} as NodeJS.ProcessEnv)).toBe(false);
         expect(
             isStreamRestoreEnabled({
                 [ENV_STREAM_RESTORE]: ""
             } as NodeJS.ProcessEnv)
-        ).toBe(true);
+        ).toBe(false);
     });
 
-    test("0/false/no/off (any case) force the legacy file-based restore", () => {
-        for (const off of ["0", "false", "FALSE", "No", "off", " off "]) {
-            expect(
-                isStreamRestoreEnabled({
-                    [ENV_STREAM_RESTORE]: off
-                } as NodeJS.ProcessEnv)
-            ).toBe(false);
-        }
-    });
-
-    test("any other value keeps streaming enabled", () => {
-        for (const on of ["1", "true", "yes", "on"]) {
+    test("only explicit 1/true/yes/on (any case, trimmed) enable streaming", () => {
+        for (const on of ["1", "true", "TRUE", "Yes", "on", " on "]) {
             expect(
                 isStreamRestoreEnabled({
                     [ENV_STREAM_RESTORE]: on
                 } as NodeJS.ProcessEnv)
             ).toBe(true);
+        }
+    });
+
+    test("0/false/no/off and any other value keep the file-based path", () => {
+        for (const off of [
+            "0",
+            "false",
+            "FALSE",
+            "No",
+            "off",
+            " off ",
+            "maybe",
+            "2",
+            "enabled"
+        ]) {
+            expect(
+                isStreamRestoreEnabled({
+                    [ENV_STREAM_RESTORE]: off
+                } as NodeJS.ProcessEnv)
+            ).toBe(false);
         }
     });
 });

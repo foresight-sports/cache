@@ -14,6 +14,10 @@ import {
 } from "../actionsCacheShims.js";
 import * as cacheHttpClient from "./backend";
 import { isStreamRestoreEnabled } from "./streamingRestore";
+import {
+    createArchiveStagingDirectory,
+    removeArchiveStagingDirectory
+} from "./utils/archiveStagingDir.js";
 import { expandWindowsReparsePoints } from "./utils/reparsePoints";
 import {
     createTar as uncompressedCreateTar,
@@ -186,6 +190,8 @@ export async function restoreCache(
     const compressionMethod = await resolveCompressionMethod();
     const tarFns = getTarFunctions();
     let archivePath = "";
+    let archiveFolder = "";
+    let archiveDirIsCustom = false;
     try {
         // path are needed to compute version
         const cacheEntry = await cacheHttpClient.getCacheEntry(keys, paths, {
@@ -206,8 +212,10 @@ export async function restoreCache(
         // archive on disk). Only for the no-compression zstd path, whose extract
         // command (`tar --use-compress-program "zstd -d --long=30" -xf -`) the
         // stream pipeline reproduces exactly; the gzip path stays file-based.
-        // Off-switch: CACHE_STREAM_RESTORE=0. Any streaming miss/failure returns
-        // false and falls through to the file-based download+extract below.
+        // Opt-in: streaming runs only when CACHE_STREAM_RESTORE is explicitly
+        // truthy (1/true/yes/on); default is the file-based download+extract
+        // below (fast once the archive is staged on NVMe via CACHE_ARCHIVE_DIR).
+        // Any streaming miss/failure returns false and falls through to it.
         if (shouldSkipCompression() && isStreamRestoreEnabled(process.env)) {
             const streamed = await cacheHttpClient.downloadCacheStreaming(
                 cacheEntry.archiveLocation
@@ -218,8 +226,14 @@ export async function restoreCache(
             }
         }
 
+        // Stage the scratch archive under CACHE_ARCHIVE_DIR when set (e.g. NVMe),
+        // otherwise the upstream RUNNER_TEMP default. Fall back safely on a bad
+        // value so a mis-set CACHE_ARCHIVE_DIR can never break a restore.
+        const staging = await createArchiveStagingDirectory();
+        archiveFolder = staging.dir;
+        archiveDirIsCustom = staging.isCustom;
         archivePath = path.join(
-            await utils.createTempDirectory(),
+            archiveFolder,
             utils.getCacheFileName(compressionMethod)
         );
         core.debug(`Archive Path: ${archivePath}`);
@@ -267,11 +281,18 @@ export async function restoreCache(
             core.warning(`Failed to restore: ${(error as Error).message}`);
         }
     } finally {
-        // Try to delete the archive to save space
-        try {
-            await utils.unlinkFile(archivePath);
-        } catch (error) {
-            core.debug(`Failed to delete archive: ${error}`);
+        // Try to delete the archive to save space. With a custom
+        // CACHE_ARCHIVE_DIR, remove the whole unique staging subdir (archive
+        // file included) so nothing leaks on the fast disk; the default
+        // (RUNNER_TEMP) path keeps upstream's file-only unlink byte-for-byte.
+        if (archiveDirIsCustom) {
+            await removeArchiveStagingDirectory(archiveFolder);
+        } else {
+            try {
+                await utils.unlinkFile(archivePath);
+            } catch (error) {
+                core.debug(`Failed to delete archive: ${error}`);
+            }
         }
     }
 
@@ -318,7 +339,11 @@ export async function saveCache(
         );
     }
 
-    const archiveFolder = await utils.createTempDirectory();
+    // Stage the scratch archive under CACHE_ARCHIVE_DIR when set (e.g. NVMe),
+    // otherwise the upstream RUNNER_TEMP default. createTar writes cache.tzst
+    // into archiveFolder, so the upload benefits from the fast disk too.
+    const staging = await createArchiveStagingDirectory();
+    const archiveFolder = staging.dir;
     const archivePath = path.join(
         archiveFolder,
         utils.getCacheFileName(compressionMethod)
@@ -356,11 +381,18 @@ export async function saveCache(
             core.warning(`Failed to save: ${typedError.message}`);
         }
     } finally {
-        // Try to delete the archive to save space
-        try {
-            await utils.unlinkFile(archivePath);
-        } catch (error) {
-            core.debug(`Failed to delete archive: ${error}`);
+        // Try to delete the archive to save space. With a custom
+        // CACHE_ARCHIVE_DIR, remove the whole unique staging subdir (archive
+        // file included) so nothing leaks on the fast disk; the default
+        // (RUNNER_TEMP) path keeps upstream's file-only unlink byte-for-byte.
+        if (staging.isCustom) {
+            await removeArchiveStagingDirectory(archiveFolder);
+        } else {
+            try {
+                await utils.unlinkFile(archivePath);
+            } catch (error) {
+                core.debug(`Failed to delete archive: ${error}`);
+            }
         }
     }
 
