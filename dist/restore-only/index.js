@@ -127263,26 +127263,138 @@ const downloadUtils_promiseWithTimeout = async (timeoutMs, promise) => {
 
 
 
-// s5cmd's global worker pool. Scale to cores so the goroutine fan-out actually
-// uses the box, with a floor so tiny runners still parallelize and a ceiling
-// matching s5cmd's own default.
-const S5CMD_MIN_WORKERS = 32;
-const S5CMD_MAX_WORKERS = 256;
-// aws-cli's max_concurrent_requests. Same core-scaling idea; the CRT default of
-// 10 is the flat-26-MB/s bottleneck Premier measured, so lift it well above.
-const AWS_CLI_MIN_CONCURRENCY = 16;
-const AWS_CLI_MAX_CONCURRENCY = 256;
-function scaleToCores(cpuCount, min, max, factor = 4) {
+// ============================================================================
+// Single-file transfer concurrency & part sizing.
+// ============================================================================
+//
+// The cache is ONE large archive (cache.tzst). What actually parallelizes a
+// single large object differs by engine (verified against s5cmd docs, not
+// guessed):
+//   - s5cmd:  `cp --concurrency N` is "the number of parts that will be
+//             uploaded or downloaded in parallel for a single file" (default 5)
+//             and `--part-size` (MiB, default 50) is each part's size. The
+//             global `--numworkers` pool only limits how many SEPARATE objects
+//             run at once ("if you are uploading 100 files ... --numworkers ...
+//             limit the number of files concurrently uploaded"), so for our one
+//             object it is ~irrelevant, and concurrency is independent of it.
+//             We therefore pin --numworkers and tune --concurrency/--part-size.
+//   - aws-cli: `default.s3.max_concurrent_requests` is the single-file part
+//             parallelism and `default.s3.multipart_chunksize` the part size.
+//
+// Upload and download are DIFFERENT workloads and get DIFFERENT defaults:
+//
+//   Upload   — CPU/TLS-bound on the send side (measured ~1.6 MB/s per
+//              connection; a 64-vCPU box at 256 parts hit 417 MB/s ~= 66% of a
+//              ~5 Gbps NIC). Driving many concurrent TLS PUTs needs cores, so
+//              upload part-parallelism SCALES WITH CORES (high floor + ceiling).
+//
+//   Download — I/O-bound parallel range-GETs of one object (measured ~3.2 MB/s
+//              per connection; a 16-vCPU box got only the old cores*4 = 64 parts
+//              and sat at 207 MB/s ~= 33% of NIC, connections unsaturated).
+//              Local CPU is NOT the bottleneck, so the old cores*4 STARVED small
+//              runners. Download part-parallelism is therefore DECOUPLED from
+//              vCPU with a high fixed floor (256): at ~3.2 MB/s per connection,
+//              256 parts is ~820 MB/s of demand — enough to fill a 5 Gbps
+//              (~625 MB/s) NIC with headroom on even a 16-vCPU box; bigger boxes
+//              (bigger NIC) scale up to a 512 ceiling, and any runner can
+//              override via env.
+//
+// Peak client memory for a native multipart transfer is ~concurrency * part-size
+// (every in-flight part is buffered). Upload keeps the backend's adaptive part
+// size (64 MiB for a 44 GB archive => ~700 parts, well under S3's 10k-part cap).
+// Download uses a SMALLER 16 MiB part so 256-way concurrency peaks at ~4 GiB
+// while still splitting the object into many parts.
+// s5cmd global worker pool. A single-object transfer uses ~1 worker, so this is
+// pinned (not tuned); kept >= the chosen concurrency as a cheap hedge.
+const S5CMD_NUMWORKERS_MIN = 256;
+// Upload part-parallelism: cores-scaled (send side is CPU/TLS-bound).
+const UPLOAD_CONCURRENCY_MIN = 96;
+const UPLOAD_CONCURRENCY_MAX = 384;
+const UPLOAD_CONCURRENCY_FACTOR = 8;
+// Download part-parallelism: DECOUPLED from cores (I/O-bound range-GETs). High
+// fixed floor so a small runner still fills its NIC; scales up for big boxes.
+const DOWNLOAD_CONCURRENCY_MIN = 256;
+const DOWNLOAD_CONCURRENCY_MAX = 512;
+const DOWNLOAD_CONCURRENCY_FACTOR = 8;
+// Download multipart part size (MiB). Smaller than the upload part size so the
+// concurrency*part-size peak buffer stays bounded (256 * 16 MiB = 4 GiB).
+const DOWNLOAD_PART_SIZE_MB = 16;
+// S3 rejects a non-final multipart part below 5 MiB (EntityTooSmall); floor
+// every engine part size here for safety.
+const MIN_PART_SIZE_MB = 5;
+// aws-cli's multipart_chunksize fallback when no part size is supplied.
+const AWS_CLI_DEFAULT_CHUNK_MB = 64;
+// Operator escape hatches (env var names) + a sanity ceiling for overrides.
+const ENV_UPLOAD_CONCURRENCY = "CACHE_UPLOAD_CONCURRENCY";
+const ENV_DOWNLOAD_CONCURRENCY = "CACHE_DOWNLOAD_CONCURRENCY";
+const ENV_DOWNLOAD_PART_SIZE_MB = "CACHE_DOWNLOAD_PART_SIZE";
+const CONCURRENCY_HARD_MAX = 1024;
+function scaleToCores(cpuCount, min, max, factor) {
     const cores = Number.isFinite(cpuCount) && cpuCount > 0 ? cpuCount : 1;
     return Math.min(max, Math.max(min, Math.floor(cores) * factor));
 }
-/** s5cmd `--numworkers`, scaled to cores (floor 32, ceiling 256). */
-function computeS5cmdWorkers(cpuCount = external_os_.cpus().length) {
-    return scaleToCores(cpuCount, S5CMD_MIN_WORKERS, S5CMD_MAX_WORKERS);
+/** Parse a positive integer env value; undefined/blank/non-positive -> undefined. */
+function parseEnvInt(value) {
+    if (value === undefined || value.trim() === "") {
+        return undefined;
+    }
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        return undefined;
+    }
+    return Math.floor(parsed);
 }
-/** aws-cli `max_concurrent_requests`, scaled to cores (floor 16, ceiling 256). */
-function computeAwsCliConcurrency(cpuCount = external_os_.cpus().length) {
-    return scaleToCores(cpuCount, AWS_CLI_MIN_CONCURRENCY, AWS_CLI_MAX_CONCURRENCY);
+/**
+ * UPLOAD single-file part-parallelism (`s5cmd cp --concurrency` / aws-cli
+ * `max_concurrent_requests`). Scales with cores because the send side is
+ * CPU/TLS-bound; env-overridable via CACHE_UPLOAD_CONCURRENCY (floor 96,
+ * ceiling 384, cores*8).
+ */
+function computeUploadConcurrency(cpuCount = external_os_.cpus().length, env = process.env) {
+    const override = parseEnvInt(env[ENV_UPLOAD_CONCURRENCY]);
+    if (override !== undefined) {
+        return Math.min(override, CONCURRENCY_HARD_MAX);
+    }
+    return scaleToCores(cpuCount, UPLOAD_CONCURRENCY_MIN, UPLOAD_CONCURRENCY_MAX, UPLOAD_CONCURRENCY_FACTOR);
+}
+/**
+ * DOWNLOAD single-file part-parallelism. DECOUPLED from cores (I/O-bound
+ * range-GETs) with a high fixed floor so a small runner saturates its NIC;
+ * scales up for big boxes and is env-overridable via CACHE_DOWNLOAD_CONCURRENCY
+ * (floor 256, ceiling 512, cores*8).
+ */
+function computeDownloadConcurrency(cpuCount = external_os_.cpus().length, env = process.env) {
+    const override = parseEnvInt(env[ENV_DOWNLOAD_CONCURRENCY]);
+    if (override !== undefined) {
+        return Math.min(override, CONCURRENCY_HARD_MAX);
+    }
+    return scaleToCores(cpuCount, DOWNLOAD_CONCURRENCY_MIN, DOWNLOAD_CONCURRENCY_MAX, DOWNLOAD_CONCURRENCY_FACTOR);
+}
+/** Direction-aware single-file part parallelism (both native engines). */
+function computeTransferConcurrency(direction, cpuCount = external_os_.cpus().length, env = process.env) {
+    return direction === "upload"
+        ? computeUploadConcurrency(cpuCount, env)
+        : computeDownloadConcurrency(cpuCount, env);
+}
+/** Floor a part size at S3's 5 MiB multipart minimum and round to whole MiB. */
+function clampPartSizeMb(mb) {
+    return Math.max(MIN_PART_SIZE_MB, Math.round(mb));
+}
+/**
+ * Multipart part size (whole MiB) for a direction, or undefined to let the
+ * engine use its own default. UPLOAD uses the backend's adaptive part size
+ * (params.partSizeMb) so the 10k-part cap and per-part overhead stay respected.
+ * DOWNLOAD uses a fixed small size (bounds concurrency*part-size memory),
+ * independent of the upload-side size and overridable via CACHE_DOWNLOAD_PART_SIZE.
+ */
+function computePartSizeMb(direction, params, env = process.env) {
+    if (direction === "upload") {
+        return params.partSizeMb && params.partSizeMb > 0
+            ? clampPartSizeMb(params.partSizeMb)
+            : undefined;
+    }
+    const override = parseEnvInt(env[ENV_DOWNLOAD_PART_SIZE_MB]);
+    return clampPartSizeMb(override ?? DOWNLOAD_PART_SIZE_MB);
 }
 /** Region for the engines; "auto" when unset (S3-compatible endpoints/R2). */
 function resolveRegion(region) {
@@ -127301,13 +127413,16 @@ function s3Uri(params) {
  * MinIO custom endpoints are all path-style), so it is left intentionally
  * unaddressed rather than adding a code path that can never run.
  */
-function buildS5cmdArgs(direction, params, cpuCount = external_os_.cpus().length) {
-    const workers = computeS5cmdWorkers(cpuCount);
+function buildS5cmdArgs(direction, params, cpuCount = external_os_.cpus().length, env = process.env) {
+    const concurrency = computeTransferConcurrency(direction, cpuCount, env);
+    // --numworkers only limits how many SEPARATE objects run at once (we move
+    // exactly one), so it is pinned; keep it >= concurrency as a cheap hedge.
+    const numworkers = Math.max(S5CMD_NUMWORKERS_MIN, concurrency);
     // Global flags precede the subcommand. --stat prints an end-of-run summary;
     // --log error drops per-object success chatter.
     const args = [
         "--numworkers",
-        String(workers),
+        String(numworkers),
         "--stat",
         "--log",
         "error"
@@ -127315,12 +127430,12 @@ function buildS5cmdArgs(direction, params, cpuCount = external_os_.cpus().length
     if (params.endpoint) {
         args.push("--endpoint-url", params.endpoint);
     }
-    // cp flags: --concurrency is the per-object part parallelism (what actually
-    // multiparts a single large archive across the worker pool); --part-size is
-    // in MiB.
-    args.push("cp", "--concurrency", String(workers));
-    if (params.partSizeMb && params.partSizeMb > 0) {
-        args.push("--part-size", String(Math.max(5, Math.round(params.partSizeMb))));
+    // cp flags: --concurrency is the per-object part parallelism that actually
+    // multiparts a single large archive; --part-size (MiB) sizes each part.
+    args.push("cp", "--concurrency", String(concurrency));
+    const partSizeMb = computePartSizeMb(direction, params, env);
+    if (partSizeMb !== undefined) {
+        args.push("--part-size", String(partSizeMb));
     }
     if (direction === "upload") {
         args.push(params.archivePath, s3Uri(params));
@@ -127333,13 +127448,15 @@ function buildS5cmdArgs(direction, params, cpuCount = external_os_.cpus().length
 /**
  * `aws configure set default.s3.*` argv batches to run before the cp. These
  * tuning knobs have no CLI flag — they live only in the aws config file — so
- * they must be set this way first.
+ * they must be set this way first. Concurrency and chunk size mirror the s5cmd
+ * reasoning: max_concurrent_requests is aws-cli's single-file part parallelism
+ * (upload cores-scaled, download core-decoupled with a high fixed floor), and
+ * multipart_chunksize is its part size (download's smaller size bounds the
+ * concurrency*chunk peak buffer, exactly like the s5cmd path).
  */
-function buildAwsCliConfigureArgs(params, cpuCount = external_os_.cpus().length) {
-    const concurrency = computeAwsCliConcurrency(cpuCount);
-    const chunkMb = params.partSizeMb && params.partSizeMb > 0
-        ? Math.max(5, Math.round(params.partSizeMb))
-        : 64;
+function buildAwsCliConfigureArgs(direction, params, cpuCount = external_os_.cpus().length, env = process.env) {
+    const concurrency = computeTransferConcurrency(direction, cpuCount, env);
+    const chunkMb = computePartSizeMb(direction, params, env) ?? AWS_CLI_DEFAULT_CHUNK_MB;
     const batches = [
         [
             "configure",
@@ -127435,7 +127552,7 @@ async function runS5cmd(direction, params, execPath) {
 async function runAwsCli(direction, params, execPath) {
     const { env, cleanup } = buildEngineEnv(params);
     try {
-        for (const configureArgs of buildAwsCliConfigureArgs(params)) {
+        for (const configureArgs of buildAwsCliConfigureArgs(direction, params)) {
             await exec_exec(`"${execPath}"`, configureArgs, { env, silent: true });
         }
         await exec_exec(`"${execPath}"`, buildAwsCliCpArgs(direction, params), {

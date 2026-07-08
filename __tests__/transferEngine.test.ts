@@ -6,8 +6,10 @@ import {
     buildAwsCliCpArgs,
     buildEngineEnv,
     buildS5cmdArgs,
-    computeAwsCliConcurrency,
-    computeS5cmdWorkers,
+    computeDownloadConcurrency,
+    computePartSizeMb,
+    computeTransferConcurrency,
+    computeUploadConcurrency,
     resolveRegion,
     transferArchive,
     TransferEngineDeps,
@@ -30,19 +32,78 @@ const baseParams: TransferParams = {
     partSizeMb: 64
 };
 
-describe("core-scaling helpers", () => {
-    test("computeS5cmdWorkers scales to cores with floor and ceiling", () => {
-        expect(computeS5cmdWorkers(1)).toBe(32); // floor
-        expect(computeS5cmdWorkers(16)).toBe(64); // 16 * 4
-        expect(computeS5cmdWorkers(64)).toBe(256); // ceiling (64*4=256)
-        expect(computeS5cmdWorkers(1000)).toBe(256); // ceiling clamp
-        expect(computeS5cmdWorkers(0)).toBe(32); // degenerate -> floor
+const noEnv = {} as NodeJS.ProcessEnv;
+
+describe("upload vs download concurrency (single-file part parallelism)", () => {
+    test("upload concurrency scales with cores (CPU/TLS-bound send side)", () => {
+        expect(computeUploadConcurrency(1, noEnv)).toBe(96); // floor
+        expect(computeUploadConcurrency(16, noEnv)).toBe(128); // 16 * 8
+        expect(computeUploadConcurrency(48, noEnv)).toBe(384); // 48*8=384 ceiling
+        expect(computeUploadConcurrency(64, noEnv)).toBe(384); // ceiling clamp
+        expect(computeUploadConcurrency(0, noEnv)).toBe(96); // degenerate -> floor
     });
 
-    test("computeAwsCliConcurrency scales to cores with floor and ceiling", () => {
-        expect(computeAwsCliConcurrency(1)).toBe(16); // floor
-        expect(computeAwsCliConcurrency(16)).toBe(64);
-        expect(computeAwsCliConcurrency(100)).toBe(256); // ceiling
+    test("download concurrency is DECOUPLED from cores with a high fixed floor", () => {
+        // The core fix: a 16-vCPU box no longer gets a starved cores*4 = 64; it
+        // gets the 256 floor regardless of vCPU (download is I/O-bound, not
+        // CPU-bound), enough to fill a ~5 Gbps NIC at the measured ~3.2 MB/s/conn.
+        expect(computeDownloadConcurrency(1, noEnv)).toBe(256); // floor
+        expect(computeDownloadConcurrency(16, noEnv)).toBe(256); // floor, NOT 16*anything
+        expect(computeDownloadConcurrency(32, noEnv)).toBe(256); // 32*8=256 (still floor)
+        expect(computeDownloadConcurrency(64, noEnv)).toBe(512); // big box -> ceiling (64*8)
+        expect(computeDownloadConcurrency(1000, noEnv)).toBe(512); // ceiling clamp
+    });
+
+    test("download floor is independent of cores (regression guard for 16-vCPU starvation)", () => {
+        for (const cores of [1, 2, 4, 8, 12, 16]) {
+            expect(
+                computeDownloadConcurrency(cores, noEnv)
+            ).toBeGreaterThanOrEqual(256);
+        }
+        // Download is always at least as parallel as upload on the same small box.
+        expect(computeDownloadConcurrency(16, noEnv)).toBeGreaterThan(
+            computeUploadConcurrency(16, noEnv)
+        );
+    });
+
+    test("env overrides replace the computed concurrency (clamped to a sanity ceiling)", () => {
+        expect(
+            computeUploadConcurrency(64, {
+                CACHE_UPLOAD_CONCURRENCY: "200"
+            } as NodeJS.ProcessEnv)
+        ).toBe(200);
+        expect(
+            computeDownloadConcurrency(16, {
+                CACHE_DOWNLOAD_CONCURRENCY: "128"
+            } as NodeJS.ProcessEnv)
+        ).toBe(128);
+        // Absurd overrides are clamped to the hard ceiling (1024) so a typo
+        // cannot OOM the runner with in-flight part buffers.
+        expect(
+            computeDownloadConcurrency(16, {
+                CACHE_DOWNLOAD_CONCURRENCY: "99999"
+            } as NodeJS.ProcessEnv)
+        ).toBe(1024);
+        // Non-positive / non-numeric overrides are ignored (fall back to default).
+        expect(
+            computeDownloadConcurrency(16, {
+                CACHE_DOWNLOAD_CONCURRENCY: "0"
+            } as NodeJS.ProcessEnv)
+        ).toBe(256);
+        expect(
+            computeUploadConcurrency(16, {
+                CACHE_UPLOAD_CONCURRENCY: "abc"
+            } as NodeJS.ProcessEnv)
+        ).toBe(128);
+    });
+
+    test("computeTransferConcurrency dispatches by direction", () => {
+        expect(computeTransferConcurrency("upload", 16, noEnv)).toBe(
+            computeUploadConcurrency(16, noEnv)
+        );
+        expect(computeTransferConcurrency("download", 16, noEnv)).toBe(
+            computeDownloadConcurrency(16, noEnv)
+        );
     });
 
     test("resolveRegion defaults to auto when unset", () => {
@@ -52,12 +113,79 @@ describe("core-scaling helpers", () => {
     });
 });
 
+describe("computePartSizeMb", () => {
+    test("upload uses the backend's adaptive part size (params.partSizeMb)", () => {
+        expect(
+            computePartSizeMb(
+                "upload",
+                { ...baseParams, partSizeMb: 64 },
+                noEnv
+            )
+        ).toBe(64);
+        // Floors at S3's 5 MiB multipart minimum.
+        expect(
+            computePartSizeMb("upload", { ...baseParams, partSizeMb: 1 }, noEnv)
+        ).toBe(5);
+        // No part size supplied -> undefined (engine uses its own default).
+        expect(
+            computePartSizeMb(
+                "upload",
+                { ...baseParams, partSizeMb: undefined },
+                noEnv
+            )
+        ).toBeUndefined();
+    });
+
+    test("download uses a fixed small part size, decoupled from the upload size", () => {
+        // Even when params carries an upload-side 64 MiB, download uses its 16 MiB
+        // so concurrency*part-size peak buffer stays bounded.
+        expect(
+            computePartSizeMb(
+                "download",
+                { ...baseParams, partSizeMb: 64 },
+                noEnv
+            )
+        ).toBe(16);
+        expect(
+            computePartSizeMb(
+                "download",
+                { ...baseParams, partSizeMb: undefined },
+                noEnv
+            )
+        ).toBe(16);
+    });
+
+    test("download part size is env-overridable and floored at 5 MiB", () => {
+        expect(
+            computePartSizeMb("download", baseParams, {
+                CACHE_DOWNLOAD_PART_SIZE: "32"
+            } as NodeJS.ProcessEnv)
+        ).toBe(32);
+        // A sub-5 MiB override is lifted to the S3 minimum.
+        expect(
+            computePartSizeMb("download", baseParams, {
+                CACHE_DOWNLOAD_PART_SIZE: "2"
+            } as NodeJS.ProcessEnv)
+        ).toBe(5);
+    });
+
+    test("256-way download at 16 MiB keeps the peak in-flight buffer bounded (~4 GiB)", () => {
+        const concurrency = computeDownloadConcurrency(16, noEnv); // 256
+        const partMb = computePartSizeMb(
+            "download",
+            baseParams,
+            noEnv
+        ) as number; // 16
+        expect((concurrency * partMb) / 1024).toBeLessThanOrEqual(4); // GiB
+    });
+});
+
 describe("buildS5cmdArgs", () => {
     test("upload places global flags, then cp, then <local> <s3uri>", () => {
-        const args = buildS5cmdArgs("upload", baseParams, 16);
+        const args = buildS5cmdArgs("upload", baseParams, 16, noEnv);
         expect(args).toEqual([
             "--numworkers",
-            "64",
+            "256", // pinned >= concurrency (single object doesn't use the pool)
             "--stat",
             "--log",
             "error",
@@ -65,16 +193,16 @@ describe("buildS5cmdArgs", () => {
             "https://s3.example.com",
             "cp",
             "--concurrency",
-            "64",
+            "128", // upload cores-scaled: 16*8
             "--part-size",
-            "64",
+            "64", // backend's adaptive upload part size
             "/tmp/cache.tzst",
             "s3://cache-bucket/cache/owner/repo/abc123/my-key"
         ]);
     });
 
-    test("download reverses operands to <s3uri> <local>", () => {
-        const args = buildS5cmdArgs("download", baseParams, 16);
+    test("download reverses operands and uses the decoupled 256 concurrency + 16 MiB part", () => {
+        const args = buildS5cmdArgs("download", baseParams, 16, noEnv);
         const cpIdx = args.indexOf("cp");
         // last two operands, in order
         expect(args.slice(-2)).toEqual([
@@ -82,26 +210,48 @@ describe("buildS5cmdArgs", () => {
             "/tmp/cache.tzst"
         ]);
         expect(cpIdx).toBeGreaterThan(-1);
+        // A 16-vCPU box downloads at the 256 floor (not the old cores*4 = 64)...
+        expect(args[args.indexOf("--concurrency") + 1]).toBe("256");
+        // ...with the smaller download part size, and numworkers pinned >= it.
+        expect(args[args.indexOf("--part-size") + 1]).toBe("16");
+        expect(args[args.indexOf("--numworkers") + 1]).toBe("256");
     });
 
-    test("omits --endpoint-url when no endpoint (real AWS S3) and --part-size when unknown", () => {
+    test("omits --endpoint-url for real AWS S3; download still emits its own part size", () => {
         const args = buildS5cmdArgs(
             "download",
-            { ...baseParams, endpoint: undefined, partSizeMb: undefined },
-            16
+            { ...baseParams, endpoint: undefined },
+            16,
+            noEnv
         );
         expect(args).not.toContain("--endpoint-url");
-        expect(args).not.toContain("--part-size");
         expect(args).toContain("--numworkers");
+        // Download supplies its own part size even when the caller passes none.
+        expect(args).toContain("--part-size");
+    });
+
+    test("upload omits --part-size when the backend supplies none", () => {
+        const args = buildS5cmdArgs(
+            "upload",
+            { ...baseParams, partSizeMb: undefined },
+            16,
+            noEnv
+        );
+        expect(args).not.toContain("--part-size");
     });
 });
 
 describe("buildAwsCliConfigureArgs / buildAwsCliCpArgs", () => {
-    test("configure batches set the tuned s3 knobs", () => {
-        const batches = buildAwsCliConfigureArgs(baseParams, 16);
+    test("upload configure batches mirror the s5cmd upload concurrency/part size", () => {
+        const batches = buildAwsCliConfigureArgs(
+            "upload",
+            baseParams,
+            16,
+            noEnv
+        );
         const flat = batches.map(b => b.join(" "));
         expect(flat).toContain(
-            "configure set default.s3.max_concurrent_requests 64"
+            "configure set default.s3.max_concurrent_requests 128"
         );
         expect(flat).toContain(
             "configure set default.s3.max_queue_size 100000"
@@ -118,10 +268,29 @@ describe("buildAwsCliConfigureArgs / buildAwsCliCpArgs", () => {
         );
     });
 
+    test("download configure batches use the decoupled 256 concurrency + 16 MiB chunk", () => {
+        // baseParams carries an upload-side 64 MiB partSizeMb; download ignores it.
+        const batches = buildAwsCliConfigureArgs(
+            "download",
+            baseParams,
+            16,
+            noEnv
+        );
+        const flat = batches.map(b => b.join(" "));
+        expect(flat).toContain(
+            "configure set default.s3.max_concurrent_requests 256"
+        );
+        expect(flat).toContain(
+            "configure set default.s3.multipart_chunksize 16MB"
+        );
+    });
+
     test("configure adds path addressing style when forcePathStyle", () => {
         const batches = buildAwsCliConfigureArgs(
+            "upload",
             { ...baseParams, forcePathStyle: true },
-            16
+            16,
+            noEnv
         );
         const flat = batches.map(b => b.join(" "));
         expect(flat).toContain(
