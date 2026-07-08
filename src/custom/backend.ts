@@ -19,7 +19,8 @@ import {
     getDownloadOptions
 } from "../actionsCacheShims.js";
 import { downloadCacheHttpClientConcurrent } from "./downloadUtils";
-import { transferArchive } from "./transferEngine";
+import { streamedRestore } from "./streamingRestore";
+import { transferArchive, TransferParams } from "./transferEngine";
 import { computeEffectivePartSize } from "./utils/partSize";
 
 export interface ArtifactCacheEntry {
@@ -300,6 +301,54 @@ export async function downloadCache(
         undefined,
         verifyNativeDownload
     );
+}
+
+/**
+ * Streamed restore: pull s3://bucket/key straight through the decompressor+tar
+ * so the download and the extraction OVERLAP (no scratch archive on disk),
+ * instead of downloadCache()-to-file THEN extractTar(). Returns true when the
+ * cache was streamed AND extracted end-to-end; returns false to signal the
+ * caller to fall back to the file-based download+extract path (used when no
+ * streaming engine is available/succeeds, or when the S3 config is missing so
+ * the file-based path can surface the clear error). This never throws for a
+ * streaming failure — a fall-back is always safe because the file-based path
+ * re-extracts from scratch (tar -x overwrites any partial files a broken stream
+ * left behind), and its own size/integrity checks are not bypassed.
+ */
+export async function downloadCacheStreaming(
+    archiveLocation: string
+): Promise<boolean> {
+    if (!bucketName || !region) {
+        // Let the file-based downloadCache() surface the clear config error.
+        return false;
+    }
+
+    const bucket = bucketName;
+    const archiveUrl = new URL(archiveLocation);
+    const objectKey = archiveUrl.pathname.slice(1);
+
+    // archivePath is unused for streaming (no scratch file is written); the
+    // streaming builders derive everything from bucket/key/endpoint/region.
+    const params: TransferParams = {
+        bucket,
+        key: objectKey,
+        archivePath: "",
+        endpoint,
+        region,
+        forcePathStyle
+    };
+
+    try {
+        await streamedRestore(params);
+        return true;
+    } catch (error) {
+        core.warning(
+            `Streamed restore unavailable/failed (${
+                (error as Error).message
+            }); falling back to download-to-file + extract.`
+        );
+        return false;
+    }
 }
 
 export async function saveCache(

@@ -4,8 +4,10 @@ import * as os from "os";
 import {
     buildAwsCliConfigureArgs,
     buildAwsCliCpArgs,
+    buildAwsCliStreamCpArgs,
     buildEngineEnv,
     buildS5cmdArgs,
+    buildS5cmdCatArgs,
     computeDownloadConcurrency,
     computePartSizeMb,
     computeTransferConcurrency,
@@ -238,6 +240,94 @@ describe("buildS5cmdArgs", () => {
             noEnv
         );
         expect(args).not.toContain("--part-size");
+    });
+});
+
+describe("buildS5cmdCatArgs (streaming download to stdout)", () => {
+    test("emits `cat` with the reused download concurrency/part-size + s3 uri last", () => {
+        const args = buildS5cmdCatArgs(baseParams, 16, noEnv);
+        expect(args).toEqual([
+            "--numworkers",
+            "256", // pinned >= concurrency
+            "--log",
+            "error",
+            "--endpoint-url",
+            "https://s3.example.com",
+            "cat",
+            "--concurrency",
+            "256", // SAME decoupled download concurrency the cp path uses
+            "--part-size",
+            "16", // SAME small download part size (bounds ordered-writer buffer)
+            "s3://cache-bucket/cache/owner/repo/abc123/my-key"
+        ]);
+    });
+
+    test("omits --stat so no stats line can corrupt the object byte stream on stdout", () => {
+        // (--stat would print a summary to stdout, which for `cat` carries the
+        // archive bytes; the cp path keeps --stat, the cat path must not.)
+        expect(buildS5cmdCatArgs(baseParams, 16, noEnv)).not.toContain(
+            "--stat"
+        );
+    });
+
+    test("streams via argv only — the s3 uri is a single token, never a shell string", () => {
+        const args = buildS5cmdCatArgs(baseParams, 16, noEnv);
+        // Exactly one operand token and it is the bare s3:// uri (no pipe, no
+        // redirection, no `tar`, no interpolation into a composite string).
+        expect(args[args.length - 1]).toBe(
+            "s3://cache-bucket/cache/owner/repo/abc123/my-key"
+        );
+        expect(args.some(a => a.includes("|") || a.includes("tar"))).toBe(
+            false
+        );
+    });
+
+    test("honors CACHE_DOWNLOAD_* env overrides (same knobs as the cp path)", () => {
+        const args = buildS5cmdCatArgs(baseParams, 16, {
+            CACHE_DOWNLOAD_CONCURRENCY: "128",
+            CACHE_DOWNLOAD_PART_SIZE: "32"
+        } as NodeJS.ProcessEnv);
+        expect(args[args.indexOf("--concurrency") + 1]).toBe("128");
+        expect(args[args.indexOf("--part-size") + 1]).toBe("32");
+    });
+
+    test("omits --endpoint-url for real AWS S3", () => {
+        const args = buildS5cmdCatArgs(
+            { ...baseParams, endpoint: undefined },
+            16,
+            noEnv
+        );
+        expect(args).not.toContain("--endpoint-url");
+        expect(args).toContain("cat");
+    });
+});
+
+describe("buildAwsCliStreamCpArgs (streaming download to stdout)", () => {
+    test("emits `s3 cp <uri> -` (stdout) with endpoint + only-show-errors", () => {
+        expect(buildAwsCliStreamCpArgs(baseParams)).toEqual([
+            "s3",
+            "cp",
+            "s3://cache-bucket/cache/owner/repo/abc123/my-key",
+            "-",
+            "--endpoint-url",
+            "https://s3.example.com",
+            "--only-show-errors"
+        ]);
+    });
+
+    test("destination is the bare `-` stdout token; no shell pipe/redirection", () => {
+        const args = buildAwsCliStreamCpArgs({
+            ...baseParams,
+            endpoint: undefined
+        });
+        expect(args).toEqual([
+            "s3",
+            "cp",
+            "s3://cache-bucket/cache/owner/repo/abc123/my-key",
+            "-",
+            "--only-show-errors"
+        ]);
+        expect(args.some(a => a.includes("|") || a.includes(">"))).toBe(false);
     });
 });
 

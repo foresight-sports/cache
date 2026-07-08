@@ -346,6 +346,79 @@ export function buildAwsCliCpArgs(
     return args;
 }
 
+// ============================================================================
+// STREAMING RESTORE command builders (download straight to stdout, no scratch
+// file). These feed the streamed `<downloader> | tar -xf -` pipeline in
+// streamingRestore.ts, where the download and the tar+zstd extraction OVERLAP
+// (~2x faster restore) instead of running serially (download-to-file THEN
+// extract). The operands are plain argv — the s3 URI is never interpolated into
+// a shell string — so the pipeline stays injection-safe.
+// ============================================================================
+
+/**
+ * s5cmd streaming-download argv: `[global flags] cat [--concurrency N]
+ * [--part-size M] s3://bucket/key`. `cat` writes the object to stdout using
+ * concurrent multipart (peak/s5cmd concurrent-cat support), reusing the SAME
+ * single-file download concurrency/part-size the `cp` path uses so the tuned
+ * defaults (and the CACHE_DOWNLOAD_* env overrides) apply to streaming too.
+ *
+ * MEMORY: `cat` fetches up to `--concurrency` parts in parallel but must emit
+ * them to stdout IN ORDER, so if `tar` stalls the ordered writer buffers
+ * out-of-order-completed parts. That buffer is bounded by ~concurrency *
+ * part-size (256 * 16 MiB ~= 4 GiB with the defaults here) — within budget on
+ * the 16-64 GiB runners. Shrink it on a memory-constrained runner by lowering
+ * CACHE_DOWNLOAD_CONCURRENCY / CACHE_DOWNLOAD_PART_SIZE, or force the inherently
+ * bounded aws-cli stream (or CACHE_STREAM_RESTORE=0 for no streaming at all).
+ *
+ * NOTE: unlike the `cp` path this omits `--stat`: for `cat` the object bytes go
+ * to stdout, and a stats line printed to stdout would corrupt the tar stream.
+ */
+export function buildS5cmdCatArgs(
+    params: TransferParams,
+    cpuCount: number = os.cpus().length,
+    env: NodeJS.ProcessEnv = process.env
+): string[] {
+    const concurrency = computeTransferConcurrency("download", cpuCount, env);
+    // --numworkers only limits how many SEPARATE objects run at once (we move
+    // exactly one), so it is pinned; keep it >= concurrency as a cheap hedge.
+    const numworkers = Math.max(S5CMD_NUMWORKERS_MIN, concurrency);
+    const args: string[] = [
+        "--numworkers",
+        String(numworkers),
+        "--log",
+        "error"
+    ];
+    if (params.endpoint) {
+        args.push("--endpoint-url", params.endpoint);
+    }
+    args.push("cat", "--concurrency", String(concurrency));
+    const partSizeMb = computePartSizeMb("download", params, env);
+    if (partSizeMb !== undefined) {
+        args.push("--part-size", String(partSizeMb));
+    }
+    args.push(s3Uri(params));
+    return args;
+}
+
+/**
+ * aws-cli streaming-download argv: `s3 cp s3://bucket/key - [--endpoint-url ep]
+ * --only-show-errors`. The `-` destination streams the object to stdout through
+ * aws-cli's bounded internal ring buffer (a single streaming GET, not
+ * multipart), which gives a LOWER, inherently bounded peak RAM than s5cmd cat's
+ * ordered writer — so this is the memory-safer streaming engine and the natural
+ * second choice. `--only-show-errors` keeps stdout pure object bytes (progress
+ * chatter, if any, goes to stderr). Path-style vs virtual-host addressing and
+ * the region come from the scoped `aws configure`/env the caller sets up first.
+ */
+export function buildAwsCliStreamCpArgs(params: TransferParams): string[] {
+    const args = ["s3", "cp", s3Uri(params), "-"];
+    if (params.endpoint) {
+        args.push("--endpoint-url", params.endpoint);
+    }
+    args.push("--only-show-errors");
+    return args;
+}
+
 function sanitizeEnv(env: NodeJS.ProcessEnv): { [key: string]: string } {
     const sanitized: { [key: string]: string } = {};
     for (const [key, value] of Object.entries(env)) {

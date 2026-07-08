@@ -189,6 +189,53 @@ export async function extractTar(
     });
 }
 
+/** A spawn-ready tar invocation (command + argv + env). Structurally matches
+ *  streamingRestore.SpawnSpec so it can be piped without a cross-module type
+ *  import (keeps uncompressedTar free of a streamingRestore dependency). */
+export interface TarStreamCommand {
+    command: string;
+    args: string[];
+    env: { [key: string]: string };
+}
+
+// Core tar argv for reading the COMPRESSED archive from stdin (`-xf -`) instead
+// of a file, decompressing via the exact same `zstd -d --long=30` filter as the
+// file-based extractTar. The `--long=30` window MUST match the create side; it
+// is preserved unchanged here (no save-side/format change). Split out (pure, no
+// I/O) so the streaming extract args are unit-testable without a real tar/zstd.
+export function buildStreamExtractCoreArgs(workingDirectory: string): string[] {
+    return [
+        "--use-compress-program",
+        "zstd -d --long=30",
+        "-xf",
+        "-",
+        "-P",
+        "-C",
+        workingDirectory
+    ];
+}
+
+/**
+ * Build the tar command that extracts the archive from STDIN, for the streamed
+ * `<downloader> | tar -xf -` restore pipeline. Same tar tool, same
+ * `zstd -d --long=30` decompressor, same `-P -C <workspace>` target as the
+ * file-based extractTar — only the input source changes (stdin, not a file), so
+ * no scratch archive is written or read. Returns a spawn-ready spec; the caller
+ * (streamingRestore.runPipeline) wires the downloader's stdout into this tar's
+ * stdin via Node stream piping (no shell pipe, no FIFO).
+ */
+export async function buildExtractTarStreamCommand(): Promise<TarStreamCommand> {
+    const tool = await getTarTool();
+    const workingDirectory = normalizeForTar(getWorkingDirectory());
+
+    await io.mkdirP(workingDirectory);
+
+    const args = buildStreamExtractCoreArgs(workingDirectory);
+    appendPlatformSpecificArgs(tool, args);
+
+    return { command: tool.path, args, env: getExecEnv() };
+}
+
 export async function listTar(
     archivePath: string,
     _compressionMethod: CompressionMethod

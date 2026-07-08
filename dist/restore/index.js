@@ -127493,6 +127493,72 @@ function buildAwsCliCpArgs(direction, params) {
     args.push("--only-show-errors");
     return args;
 }
+// ============================================================================
+// STREAMING RESTORE command builders (download straight to stdout, no scratch
+// file). These feed the streamed `<downloader> | tar -xf -` pipeline in
+// streamingRestore.ts, where the download and the tar+zstd extraction OVERLAP
+// (~2x faster restore) instead of running serially (download-to-file THEN
+// extract). The operands are plain argv — the s3 URI is never interpolated into
+// a shell string — so the pipeline stays injection-safe.
+// ============================================================================
+/**
+ * s5cmd streaming-download argv: `[global flags] cat [--concurrency N]
+ * [--part-size M] s3://bucket/key`. `cat` writes the object to stdout using
+ * concurrent multipart (peak/s5cmd concurrent-cat support), reusing the SAME
+ * single-file download concurrency/part-size the `cp` path uses so the tuned
+ * defaults (and the CACHE_DOWNLOAD_* env overrides) apply to streaming too.
+ *
+ * MEMORY: `cat` fetches up to `--concurrency` parts in parallel but must emit
+ * them to stdout IN ORDER, so if `tar` stalls the ordered writer buffers
+ * out-of-order-completed parts. That buffer is bounded by ~concurrency *
+ * part-size (256 * 16 MiB ~= 4 GiB with the defaults here) — within budget on
+ * the 16-64 GiB runners. Shrink it on a memory-constrained runner by lowering
+ * CACHE_DOWNLOAD_CONCURRENCY / CACHE_DOWNLOAD_PART_SIZE, or force the inherently
+ * bounded aws-cli stream (or CACHE_STREAM_RESTORE=0 for no streaming at all).
+ *
+ * NOTE: unlike the `cp` path this omits `--stat`: for `cat` the object bytes go
+ * to stdout, and a stats line printed to stdout would corrupt the tar stream.
+ */
+function buildS5cmdCatArgs(params, cpuCount = external_os_.cpus().length, env = process.env) {
+    const concurrency = computeTransferConcurrency("download", cpuCount, env);
+    // --numworkers only limits how many SEPARATE objects run at once (we move
+    // exactly one), so it is pinned; keep it >= concurrency as a cheap hedge.
+    const numworkers = Math.max(S5CMD_NUMWORKERS_MIN, concurrency);
+    const args = [
+        "--numworkers",
+        String(numworkers),
+        "--log",
+        "error"
+    ];
+    if (params.endpoint) {
+        args.push("--endpoint-url", params.endpoint);
+    }
+    args.push("cat", "--concurrency", String(concurrency));
+    const partSizeMb = computePartSizeMb("download", params, env);
+    if (partSizeMb !== undefined) {
+        args.push("--part-size", String(partSizeMb));
+    }
+    args.push(s3Uri(params));
+    return args;
+}
+/**
+ * aws-cli streaming-download argv: `s3 cp s3://bucket/key - [--endpoint-url ep]
+ * --only-show-errors`. The `-` destination streams the object to stdout through
+ * aws-cli's bounded internal ring buffer (a single streaming GET, not
+ * multipart), which gives a LOWER, inherently bounded peak RAM than s5cmd cat's
+ * ordered writer — so this is the memory-safer streaming engine and the natural
+ * second choice. `--only-show-errors` keeps stdout pure object bytes (progress
+ * chatter, if any, goes to stderr). Path-style vs virtual-host addressing and
+ * the region come from the scoped `aws configure`/env the caller sets up first.
+ */
+function buildAwsCliStreamCpArgs(params) {
+    const args = ["s3", "cp", s3Uri(params), "-"];
+    if (params.endpoint) {
+        args.push("--endpoint-url", params.endpoint);
+    }
+    args.push("--only-show-errors");
+    return args;
+}
 function sanitizeEnv(env) {
     const sanitized = {};
     for (const [key, value] of Object.entries(env)) {
@@ -127650,7 +127716,415 @@ async function transferEngine_transferArchive(direction, params, nodeFallback, d
     return "node";
 }
 
+;// CONCATENATED MODULE: ./src/custom/utils/uncompressedTar.ts
+
+
+
+
+
+
+async function getTarTool() {
+    switch (process.platform) {
+        case "win32": {
+            const gnuTar = await getGnuTarPathOnWindows();
+            if (gnuTar) {
+                return {
+                    path: gnuTar,
+                    type: ArchiveToolType.GNU
+                };
+            }
+            if ((0,external_fs_namespaceObject.existsSync)(SystemTarPathOnWindows)) {
+                return {
+                    path: SystemTarPathOnWindows,
+                    type: ArchiveToolType.BSD
+                };
+            }
+            break;
+        }
+        case "darwin": {
+            const gnuTar = await which("gtar", false);
+            if (gnuTar) {
+                return { path: gnuTar, type: ArchiveToolType.GNU };
+            }
+            return {
+                path: await which("tar", true),
+                type: ArchiveToolType.BSD
+            };
+        }
+        default:
+            break;
+    }
+    return {
+        path: await which("tar", true),
+        type: ArchiveToolType.GNU
+    };
+}
+function uncompressedTar_getWorkingDirectory() {
+    return process.env["GITHUB_WORKSPACE"] ?? process.cwd();
+}
+function normalizeForTar(targetPath) {
+    return targetPath.replace(new RegExp(`\\${external_path_.sep}`, "g"), "/");
+}
+function appendPlatformSpecificArgs(tool, args) {
+    if (tool.type === ArchiveToolType.GNU) {
+        if (process.platform === "win32") {
+            args.push("--force-local");
+        }
+        else if (process.platform === "darwin") {
+            args.push("--delay-directory-restore");
+        }
+    }
+}
+function uncompressedTar_sanitizeEnv(env) {
+    const sanitized = {};
+    for (const [key, value] of Object.entries(env)) {
+        if (value !== undefined) {
+            sanitized[key] = value;
+        }
+    }
+    return sanitized;
+}
+function getExecEnv() {
+    return uncompressedTar_sanitizeEnv({ ...process.env, MSYS: "winsymlinks:nativestrict" });
+}
+// createTar shells out to `zstd` (the no-compression fast path compresses with
+// multithreaded zstd). If zstd isn't on PATH the tar invocation fails and the
+// cache is silently skipped upstream — surface one clear warning so the cause is
+// obvious in the log instead of a generic tar error. Emitted at most once.
+let zstdMissingWarned = false;
+async function warnIfZstdMissing() {
+    if (zstdMissingWarned) {
+        return;
+    }
+    const zstdPath = await which("zstd", false);
+    if (!zstdPath) {
+        zstdMissingWarned = true;
+        warning("zstd not found on PATH — cache disabled for this run. Install zstd to enable caching.");
+    }
+}
+async function runTar(tool, args, options) {
+    await exec_exec(`"${tool.path}"`, args, options);
+}
+async function uncompressedTar_createTar(archiveFolder, sourceDirectories, compressionMethod) {
+    const tool = await getTarTool();
+    await warnIfZstdMissing();
+    const cacheFileName = getCacheFileName(compressionMethod);
+    const normalizedArchiveName = normalizeForTar(cacheFileName);
+    const normalizedManifestPath = normalizeForTar(external_path_.join(archiveFolder, ManifestFilename));
+    const workingDirectory = normalizeForTar(uncompressedTar_getWorkingDirectory());
+    (0,external_fs_namespaceObject.writeFileSync)(normalizedManifestPath, sourceDirectories.join("\n"));
+    const args = [
+        "--posix",
+        // Multithreaded zstd (-T0 = all cores) at the fast level 3, with long-range
+        // matching (--long=30 = 1 GiB window). tar splits this value on whitespace
+        // and runs it as the compression filter. This replaces the previous raw
+        // (uncompressed) tar so the payload is both smaller and produced in parallel.
+        // The matching decompressor in extractTar/listTar uses `zstd -d --long=30`.
+        "--use-compress-program",
+        "zstd -T0 -3 --long=30",
+        "-cf",
+        normalizedArchiveName,
+        "--exclude",
+        normalizedArchiveName,
+        "-P",
+        "-C",
+        workingDirectory,
+        "--files-from",
+        ManifestFilename
+    ];
+    appendPlatformSpecificArgs(tool, args);
+    await runTar(tool, args, {
+        cwd: archiveFolder,
+        env: getExecEnv()
+    });
+}
+async function uncompressedTar_extractTar(archivePath, _compressionMethod) {
+    void _compressionMethod;
+    const tool = await getTarTool();
+    const workingDirectory = normalizeForTar(uncompressedTar_getWorkingDirectory());
+    await mkdirP(workingDirectory);
+    const args = [
+        // Decompress with zstd (long-range window must match the create side).
+        // `zstd -d` is used rather than `unzstd` because it is the form proven on the
+        // Windows Git tar bundle used by the runner (the toolkit's own zstd path and
+        // the observed restore log both invoke `zstd -d`), and it is equally valid on
+        // Linux/macOS.
+        "--use-compress-program",
+        "zstd -d --long=30",
+        "-xf",
+        normalizeForTar(archivePath),
+        "-P",
+        "-C",
+        workingDirectory
+    ];
+    appendPlatformSpecificArgs(tool, args);
+    await runTar(tool, args, {
+        env: getExecEnv()
+    });
+}
+// Core tar argv for reading the COMPRESSED archive from stdin (`-xf -`) instead
+// of a file, decompressing via the exact same `zstd -d --long=30` filter as the
+// file-based extractTar. The `--long=30` window MUST match the create side; it
+// is preserved unchanged here (no save-side/format change). Split out (pure, no
+// I/O) so the streaming extract args are unit-testable without a real tar/zstd.
+function buildStreamExtractCoreArgs(workingDirectory) {
+    return [
+        "--use-compress-program",
+        "zstd -d --long=30",
+        "-xf",
+        "-",
+        "-P",
+        "-C",
+        workingDirectory
+    ];
+}
+/**
+ * Build the tar command that extracts the archive from STDIN, for the streamed
+ * `<downloader> | tar -xf -` restore pipeline. Same tar tool, same
+ * `zstd -d --long=30` decompressor, same `-P -C <workspace>` target as the
+ * file-based extractTar — only the input source changes (stdin, not a file), so
+ * no scratch archive is written or read. Returns a spawn-ready spec; the caller
+ * (streamingRestore.runPipeline) wires the downloader's stdout into this tar's
+ * stdin via Node stream piping (no shell pipe, no FIFO).
+ */
+async function buildExtractTarStreamCommand() {
+    const tool = await getTarTool();
+    const workingDirectory = normalizeForTar(uncompressedTar_getWorkingDirectory());
+    await mkdirP(workingDirectory);
+    const args = buildStreamExtractCoreArgs(workingDirectory);
+    appendPlatformSpecificArgs(tool, args);
+    return { command: tool.path, args, env: getExecEnv() };
+}
+async function uncompressedTar_listTar(archivePath, _compressionMethod) {
+    void _compressionMethod;
+    const tool = await getTarTool();
+    // Same zstd decompressor as extractTar so debug listing works on the
+    // now-compressed archive.
+    const args = [
+        "--use-compress-program",
+        "zstd -d --long=30",
+        "-tf",
+        normalizeForTar(archivePath),
+        "-P"
+    ];
+    appendPlatformSpecificArgs(tool, args);
+    await runTar(tool, args, {
+        env: getExecEnv()
+    });
+}
+
+;// CONCATENATED MODULE: ./src/custom/streamingRestore.ts
+// Streamed cache restore: overlap the download and the extraction instead of
+// running them serially.
+//
+// OLD (file-based, serial): `s5cmd/aws cp s3://…/cache.tzst <file>` writes the
+// whole ~44 GB archive to NVMe scratch, THEN `tar --use-compress-program
+// "zstd -d --long=30" -xf <file>` reads it back and extracts. Measured ~3.5 min
+// download + ~3.5 min extract = ~7 min, and it round-trips 44 GB through disk.
+//
+// NEW (streamed, overlapped): `<downloader to stdout> | tar
+// --use-compress-program "zstd -d --long=30" -xf -`. The downloader streams the
+// object to stdout while tar+zstd extract it on the fly, so the two phases run
+// concurrently (~1.8-2x, ~7 min -> ~3.5-4 min) and no scratch file is written.
+//
+// The pipe is wired in NODE (downloader.stdout -> tar.stdin), NOT via a shell
+// pipe or a FIFO: `mkfifo`'s MSYS-emulated FIFOs are unusable by native Windows
+// exes, and `bash -c "… | …"` would mean interpolating the s3 URL / dest path
+// into a shell string. Both child processes are spawned with argv arrays and
+// shell:false, so nothing is ever parsed by a shell (injection-safe).
+//
+// Streaming is the default for the s5cmd and aws-cli engines. On ANY streaming
+// failure (downloader non-zero exit, tar/zstd error, broken pipe) the chain
+// tries the next streaming engine and ultimately signals the caller to fall
+// back to the proven file-based download-to-file + extract path (which also
+// re-runs the s5cmd/aws/node cp engines). The node presigned-URL engine is
+// intentionally NOT streamed — it stays file-based as the always-present safety
+// net. `CACHE_STREAM_RESTORE=0` forces the old file-based behavior entirely.
+
+
+
+
+
+/** Env var to force the legacy file-based restore (disable streaming). */
+const ENV_STREAM_RESTORE = "CACHE_STREAM_RESTORE";
+/**
+ * Streaming restore is ON by default. `CACHE_STREAM_RESTORE` set to
+ * 0/false/no/off (case-insensitive) forces the legacy download-to-file +
+ * extract path. Any other value (or unset) keeps streaming enabled.
+ */
+function isStreamRestoreEnabled(env = process.env) {
+    const value = (env[ENV_STREAM_RESTORE] ?? "").trim().toLowerCase();
+    return !(value === "0" ||
+        value === "false" ||
+        value === "no" ||
+        value === "off");
+}
+/**
+ * Run `downloader | tar` as a Node-wired pipeline: spawn both children (argv
+ * arrays, shell:false — no shell parsing) and pipe downloader.stdout ->
+ * tar.stdin with Node handling backpressure. Resolves only when BOTH children
+ * exit 0 (integrity for the streamed path comes from the downloader completing
+ * AND tar+zstd extracting end-to-end); rejects on any non-zero exit, spawn
+ * error, or broken pipe so the caller can fall through cleanly.
+ */
+async function runPipeline(downloader, tar) {
+    return new Promise((resolve, reject) => {
+        const stderrChunks = [];
+        let settled = false;
+        let dlDone = false;
+        let tarDone = false;
+        let dlCode = null;
+        let tarCode = null;
+        const settleReject = (err) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            reject(err);
+        };
+        const maybeSettle = () => {
+            if (!dlDone || !tarDone || settled) {
+                return;
+            }
+            if (dlCode === 0 && tarCode === 0) {
+                settled = true;
+                resolve();
+                return;
+            }
+            const detail = stderrChunks.join("").trim().slice(0, 2000);
+            settleReject(new Error(`streamed restore pipeline failed (downloader exit ${dlCode}, tar exit ${tarCode})` +
+                (detail ? `: ${detail}` : "")));
+        };
+        // tar is the consumer; spawn it first so its stdin exists before we pipe.
+        const tarProc = (0,external_child_process_namespaceObject.spawn)(tar.command, tar.args, {
+            env: tar.env,
+            stdio: ["pipe", "inherit", "pipe"],
+            windowsHide: true
+        });
+        const dlProc = (0,external_child_process_namespaceObject.spawn)(downloader.command, downloader.args, {
+            env: downloader.env,
+            stdio: ["ignore", "pipe", "pipe"],
+            windowsHide: true
+        });
+        // downloader stdout -> tar stdin (Node pipe, honors backpressure).
+        dlProc.stdout?.pipe(tarProc.stdin);
+        dlProc.stderr?.on("data", (chunk) => stderrChunks.push(`[downloader] ${chunk.toString()}`));
+        tarProc.stderr?.on("data", (chunk) => stderrChunks.push(`[tar] ${chunk.toString()}`));
+        // A broken pipe (tar died -> downloader's stdout write EPIPEs, or vice
+        // versa) is not the real error; the non-zero exit code below is. Swallow
+        // the stream 'error' so it does not become an unhandled exception.
+        tarProc.stdin?.on("error", () => undefined);
+        dlProc.stdout?.on("error", () => undefined);
+        dlProc.on("error", (err) => {
+            dlDone = true;
+            dlCode = dlCode ?? -1;
+            if (!tarDone) {
+                tarProc.kill("SIGKILL");
+            }
+            settleReject(err);
+        });
+        tarProc.on("error", (err) => {
+            tarDone = true;
+            tarCode = tarCode ?? -1;
+            if (!dlDone) {
+                dlProc.kill("SIGKILL");
+            }
+            settleReject(err);
+        });
+        dlProc.on("close", (code) => {
+            dlDone = true;
+            dlCode = code;
+            maybeSettle();
+        });
+        tarProc.on("close", (code) => {
+            tarDone = true;
+            tarCode = code;
+            // tar exited (likely on error) before the downloader finished:
+            // stop the transfer so it does not keep pulling the whole object.
+            if ((code ?? -1) !== 0 && !dlDone) {
+                dlProc.kill("SIGKILL");
+            }
+            maybeSettle();
+        });
+    });
+}
+/** Run scoped `aws configure set …` batches before the streaming cp. */
+async function runAwsConfigure(batches, env, execPath) {
+    for (const configureArgs of batches) {
+        await exec_exec(`"${execPath}"`, configureArgs, { env, silent: true });
+    }
+}
+const streamingRestore_defaultDeps = {
+    findExecutable: findExecutable,
+    buildExtractCommand: buildExtractTarStreamCommand,
+    runPipeline,
+    runAwsConfigure
+};
+/**
+ * Attempt a streamed restore of s3://bucket/key straight into the workspace,
+ * overlapping download and extraction. Tries `s5cmd cat | tar` first, then
+ * `aws s3 cp - | tar`; each streaming engine that is missing or fails falls
+ * through to the next. Returns the engine that completed the restore, or THROWS
+ * if no streaming engine succeeded — the backend wrapper turns that throw into
+ * a clean fall-back to the file-based download+extract path. The node
+ * presigned-URL engine is deliberately absent here (it is the file-based safety
+ * net, not a streaming engine).
+ */
+async function streamedRestore(params, deps = streamingRestore_defaultDeps) {
+    const startedAtMs = Date.now();
+    const logElapsed = (engine) => {
+        const elapsedSec = Math.max((Date.now() - startedAtMs) / 1000, 0.001);
+        info(`Cache restored via streamed ${engine} (download|extract overlapped) in ${elapsedSec.toFixed(1)}s.`);
+    };
+    // Engine 1: s5cmd cat | tar.
+    const s5cmdPath = await deps.findExecutable("s5cmd");
+    if (s5cmdPath) {
+        const { env, cleanup } = buildEngineEnv(params);
+        try {
+            info(`Cache download: streaming engine s5cmd cat | tar (${s5cmdPath}).`);
+            const tar = await deps.buildExtractCommand();
+            await deps.runPipeline({ command: s5cmdPath, args: buildS5cmdCatArgs(params), env }, tar);
+            logElapsed("s5cmd");
+            return "s5cmd";
+        }
+        catch (error) {
+            warning(`s5cmd streamed restore failed (${error.message}); trying aws-cli stream.`);
+        }
+        finally {
+            cleanup();
+        }
+    }
+    // Engine 2: aws s3 cp - | tar (bounded ring buffer; memory-safer stream).
+    const awsPath = await deps.findExecutable("aws");
+    if (awsPath) {
+        const { env, cleanup } = buildEngineEnv(params);
+        try {
+            info(`Cache download: streaming engine aws-cli cp - | tar (${awsPath}).`);
+            // Multipart knobs are largely inert for a stdout stream (single GET),
+            // but addressing_style=path (set when forcePathStyle) is required for
+            // RunsOn/R2/MinIO path-style endpoints, so run the scoped configure.
+            await deps.runAwsConfigure(buildAwsCliConfigureArgs("download", params), env, awsPath);
+            const tar = await deps.buildExtractCommand();
+            await deps.runPipeline({
+                command: awsPath,
+                args: buildAwsCliStreamCpArgs(params),
+                env
+            }, tar);
+            logElapsed("aws-cli");
+            return "aws-cli";
+        }
+        catch (error) {
+            warning(`aws-cli streamed restore failed (${error.message}); falling back to file-based restore.`);
+        }
+        finally {
+            cleanup();
+        }
+    }
+    throw new Error("no streaming restore engine available (s5cmd/aws-cli missing or failed)");
+}
+
 ;// CONCATENATED MODULE: ./src/custom/backend.ts
+
 
 
 
@@ -127856,6 +128330,45 @@ async function backend_downloadCache(archiveLocation, archivePath, options) {
         region,
         forcePathStyle
     }, nodeDownload, undefined, verifyNativeDownload);
+}
+/**
+ * Streamed restore: pull s3://bucket/key straight through the decompressor+tar
+ * so the download and the extraction OVERLAP (no scratch archive on disk),
+ * instead of downloadCache()-to-file THEN extractTar(). Returns true when the
+ * cache was streamed AND extracted end-to-end; returns false to signal the
+ * caller to fall back to the file-based download+extract path (used when no
+ * streaming engine is available/succeeds, or when the S3 config is missing so
+ * the file-based path can surface the clear error). This never throws for a
+ * streaming failure — a fall-back is always safe because the file-based path
+ * re-extracts from scratch (tar -x overwrites any partial files a broken stream
+ * left behind), and its own size/integrity checks are not bypassed.
+ */
+async function downloadCacheStreaming(archiveLocation) {
+    if (!bucketName || !region) {
+        // Let the file-based downloadCache() surface the clear config error.
+        return false;
+    }
+    const bucket = bucketName;
+    const archiveUrl = new URL(archiveLocation);
+    const objectKey = archiveUrl.pathname.slice(1);
+    // archivePath is unused for streaming (no scratch file is written); the
+    // streaming builders derive everything from bucket/key/endpoint/region.
+    const params = {
+        bucket,
+        key: objectKey,
+        archivePath: "",
+        endpoint,
+        region,
+        forcePathStyle
+    };
+    try {
+        await streamedRestore(params);
+        return true;
+    }
+    catch (error) {
+        warning(`Streamed restore unavailable/failed (${error.message}); falling back to download-to-file + extract.`);
+        return false;
+    }
 }
 async function backend_saveCache(key, paths, archivePath, { compressionMethod, enableCrossOsArchive, cacheSize: archiveFileSize, uploadChunkSize }) {
     void archiveFileSize;
@@ -128113,172 +128626,9 @@ function reparsePoints_expandWindowsReparsePoints(cachePaths, workspaceRoot = pr
     return expanded;
 }
 
-;// CONCATENATED MODULE: ./src/custom/utils/uncompressedTar.ts
-
-
-
-
-
-
-async function getTarTool() {
-    switch (process.platform) {
-        case "win32": {
-            const gnuTar = await getGnuTarPathOnWindows();
-            if (gnuTar) {
-                return {
-                    path: gnuTar,
-                    type: ArchiveToolType.GNU
-                };
-            }
-            if ((0,external_fs_namespaceObject.existsSync)(SystemTarPathOnWindows)) {
-                return {
-                    path: SystemTarPathOnWindows,
-                    type: ArchiveToolType.BSD
-                };
-            }
-            break;
-        }
-        case "darwin": {
-            const gnuTar = await which("gtar", false);
-            if (gnuTar) {
-                return { path: gnuTar, type: ArchiveToolType.GNU };
-            }
-            return {
-                path: await which("tar", true),
-                type: ArchiveToolType.BSD
-            };
-        }
-        default:
-            break;
-    }
-    return {
-        path: await which("tar", true),
-        type: ArchiveToolType.GNU
-    };
-}
-function uncompressedTar_getWorkingDirectory() {
-    return process.env["GITHUB_WORKSPACE"] ?? process.cwd();
-}
-function normalizeForTar(targetPath) {
-    return targetPath.replace(new RegExp(`\\${external_path_.sep}`, "g"), "/");
-}
-function appendPlatformSpecificArgs(tool, args) {
-    if (tool.type === ArchiveToolType.GNU) {
-        if (process.platform === "win32") {
-            args.push("--force-local");
-        }
-        else if (process.platform === "darwin") {
-            args.push("--delay-directory-restore");
-        }
-    }
-}
-function uncompressedTar_sanitizeEnv(env) {
-    const sanitized = {};
-    for (const [key, value] of Object.entries(env)) {
-        if (value !== undefined) {
-            sanitized[key] = value;
-        }
-    }
-    return sanitized;
-}
-function getExecEnv() {
-    return uncompressedTar_sanitizeEnv({ ...process.env, MSYS: "winsymlinks:nativestrict" });
-}
-// createTar shells out to `zstd` (the no-compression fast path compresses with
-// multithreaded zstd). If zstd isn't on PATH the tar invocation fails and the
-// cache is silently skipped upstream — surface one clear warning so the cause is
-// obvious in the log instead of a generic tar error. Emitted at most once.
-let zstdMissingWarned = false;
-async function warnIfZstdMissing() {
-    if (zstdMissingWarned) {
-        return;
-    }
-    const zstdPath = await which("zstd", false);
-    if (!zstdPath) {
-        zstdMissingWarned = true;
-        warning("zstd not found on PATH — cache disabled for this run. Install zstd to enable caching.");
-    }
-}
-async function runTar(tool, args, options) {
-    await exec_exec(`"${tool.path}"`, args, options);
-}
-async function uncompressedTar_createTar(archiveFolder, sourceDirectories, compressionMethod) {
-    const tool = await getTarTool();
-    await warnIfZstdMissing();
-    const cacheFileName = getCacheFileName(compressionMethod);
-    const normalizedArchiveName = normalizeForTar(cacheFileName);
-    const normalizedManifestPath = normalizeForTar(external_path_.join(archiveFolder, ManifestFilename));
-    const workingDirectory = normalizeForTar(uncompressedTar_getWorkingDirectory());
-    (0,external_fs_namespaceObject.writeFileSync)(normalizedManifestPath, sourceDirectories.join("\n"));
-    const args = [
-        "--posix",
-        // Multithreaded zstd (-T0 = all cores) at the fast level 3, with long-range
-        // matching (--long=30 = 1 GiB window). tar splits this value on whitespace
-        // and runs it as the compression filter. This replaces the previous raw
-        // (uncompressed) tar so the payload is both smaller and produced in parallel.
-        // The matching decompressor in extractTar/listTar uses `zstd -d --long=30`.
-        "--use-compress-program",
-        "zstd -T0 -3 --long=30",
-        "-cf",
-        normalizedArchiveName,
-        "--exclude",
-        normalizedArchiveName,
-        "-P",
-        "-C",
-        workingDirectory,
-        "--files-from",
-        ManifestFilename
-    ];
-    appendPlatformSpecificArgs(tool, args);
-    await runTar(tool, args, {
-        cwd: archiveFolder,
-        env: getExecEnv()
-    });
-}
-async function uncompressedTar_extractTar(archivePath, _compressionMethod) {
-    void _compressionMethod;
-    const tool = await getTarTool();
-    const workingDirectory = normalizeForTar(uncompressedTar_getWorkingDirectory());
-    await mkdirP(workingDirectory);
-    const args = [
-        // Decompress with zstd (long-range window must match the create side).
-        // `zstd -d` is used rather than `unzstd` because it is the form proven on the
-        // Windows Git tar bundle used by the runner (the toolkit's own zstd path and
-        // the observed restore log both invoke `zstd -d`), and it is equally valid on
-        // Linux/macOS.
-        "--use-compress-program",
-        "zstd -d --long=30",
-        "-xf",
-        normalizeForTar(archivePath),
-        "-P",
-        "-C",
-        workingDirectory
-    ];
-    appendPlatformSpecificArgs(tool, args);
-    await runTar(tool, args, {
-        env: getExecEnv()
-    });
-}
-async function uncompressedTar_listTar(archivePath, _compressionMethod) {
-    void _compressionMethod;
-    const tool = await getTarTool();
-    // Same zstd decompressor as extractTar so debug listing works on the
-    // now-compressed archive.
-    const args = [
-        "--use-compress-program",
-        "zstd -d --long=30",
-        "-tf",
-        normalizeForTar(archivePath),
-        "-P"
-    ];
-    appendPlatformSpecificArgs(tool, args);
-    await runTar(tool, args, {
-        env: getExecEnv()
-    });
-}
-
 ;// CONCATENATED MODULE: ./src/custom/cache.ts
 // https://github.com/actions/toolkit/blob/%40actions/cache%403.2.2/packages/cache/src/cache.ts
+
 
 
 
@@ -128409,6 +128759,19 @@ async function cache_restoreCache(paths, primaryKey, restoreKeys, options, enabl
         if (options?.lookupOnly) {
             info("Lookup only - skipping download");
             return cacheEntry.cacheKey;
+        }
+        // Fast path: STREAMED restore (download|extract overlapped, no scratch
+        // archive on disk). Only for the no-compression zstd path, whose extract
+        // command (`tar --use-compress-program "zstd -d --long=30" -xf -`) the
+        // stream pipeline reproduces exactly; the gzip path stays file-based.
+        // Off-switch: CACHE_STREAM_RESTORE=0. Any streaming miss/failure returns
+        // false and falls through to the file-based download+extract below.
+        if (shouldSkipCompression() && isStreamRestoreEnabled(process.env)) {
+            const streamed = await downloadCacheStreaming(cacheEntry.archiveLocation);
+            if (streamed) {
+                info("Cache restored successfully");
+                return cacheEntry.cacheKey;
+            }
         }
         archivePath = external_path_.join(await createTempDirectory(), getCacheFileName(compressionMethod));
         core_debug(`Archive Path: ${archivePath}`);

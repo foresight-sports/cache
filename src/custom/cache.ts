@@ -13,6 +13,7 @@ import {
     UploadOptions
 } from "../actionsCacheShims.js";
 import * as cacheHttpClient from "./backend";
+import { isStreamRestoreEnabled } from "./streamingRestore";
 import { expandWindowsReparsePoints } from "./utils/reparsePoints";
 import {
     createTar as uncompressedCreateTar,
@@ -199,6 +200,22 @@ export async function restoreCache(
         if (options?.lookupOnly) {
             core.info("Lookup only - skipping download");
             return cacheEntry.cacheKey;
+        }
+
+        // Fast path: STREAMED restore (download|extract overlapped, no scratch
+        // archive on disk). Only for the no-compression zstd path, whose extract
+        // command (`tar --use-compress-program "zstd -d --long=30" -xf -`) the
+        // stream pipeline reproduces exactly; the gzip path stays file-based.
+        // Off-switch: CACHE_STREAM_RESTORE=0. Any streaming miss/failure returns
+        // false and falls through to the file-based download+extract below.
+        if (shouldSkipCompression() && isStreamRestoreEnabled(process.env)) {
+            const streamed = await cacheHttpClient.downloadCacheStreaming(
+                cacheEntry.archiveLocation
+            );
+            if (streamed) {
+                core.info("Cache restored successfully");
+                return cacheEntry.cacheKey;
+            }
         }
 
         archivePath = path.join(
