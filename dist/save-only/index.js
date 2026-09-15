@@ -127631,6 +127631,33 @@ async function transferEngine_transferArchive(direction, params, nodeFallback, d
 
 
 
+const ENV_ZSTD_COMPRESS_ARGS = "CACHE_ZSTD_COMPRESS_ARGS";
+const DEFAULT_ZSTD_COMPRESS_ARGS = "-T0 -3 --long=30";
+// Each token must look like a zstd option: no shell metacharacters, no paths.
+const ZSTD_ARG_TOKEN = /^-{1,2}[A-Za-z0-9][A-Za-z0-9=,.-]*$/;
+/**
+ * zstd flags used when creating the archive. `CACHE_ZSTD_COMPRESS_ARGS` (e.g.
+ * `-T0 -1` to trade a few percent of size for a much faster save, or `-T0 -3`
+ * to drop the 1 GiB long-range window) replaces the default when every
+ * whitespace-separated token is a plain option; anything else is ignored with a
+ * warning so a typo can never break a save. The decompressor always passes
+ * --long=30 and therefore reads either archive shape.
+ */
+function getZstdCompressArgs(env = process.env) {
+    const raw = (env[ENV_ZSTD_COMPRESS_ARGS] ?? "").trim();
+    if (raw === "") {
+        return DEFAULT_ZSTD_COMPRESS_ARGS;
+    }
+    const tokens = raw.split(/\s+/);
+    if (tokens.every(token => ZSTD_ARG_TOKEN.test(token))) {
+        return tokens.join(" ");
+    }
+    warning(`${ENV_ZSTD_COMPRESS_ARGS}='${raw}' contains a non-option token; using the default '${DEFAULT_ZSTD_COMPRESS_ARGS}'.`);
+    return DEFAULT_ZSTD_COMPRESS_ARGS;
+}
+function getZstdCompressProgram(env = process.env) {
+    return `zstd ${getZstdCompressArgs(env)}`;
+}
 async function getTarTool() {
     switch (process.platform) {
         case "win32": {
@@ -127721,15 +127748,17 @@ async function uncompressedTar_createTar(archiveFolder, sourceDirectories, compr
     const normalizedManifestPath = normalizeForTar(external_path_.join(archiveFolder, ManifestFilename));
     const workingDirectory = normalizeForTar(uncompressedTar_getWorkingDirectory());
     (0,external_fs_namespaceObject.writeFileSync)(normalizedManifestPath, sourceDirectories.join("\n"));
+    const compressProgram = getZstdCompressProgram();
+    info(`Cache archive compressor: ${compressProgram}`);
     const args = [
         "--posix",
         // Multithreaded zstd (-T0 = all cores) at the fast level 3, with long-range
-        // matching (--long=30 = 1 GiB window). tar splits this value on whitespace
-        // and runs it as the compression filter. This replaces the previous raw
-        // (uncompressed) tar so the payload is both smaller and produced in parallel.
-        // The matching decompressor in extractTar/listTar uses `zstd -d --long=30`.
+        // matching (--long=30 = 1 GiB window) by default; overridable per job via
+        // CACHE_ZSTD_COMPRESS_ARGS. tar splits this value on whitespace and runs it
+        // as the compression filter. The decompressor in extractTar/listTar stays
+        // `zstd -d --long=30`, which reads archives produced with or without --long.
         "--use-compress-program",
-        "zstd -T0 -3 --long=30",
+        compressProgram,
         "-cf",
         normalizedArchiveName,
         "--exclude",
