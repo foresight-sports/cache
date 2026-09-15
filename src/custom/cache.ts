@@ -13,6 +13,17 @@ import {
     UploadOptions
 } from "../actionsCacheShims.js";
 import * as cacheHttpClient from "./backend";
+import {
+    createShardedArchive,
+    ENV_ARCHIVE_SHARDS,
+    extractShardedArchive,
+    getArchiveShardCount,
+    mapWithConcurrency,
+    SHARD_DOWNLOAD_CONCURRENCY,
+    shardListName,
+    ShardManifest,
+    SHARDS_KEY_SUFFIX
+} from "./shardedArchive";
 import { isStreamRestoreEnabled } from "./streamingRestore";
 import {
     createArchiveStagingDirectory,
@@ -192,6 +203,8 @@ export async function restoreCache(
     let archivePath = "";
     let archiveFolder = "";
     let archiveDirIsCustom = false;
+    // Local part files of a sharded restore (empty for a legacy archive).
+    let shardPartPaths: string[] = [];
     try {
         // path are needed to compute version
         const cacheEntry = await cacheHttpClient.getCacheEntry(keys, paths, {
@@ -206,6 +219,33 @@ export async function restoreCache(
         if (options?.lookupOnly) {
             core.info("Lookup only - skipping download");
             return cacheEntry.cacheKey;
+        }
+
+        // Sharded entry? Only the zstd (no-compression) path ever writes one,
+        // and the gzip path has its own cache version, so the probe is skipped
+        // there to keep it byte-for-byte unchanged. The decision is made per
+        // entry from the stored object, never from CACHE_ARCHIVE_SHARDS, so a
+        // job restores whichever shape the saving job produced.
+        if (shouldSkipCompression()) {
+            const manifest = await cacheHttpClient.getShardManifest(
+                cacheEntry.archiveLocation
+            );
+            if (manifest) {
+                const staging = await createArchiveStagingDirectory();
+                archiveFolder = staging.dir;
+                archiveDirIsCustom = staging.isCustom;
+                shardPartPaths = manifest.shards.map(shard =>
+                    path.join(archiveFolder, shard.name)
+                );
+                await restoreShardedArchive(
+                    manifest,
+                    cacheEntry.archiveLocation,
+                    shardPartPaths,
+                    options
+                );
+                core.info("Cache restored successfully");
+                return cacheEntry.cacheKey;
+            }
         }
 
         // Fast path: STREAMED restore (download|extract overlapped, no scratch
@@ -287,6 +327,8 @@ export async function restoreCache(
         // (RUNNER_TEMP) path keeps upstream's file-only unlink byte-for-byte.
         if (archiveDirIsCustom) {
             await removeArchiveStagingDirectory(archiveFolder);
+        } else if (shardPartPaths.length > 0) {
+            await unlinkFiles(shardPartPaths);
         } else {
             try {
                 await utils.unlinkFile(archivePath);
@@ -297,6 +339,79 @@ export async function restoreCache(
     }
 
     return undefined;
+}
+
+// Download every part of a sharded entry into the staging dir (a bounded
+// number at a time; each download is itself a wide multipart transfer), check
+// each against the size the manifest recorded, then extract all parts
+// concurrently. Any failure throws so restoreCache's catch turns it into the
+// usual warning + undefined; a partially extracted workspace is harmless
+// because a later restore or the build itself overwrites it.
+async function restoreShardedArchive(
+    manifest: ShardManifest,
+    archiveLocation: string,
+    partPaths: string[],
+    options?: DownloadOptions
+): Promise<void> {
+    core.info(
+        `Sharded cache entry: ${manifest.shards.length} part(s), ~${Math.round(
+            manifest.totalBytes / (1024 * 1024)
+        )} MB (${manifest.totalBytes} B), ${manifest.totalFiles} files.`
+    );
+
+    const downloadStartedAt = Date.now();
+    await mapWithConcurrency(
+        manifest.shards,
+        SHARD_DOWNLOAD_CONCURRENCY,
+        async (shard, index) => {
+            const partPath = partPaths[index];
+            await cacheHttpClient.downloadCache(
+                `${archiveLocation}${SHARDS_KEY_SUFFIX}${shard.name}`,
+                partPath,
+                options
+            );
+            const partSize = utils.getArchiveFileSizeInBytes(partPath);
+            core.info(
+                `  ${shard.name}: ~${Math.round(
+                    partSize / (1024 * 1024)
+                )} MB (${partSize} B), ${shard.files} files`
+            );
+            if (partSize === 0) {
+                throw new DownloadValidationError(
+                    `Downloaded cache part ${shard.name} is empty (0 bytes). This may indicate a failed download or corrupted cache.`
+                );
+            }
+            if (partSize !== shard.bytes) {
+                throw new DownloadValidationError(
+                    `Downloaded cache part ${shard.name} is ${partSize} B but the manifest recorded ${shard.bytes} B.`
+                );
+            }
+        }
+    );
+    core.info(
+        `Sharded cache: downloaded ${manifest.shards.length} part(s) in ${(
+            (Date.now() - downloadStartedAt) /
+            1000
+        ).toFixed(1)}s.`
+    );
+
+    if (core.isDebug()) {
+        for (const partPath of partPaths) {
+            await uncompressedListTar(partPath, CompressionMethod.Zstd);
+        }
+    }
+
+    await extractShardedArchive(partPaths);
+}
+
+async function unlinkFiles(filePaths: string[]): Promise<void> {
+    for (const filePath of filePaths) {
+        try {
+            await utils.unlinkFile(filePath);
+        } catch (error) {
+            core.debug(`Failed to delete ${filePath}: ${error}`);
+        }
+    }
 }
 
 /**
@@ -336,6 +451,27 @@ export async function saveCache(
     if (cachePaths.length === 0) {
         throw new Error(
             `Path Validation Error: Path(s) specified in the action for caching do(es) not exist, hence no cache is being saved.`
+        );
+    }
+
+    // Opt-in sharded save: N parallel tar|zstd parts + a manifest, only on the
+    // zstd (no-compression) path. Everything below this block is the legacy
+    // single-archive save, untouched.
+    const shardCount = getArchiveShardCount();
+    if (shardCount >= 2) {
+        if (shouldSkipCompression()) {
+            return saveShardedCache(
+                paths,
+                cachePaths,
+                key,
+                shardCount,
+                compressionMethod,
+                enableCrossOsArchive,
+                options
+            );
+        }
+        core.info(
+            `${ENV_ARCHIVE_SHARDS}=${shardCount} ignored: sharded archives require compression-level 0 (zstd).`
         );
     }
 
@@ -393,6 +529,86 @@ export async function saveCache(
             } catch (error) {
                 core.debug(`Failed to delete archive: ${error}`);
             }
+        }
+    }
+
+    return cacheId;
+}
+
+// Sharded save: enumerate + balance + N concurrent tars in the staging dir,
+// upload the parts, then the manifest. Same fail-soft contract as the legacy
+// save (ValidationError rethrown, everything else a warning and cacheId -1),
+// same staging cleanup (whole custom dir, or file-only unlinks by default).
+async function saveShardedCache(
+    paths: string[],
+    cachePaths: string[],
+    key: string,
+    shardCount: number,
+    compressionMethod: CompressionMethod,
+    enableCrossOsArchive: boolean,
+    options?: UploadOptions
+): Promise<number> {
+    let cacheId = -1;
+    const staging = await createArchiveStagingDirectory();
+    const archiveFolder = staging.dir;
+    core.debug(`Archive Folder (sharded): ${archiveFolder}`);
+    const scratchFiles: string[] = [];
+
+    try {
+        const startedAt = Date.now();
+        const { manifest, parts } = await createShardedArchive(
+            archiveFolder,
+            cachePaths,
+            shardCount
+        );
+        scratchFiles.push(
+            ...parts.map(part => part.path),
+            ...parts.map(part =>
+                path.join(archiveFolder, shardListName(part.index))
+            )
+        );
+        const tarFinishedAt = Date.now();
+
+        if (core.isDebug()) {
+            for (const part of parts) {
+                await uncompressedListTar(part.path, compressionMethod);
+            }
+        }
+
+        await cacheHttpClient.saveShardedCache(key, paths, parts, manifest, {
+            compressionMethod,
+            enableCrossOsArchive,
+            uploadChunkSize: options?.uploadChunkSize
+        });
+        const finishedAt = Date.now();
+        core.info(
+            `Sharded cache save: tar ${(
+                (tarFinishedAt - startedAt) /
+                1000
+            ).toFixed(1)}s, upload ${(
+                (finishedAt - tarFinishedAt) /
+                1000
+            ).toFixed(
+                1
+            )}s, total ${((finishedAt - startedAt) / 1000).toFixed(1)}s.`
+        );
+
+        // dummy cacheId, if we get there without raising, it means the cache has been saved
+        cacheId = 1;
+    } catch (error) {
+        const typedError = error as Error;
+        if (typedError.name === ValidationError.name) {
+            throw error;
+        } else if (typedError.name === ReserveCacheError.name) {
+            core.info(`Failed to save: ${typedError.message}`);
+        } else {
+            core.warning(`Failed to save: ${typedError.message}`);
+        }
+    } finally {
+        if (staging.isCustom) {
+            await removeArchiveStagingDirectory(archiveFolder);
+        } else {
+            await unlinkFiles(scratchFiles);
         }
     }
 

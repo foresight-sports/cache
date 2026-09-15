@@ -50,6 +50,11 @@ Be aware of S3 transfer costs if your runners are not in the same AWS region as 
 * `RUNS_ON_RUNNER_NAME`: when running on RunsOn, where this environment variable is non-empty, existing AWS credentials from the environment will be discarded. If you want to preserve existing environment variables, set this to the empty string `""`.
 * `RUNS_ON_S3_FORCE_PATH_STYLE` or `AWS_S3_FORCE_PATH_STYLE`: if one of those environment variables equals the string `"true"`, then the S3 client will be configured to force the path style.
 
+## Archive tuning (compression level 0, zstd path)
+
+* `CACHE_ZSTD_COMPRESS_ARGS`: zstd flags used when creating the archive; default `-T0 -3 --long=30` (all cores, level 3, 1 GiB long-range window). Set e.g. `-T0 -1` for a faster save at a few percent more size. Every whitespace-separated token must look like a plain zstd option, otherwise the value is ignored with a warning. Restores always decompress with `zstd -d --long=30`, which reads archives made with or without `--long`.
+* `CACHE_ARCHIVE_SHARDS`: integer `2`..`64` to archive and restore the cache as that many size-balanced parts, each a separate `tar | zstd` process run concurrently, instead of one serial stream. This is for huge caches (hundreds of GB, tens of thousands of mostly-large files) where a single tar stream leaves the disks and cores idle. Files are assigned to parts largest-first so the parts finish together; `-T0` in the zstd flags is turned into `-T<cores / shards>` per part so the compressors do not oversubscribe the machine. Parts are stored at `<key>.shards/part-NN.tzst` and a small JSON manifest is written last at the entry key itself, so a save that is interrupted never looks like a complete entry. Restores detect the manifest per entry (no env var needed on the restoring job) and download and extract every part in parallel; legacy single-archive entries keep restoring exactly as before. Unset, `0`, `1`, or an invalid value keeps the legacy single archive. Sharding applies only with `compression-level: 0`; the streaming restore (`CACHE_STREAM_RESTORE`) is not used for sharded entries.
+
 ## Compression level input
 
 All variants of this action (`foresight-sports/cache`, `foresight-sports/cache/restore`, and `foresight-sports/cache/save`) accept a `compression-level` input. Set it to any integer from `0` to `9`:

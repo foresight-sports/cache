@@ -3,6 +3,7 @@ import {
     GetObjectCommand,
     HeadObjectCommand,
     ListObjectsV2Command,
+    PutObjectCommand,
     S3Client
 } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
@@ -19,6 +20,14 @@ import {
     getDownloadOptions
 } from "../actionsCacheShims.js";
 import { downloadCacheHttpClientConcurrent } from "./downloadUtils";
+import {
+    isShardPartObjectKey,
+    parseShardManifest,
+    SHARD_MANIFEST_MAX_BYTES,
+    ShardManifest,
+    ShardPart,
+    SHARDS_KEY_SUFFIX
+} from "./shardedArchive";
 import { streamedRestore } from "./streamingRestore";
 import { transferArchive, TransferParams } from "./transferEngine";
 import { computeEffectivePartSize } from "./utils/partSize";
@@ -125,6 +134,35 @@ function getS3Prefix(
     return ["cache", repository, version].join("/");
 }
 
+/** Minimal shape of a ListObjectsV2 `Contents` element this backend reads. */
+export interface ListedObject {
+    Key?: string;
+    LastModified?: Date;
+}
+
+/**
+ * Pick the most recently modified object among a prefix listing, ignoring
+ * shard part objects (`<key>.shards/part-NN.tzst`). A sharded entry stores
+ * its parts under the entry key plus `.shards/`, so they match the same
+ * restore-key prefix and are uploaded BEFORE the manifest; without this
+ * filter a part could be chosen as "the newest key" and handed to the
+ * download as if it were a whole archive. Returns undefined when nothing
+ * eligible is listed.
+ */
+export function selectNewestArchiveObject(
+    contents: ListedObject[]
+): string | undefined {
+    const candidates = contents.filter(
+        object => !!object.Key && !isShardPartObjectKey(object.Key)
+    );
+    if (candidates.length === 0) {
+        return undefined;
+    }
+    // Sort keys by LastModified time in descending order
+    candidates.sort((a, b) => Number(b.LastModified) - Number(a.LastModified));
+    return candidates[0].Key;
+}
+
 export async function getCacheEntry(
     keys,
     paths,
@@ -147,13 +185,9 @@ export async function getCacheEntry(
             const { Contents = [] } = await s3Client.send(
                 new ListObjectsV2Command(listObjectsParams)
             );
-            if (Contents.length > 0) {
-                // Sort keys by LastModified time in descending order
-                const sortedKeys = Contents.sort(
-                    (a, b) => Number(b.LastModified) - Number(a.LastModified)
-                );
-                const s3Path = sortedKeys[0].Key; // Return the most recent key
-                cacheEntry.cacheKey = s3Path?.replace(`${s3Prefix}/`, "");
+            const s3Path = selectNewestArchiveObject(Contents); // The most recent key
+            if (s3Path) {
+                cacheEntry.cacheKey = s3Path.replace(`${s3Prefix}/`, "");
                 cacheEntry.archiveLocation = `s3://${bucketName}/${s3Path}`;
                 return cacheEntry;
             }
@@ -351,6 +385,80 @@ export async function downloadCacheStreaming(
     }
 }
 
+/**
+ * Probe the object a cache entry points at and return its sharded-archive
+ * manifest when it is one, or undefined for a legacy single archive (or on
+ * any error, so the legacy download path can surface its own clear failure).
+ * A manifest is a small JSON object; a HeadObject first keeps this a cheap
+ * check (multi-GB legacy archives are never fetched here), and only a body
+ * under SHARD_MANIFEST_MAX_BYTES that parses with the expected `format` is
+ * treated as sharded.
+ */
+export async function getShardManifest(
+    archiveLocation: string
+): Promise<ShardManifest | undefined> {
+    if (!bucketName) {
+        return undefined;
+    }
+    const bucket = bucketName;
+    const objectKey = new URL(archiveLocation).pathname.slice(1);
+
+    let contentLength: number | undefined;
+    try {
+        const head = await s3Client.send(
+            new HeadObjectCommand({ Bucket: bucket, Key: objectKey })
+        );
+        contentLength = head.ContentLength;
+    } catch (error) {
+        core.debug(
+            `Sharded-archive probe skipped (HeadObject failed: ${
+                (error as Error).message
+            }); treating the entry as a single archive.`
+        );
+        return undefined;
+    }
+    if (
+        typeof contentLength !== "number" ||
+        contentLength <= 0 ||
+        contentLength > SHARD_MANIFEST_MAX_BYTES
+    ) {
+        return undefined;
+    }
+
+    try {
+        const object = await s3Client.send(
+            new GetObjectCommand({ Bucket: bucket, Key: objectKey })
+        );
+        const body = await readObjectBody(object.Body);
+        return parseShardManifest(body);
+    } catch (error) {
+        core.debug(
+            `Sharded-archive probe skipped (GetObject failed: ${
+                (error as Error).message
+            }); treating the entry as a single archive.`
+        );
+        return undefined;
+    }
+}
+
+// Collect a GetObject body as a UTF-8 string: the SDK mixes in
+// transformToString() on Node streams; fall back to draining the stream so a
+// bare Readable (e.g. a test double) works too.
+async function readObjectBody(body: unknown): Promise<string> {
+    if (body === undefined || body === null) {
+        return "";
+    }
+    const mixed = body as { transformToString?: () => Promise<string> };
+    if (typeof mixed.transformToString === "function") {
+        return mixed.transformToString();
+    }
+    const chunks: Buffer[] = [];
+    for await (const chunk of body as AsyncIterable<Buffer | string>) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks).toString("utf8");
+}
+
 export async function saveCache(
     key: string,
     paths: string[],
@@ -371,15 +479,110 @@ export async function saveCache(
         throw new Error("Environment variable RUNS_ON_AWS_REGION not set");
     }
 
-    // Narrow the module-level env const to non-undefined for use inside the
-    // closure below (the guard above already asserted it).
-    const bucket = bucketName;
-
     const s3Prefix = getS3Prefix(paths, {
         compressionMethod,
         enableCrossOsArchive
     });
     const s3Key = `${s3Prefix}/${key}`;
+
+    await uploadArchiveObject(s3Key, archivePath, uploadChunkSize);
+
+    core.info(`Cache saved successfully.`);
+}
+
+/**
+ * Save a sharded cache entry: upload every part to
+ * `<s3prefix>/<key>.shards/<part name>` (through the same engine chain as a
+ * single archive), THEN write the JSON manifest as the object at
+ * `<s3prefix>/<key>` — the very key a legacy archive would occupy. The
+ * manifest goes last so a listing can never find a manifest whose parts are
+ * still missing; a save that dies mid-way leaves only orphan parts, which the
+ * entry lookup ignores.
+ */
+export async function saveShardedCache(
+    key: string,
+    paths: string[],
+    parts: ShardPart[],
+    manifest: ShardManifest,
+    {
+        compressionMethod,
+        enableCrossOsArchive,
+        uploadChunkSize
+    }: {
+        compressionMethod: CompressionMethod;
+        enableCrossOsArchive: boolean;
+        uploadChunkSize?: number;
+    }
+): Promise<void> {
+    if (!bucketName) {
+        throw new Error("Environment variable RUNS_ON_S3_BUCKET_CACHE not set");
+    }
+
+    if (!region) {
+        throw new Error("Environment variable RUNS_ON_AWS_REGION not set");
+    }
+
+    const bucket = bucketName;
+    const s3Prefix = getS3Prefix(paths, {
+        compressionMethod,
+        enableCrossOsArchive
+    });
+    const s3Key = `${s3Prefix}/${key}`;
+
+    core.info(
+        `Cache Size: ~${Math.round(
+            manifest.totalBytes / (1024 * 1024)
+        )} MB (${manifest.totalBytes} B) across ${parts.length} part(s)`
+    );
+
+    // Parts are uploaded one after another: each upload is already a
+    // many-way multipart transfer that saturates the send side, and the
+    // aws-cli engine rewrites its shared config before every transfer.
+    const uploadStartedAt = Date.now();
+    for (const part of parts) {
+        await uploadArchiveObject(
+            `${s3Key}${SHARDS_KEY_SUFFIX}${part.name}`,
+            part.path,
+            uploadChunkSize
+        );
+    }
+
+    const manifestBody = JSON.stringify(manifest);
+    core.info(`Uploading shard manifest to ${bucket}/${s3Key}`);
+    await s3Client.send(
+        new PutObjectCommand({
+            Bucket: bucket,
+            Key: s3Key,
+            Body: manifestBody,
+            ContentType: "application/json"
+        })
+    );
+
+    core.info(
+        `Cache saved successfully (${parts.length} part(s) + manifest uploaded in ${(
+            (Date.now() - uploadStartedAt) /
+            1000
+        ).toFixed(1)}s).`
+    );
+}
+
+/**
+ * Upload one local archive file to `s3Key` through the engine chain
+ * (s5cmd -> aws-cli -> node lib-storage). Shared by the single-archive save
+ * and every part of a sharded save.
+ */
+async function uploadArchiveObject(
+    s3Key: string,
+    archivePath: string,
+    uploadChunkSize?: number
+): Promise<void> {
+    if (!bucketName) {
+        throw new Error("Environment variable RUNS_ON_S3_BUCKET_CACHE not set");
+    }
+
+    // Narrow the module-level env const to non-undefined for use inside the
+    // closure below (the guard above already asserted it).
+    const bucket = bucketName;
 
     // Stat the archive up front so we can both report its size and size the
     // multipart upload against it.
@@ -474,8 +677,6 @@ export async function saveCache(
         },
         nodeUpload
     );
-
-    core.info(`Cache saved successfully.`);
 }
 
 class UploadProgress {

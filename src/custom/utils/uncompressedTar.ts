@@ -195,6 +195,47 @@ export async function createTar(
     });
 }
 
+/**
+ * Create ONE shard of a sharded archive: tar exactly the paths listed in
+ * `fileListName` (one per line, relative to the workspace, no recursion) into
+ * `archiveName`, both inside `archiveFolder`, compressing with the given
+ * `zstd ...` program. Same tar tool, `--posix`, `-P -C <workspace>` and
+ * platform args as createTar; `--no-recursion` because the caller has already
+ * enumerated every file (and empty directory) explicitly so it can balance the
+ * shards by size. Several of these run concurrently.
+ */
+export async function createTarFromFileList(
+    archiveFolder: string,
+    fileListName: string,
+    archiveName: string,
+    compressProgram: string
+): Promise<void> {
+    const tool = await getTarTool();
+    await warnIfZstdMissing();
+    const workingDirectory = normalizeForTar(getWorkingDirectory());
+
+    const args = [
+        "--posix",
+        "--no-recursion",
+        "--use-compress-program",
+        compressProgram,
+        "-cf",
+        normalizeForTar(archiveName),
+        "-P",
+        "-C",
+        workingDirectory,
+        "--files-from",
+        normalizeForTar(fileListName)
+    ];
+
+    appendPlatformSpecificArgs(tool, args);
+
+    await runTar(tool, args, {
+        cwd: archiveFolder,
+        env: getExecEnv()
+    });
+}
+
 export async function extractTar(
     archivePath: string,
     _compressionMethod: CompressionMethod

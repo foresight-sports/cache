@@ -75008,14 +75008,14 @@ var CacheFilename;
     CacheFilename["Gzip"] = "cache.tgz";
     CacheFilename["Zstd"] = "cache.tzst";
 })(CacheFilename || (CacheFilename = {}));
-var CompressionMethod;
+var constants_CompressionMethod;
 (function (CompressionMethod) {
     CompressionMethod["Gzip"] = "gzip";
     // Long range mode was added to zstd in v1.3.2.
     // This enum is for earlier version of zstd that does not have --long support
     CompressionMethod["ZstdWithoutLong"] = "zstd-without-long";
     CompressionMethod["Zstd"] = "zstd";
-})(CompressionMethod || (CompressionMethod = {}));
+})(constants_CompressionMethod || (constants_CompressionMethod = {}));
 var ArchiveToolType;
 (function (ArchiveToolType) {
     ArchiveToolType["GNU"] = "gnu";
@@ -75166,15 +75166,15 @@ function getCompressionMethod() {
         const version = semver.clean(versionOutput);
         core_debug(`zstd version: ${version}`);
         if (versionOutput === '') {
-            return CompressionMethod.Gzip;
+            return constants_CompressionMethod.Gzip;
         }
         else {
-            return CompressionMethod.ZstdWithoutLong;
+            return constants_CompressionMethod.ZstdWithoutLong;
         }
     });
 }
 function getCacheFileName(compressionMethod) {
-    return compressionMethod === CompressionMethod.Gzip
+    return compressionMethod === constants_CompressionMethod.Gzip
         ? CacheFilename.Gzip
         : CacheFilename.Zstd;
 }
@@ -126064,7 +126064,7 @@ function getTarArgs(tarPath_1, compressionMethod_1, type_1) {
         const workingDirectory = getWorkingDirectory();
         // Speficic args for BSD tar on windows for workaround
         const BSD_TAR_ZSTD = tarPath.type === ArchiveToolType.BSD &&
-            compressionMethod !== CompressionMethod.Gzip &&
+            compressionMethod !== constants_CompressionMethod.Gzip &&
             tar_IS_WINDOWS;
         // Method specific args
         switch (type) {
@@ -126110,7 +126110,7 @@ function getCommands(compressionMethod_1, type_1) {
             ? yield getDecompressionProgram(tarPath, compressionMethod, archivePath)
             : yield getCompressionProgram(tarPath, compressionMethod);
         const BSD_TAR_ZSTD = tarPath.type === ArchiveToolType.BSD &&
-            compressionMethod !== CompressionMethod.Gzip &&
+            compressionMethod !== constants_CompressionMethod.Gzip &&
             tar_IS_WINDOWS;
         if (BSD_TAR_ZSTD && type !== 'create') {
             args = [[...compressionArgs].join(' '), [...tarArgs].join(' ')];
@@ -126136,10 +126136,10 @@ function getDecompressionProgram(tarPath, compressionMethod, archivePath) {
         // --long=#: Enables long distance matching with # bits. Maximum is 30 (1GB) on 32-bit OS and 31 (2GB) on 64-bit.
         // Using 30 here because we also support 32-bit self-hosted runners.
         const BSD_TAR_ZSTD = tarPath.type === ArchiveToolType.BSD &&
-            compressionMethod !== CompressionMethod.Gzip &&
+            compressionMethod !== constants_CompressionMethod.Gzip &&
             tar_IS_WINDOWS;
         switch (compressionMethod) {
-            case CompressionMethod.Zstd:
+            case constants_CompressionMethod.Zstd:
                 return BSD_TAR_ZSTD
                     ? [
                         'zstd -d --long=30 --force -o',
@@ -126150,7 +126150,7 @@ function getDecompressionProgram(tarPath, compressionMethod, archivePath) {
                         '--use-compress-program',
                         tar_IS_WINDOWS ? '"zstd -d --long=30"' : 'unzstd --long=30'
                     ];
-            case CompressionMethod.ZstdWithoutLong:
+            case constants_CompressionMethod.ZstdWithoutLong:
                 return BSD_TAR_ZSTD
                     ? [
                         'zstd -d --force -o',
@@ -126173,10 +126173,10 @@ function getCompressionProgram(tarPath, compressionMethod) {
     return tar_awaiter(this, void 0, void 0, function* () {
         const cacheFileName = getCacheFileName(compressionMethod);
         const BSD_TAR_ZSTD = tarPath.type === ArchiveToolType.BSD &&
-            compressionMethod !== CompressionMethod.Gzip &&
+            compressionMethod !== constants_CompressionMethod.Gzip &&
             tar_IS_WINDOWS;
         switch (compressionMethod) {
-            case CompressionMethod.Zstd:
+            case constants_CompressionMethod.Zstd:
                 return BSD_TAR_ZSTD
                     ? [
                         'zstd -T0 --long=30 --force -o',
@@ -126187,7 +126187,7 @@ function getCompressionProgram(tarPath, compressionMethod) {
                         '--use-compress-program',
                         tar_IS_WINDOWS ? '"zstd -T0 --long=30"' : 'zstdmt --long=30'
                     ];
-            case CompressionMethod.ZstdWithoutLong:
+            case constants_CompressionMethod.ZstdWithoutLong:
                 return BSD_TAR_ZSTD
                     ? [
                         'zstd -T0 --force -o',
@@ -127089,6 +127089,668 @@ const downloadUtils_promiseWithTimeout = async (timeoutMs, promise) => {
     });
 };
 
+;// CONCATENATED MODULE: ./src/custom/utils/uncompressedTar.ts
+
+
+
+
+
+
+const ENV_ZSTD_COMPRESS_ARGS = "CACHE_ZSTD_COMPRESS_ARGS";
+const DEFAULT_ZSTD_COMPRESS_ARGS = "-T0 -3 --long=30";
+// Each token must look like a zstd option: no shell metacharacters, no paths.
+const ZSTD_ARG_TOKEN = /^-{1,2}[A-Za-z0-9][A-Za-z0-9=,.-]*$/;
+/**
+ * zstd flags used when creating the archive. `CACHE_ZSTD_COMPRESS_ARGS` (e.g.
+ * `-T0 -1` to trade a few percent of size for a much faster save, or `-T0 -3`
+ * to drop the 1 GiB long-range window) replaces the default when every
+ * whitespace-separated token is a plain option; anything else is ignored with a
+ * warning so a typo can never break a save. The decompressor always passes
+ * --long=30 and therefore reads either archive shape.
+ */
+function getZstdCompressArgs(env = process.env) {
+    const raw = (env[ENV_ZSTD_COMPRESS_ARGS] ?? "").trim();
+    if (raw === "") {
+        return DEFAULT_ZSTD_COMPRESS_ARGS;
+    }
+    const tokens = raw.split(/\s+/);
+    if (tokens.every(token => ZSTD_ARG_TOKEN.test(token))) {
+        return tokens.join(" ");
+    }
+    warning(`${ENV_ZSTD_COMPRESS_ARGS}='${raw}' contains a non-option token; using the default '${DEFAULT_ZSTD_COMPRESS_ARGS}'.`);
+    return DEFAULT_ZSTD_COMPRESS_ARGS;
+}
+function getZstdCompressProgram(env = process.env) {
+    return `zstd ${getZstdCompressArgs(env)}`;
+}
+async function getTarTool() {
+    switch (process.platform) {
+        case "win32": {
+            const gnuTar = await getGnuTarPathOnWindows();
+            if (gnuTar) {
+                return {
+                    path: gnuTar,
+                    type: ArchiveToolType.GNU
+                };
+            }
+            if ((0,external_fs_namespaceObject.existsSync)(SystemTarPathOnWindows)) {
+                return {
+                    path: SystemTarPathOnWindows,
+                    type: ArchiveToolType.BSD
+                };
+            }
+            break;
+        }
+        case "darwin": {
+            const gnuTar = await which("gtar", false);
+            if (gnuTar) {
+                return { path: gnuTar, type: ArchiveToolType.GNU };
+            }
+            return {
+                path: await which("tar", true),
+                type: ArchiveToolType.BSD
+            };
+        }
+        default:
+            break;
+    }
+    return {
+        path: await which("tar", true),
+        type: ArchiveToolType.GNU
+    };
+}
+function uncompressedTar_getWorkingDirectory() {
+    return process.env["GITHUB_WORKSPACE"] ?? process.cwd();
+}
+function normalizeForTar(targetPath) {
+    return targetPath.replace(new RegExp(`\\${external_path_.sep}`, "g"), "/");
+}
+function appendPlatformSpecificArgs(tool, args) {
+    if (tool.type === ArchiveToolType.GNU) {
+        if (process.platform === "win32") {
+            args.push("--force-local");
+        }
+        else if (process.platform === "darwin") {
+            args.push("--delay-directory-restore");
+        }
+    }
+}
+function sanitizeEnv(env) {
+    const sanitized = {};
+    for (const [key, value] of Object.entries(env)) {
+        if (value !== undefined) {
+            sanitized[key] = value;
+        }
+    }
+    return sanitized;
+}
+function getExecEnv() {
+    return sanitizeEnv({ ...process.env, MSYS: "winsymlinks:nativestrict" });
+}
+// createTar shells out to `zstd` (the no-compression fast path compresses with
+// multithreaded zstd). If zstd isn't on PATH the tar invocation fails and the
+// cache is silently skipped upstream — surface one clear warning so the cause is
+// obvious in the log instead of a generic tar error. Emitted at most once.
+let zstdMissingWarned = false;
+async function warnIfZstdMissing() {
+    if (zstdMissingWarned) {
+        return;
+    }
+    const zstdPath = await which("zstd", false);
+    if (!zstdPath) {
+        zstdMissingWarned = true;
+        warning("zstd not found on PATH — cache disabled for this run. Install zstd to enable caching.");
+    }
+}
+async function runTar(tool, args, options) {
+    await exec_exec(`"${tool.path}"`, args, options);
+}
+async function uncompressedTar_createTar(archiveFolder, sourceDirectories, compressionMethod) {
+    const tool = await getTarTool();
+    await warnIfZstdMissing();
+    const cacheFileName = getCacheFileName(compressionMethod);
+    const normalizedArchiveName = normalizeForTar(cacheFileName);
+    const normalizedManifestPath = normalizeForTar(external_path_.join(archiveFolder, ManifestFilename));
+    const workingDirectory = normalizeForTar(uncompressedTar_getWorkingDirectory());
+    (0,external_fs_namespaceObject.writeFileSync)(normalizedManifestPath, sourceDirectories.join("\n"));
+    const compressProgram = getZstdCompressProgram();
+    info(`Cache archive compressor: ${compressProgram}`);
+    const args = [
+        "--posix",
+        // Multithreaded zstd (-T0 = all cores) at the fast level 3, with long-range
+        // matching (--long=30 = 1 GiB window) by default; overridable per job via
+        // CACHE_ZSTD_COMPRESS_ARGS. tar splits this value on whitespace and runs it
+        // as the compression filter. The decompressor in extractTar/listTar stays
+        // `zstd -d --long=30`, which reads archives produced with or without --long.
+        "--use-compress-program",
+        compressProgram,
+        "-cf",
+        normalizedArchiveName,
+        "--exclude",
+        normalizedArchiveName,
+        "-P",
+        "-C",
+        workingDirectory,
+        "--files-from",
+        ManifestFilename
+    ];
+    appendPlatformSpecificArgs(tool, args);
+    await runTar(tool, args, {
+        cwd: archiveFolder,
+        env: getExecEnv()
+    });
+}
+/**
+ * Create ONE shard of a sharded archive: tar exactly the paths listed in
+ * `fileListName` (one per line, relative to the workspace, no recursion) into
+ * `archiveName`, both inside `archiveFolder`, compressing with the given
+ * `zstd ...` program. Same tar tool, `--posix`, `-P -C <workspace>` and
+ * platform args as createTar; `--no-recursion` because the caller has already
+ * enumerated every file (and empty directory) explicitly so it can balance the
+ * shards by size. Several of these run concurrently.
+ */
+async function createTarFromFileList(archiveFolder, fileListName, archiveName, compressProgram) {
+    const tool = await getTarTool();
+    await warnIfZstdMissing();
+    const workingDirectory = normalizeForTar(uncompressedTar_getWorkingDirectory());
+    const args = [
+        "--posix",
+        "--no-recursion",
+        "--use-compress-program",
+        compressProgram,
+        "-cf",
+        normalizeForTar(archiveName),
+        "-P",
+        "-C",
+        workingDirectory,
+        "--files-from",
+        normalizeForTar(fileListName)
+    ];
+    appendPlatformSpecificArgs(tool, args);
+    await runTar(tool, args, {
+        cwd: archiveFolder,
+        env: getExecEnv()
+    });
+}
+async function uncompressedTar_extractTar(archivePath, _compressionMethod) {
+    void _compressionMethod;
+    const tool = await getTarTool();
+    const workingDirectory = normalizeForTar(uncompressedTar_getWorkingDirectory());
+    await mkdirP(workingDirectory);
+    const args = [
+        // Decompress with zstd (long-range window must match the create side).
+        // `zstd -d` is used rather than `unzstd` because it is the form proven on the
+        // Windows Git tar bundle used by the runner (the toolkit's own zstd path and
+        // the observed restore log both invoke `zstd -d`), and it is equally valid on
+        // Linux/macOS.
+        "--use-compress-program",
+        "zstd -d --long=30",
+        "-xf",
+        normalizeForTar(archivePath),
+        "-P",
+        "-C",
+        workingDirectory
+    ];
+    appendPlatformSpecificArgs(tool, args);
+    await runTar(tool, args, {
+        env: getExecEnv()
+    });
+}
+// Core tar argv for reading the COMPRESSED archive from stdin (`-xf -`) instead
+// of a file, decompressing via the exact same `zstd -d --long=30` filter as the
+// file-based extractTar. The `--long=30` window MUST match the create side; it
+// is preserved unchanged here (no save-side/format change). Split out (pure, no
+// I/O) so the streaming extract args are unit-testable without a real tar/zstd.
+function buildStreamExtractCoreArgs(workingDirectory) {
+    return [
+        "--use-compress-program",
+        "zstd -d --long=30",
+        "-xf",
+        "-",
+        "-P",
+        "-C",
+        workingDirectory
+    ];
+}
+/**
+ * Build the tar command that extracts the archive from STDIN, for the streamed
+ * `<downloader> | tar -xf -` restore pipeline. Same tar tool, same
+ * `zstd -d --long=30` decompressor, same `-P -C <workspace>` target as the
+ * file-based extractTar — only the input source changes (stdin, not a file), so
+ * no scratch archive is written or read. Returns a spawn-ready spec; the caller
+ * (streamingRestore.runPipeline) wires the downloader's stdout into this tar's
+ * stdin via Node stream piping (no shell pipe, no FIFO).
+ */
+async function buildExtractTarStreamCommand() {
+    const tool = await getTarTool();
+    const workingDirectory = normalizeForTar(uncompressedTar_getWorkingDirectory());
+    await mkdirP(workingDirectory);
+    const args = buildStreamExtractCoreArgs(workingDirectory);
+    appendPlatformSpecificArgs(tool, args);
+    return { command: tool.path, args, env: getExecEnv() };
+}
+async function uncompressedTar_listTar(archivePath, _compressionMethod) {
+    void _compressionMethod;
+    const tool = await getTarTool();
+    // Same zstd decompressor as extractTar so debug listing works on the
+    // now-compressed archive.
+    const args = [
+        "--use-compress-program",
+        "zstd -d --long=30",
+        "-tf",
+        normalizeForTar(archivePath),
+        "-P"
+    ];
+    appendPlatformSpecificArgs(tool, args);
+    await runTar(tool, args, {
+        env: getExecEnv()
+    });
+}
+
+;// CONCATENATED MODULE: ./src/custom/shardedArchive.ts
+// Sharded archive mode: N parallel `tar | zstd` streams instead of one.
+//
+// A single GNU tar stream is serial by construction: one reader walks the
+// tree and one zstd filter compresses it (zstd -T0 parallelizes the
+// compression, but the tar side and the extract side stay single-threaded).
+// For a huge cache directory (Premier's Unity Library: hundreds of GB, ~50k
+// mostly-large files) that serial pipeline costs ~12 min to create and ~10 min
+// to extract per job, while the disks and the cores sit mostly idle.
+//
+// With `CACHE_ARCHIVE_SHARDS=N` (2..64) the save side enumerates every file
+// under the cache paths, splits them into N size-balanced groups (greedy
+// largest-first bin packing), and runs N independent
+// `tar --no-recursion --files-from shard-<i>.txt | zstd` processes at once.
+// Each part is uploaded to `<s3prefix>/<key>.shards/part-<i>.tzst`, and a
+// small JSON manifest is written LAST as the object at `<s3prefix>/<key>` —
+// the exact S3 key the legacy single archive uses — so a listing that finds
+// the manifest always finds a complete set of parts, and a partial upload never
+// looks like a valid cache entry. The restore side recognizes the manifest,
+// downloads every part, and extracts all of them concurrently with the legacy
+// extract command.
+//
+// Everything here is opt-in: with the knob unset (or 0 / 1 / invalid) the save
+// and restore paths are byte-for-byte the legacy single-archive behavior, and a
+// restore always accepts both shapes because it decides per entry by looking at
+// the stored object, never at the knob.
+
+
+
+
+
+
+/** Env var: number of parallel tar|zstd shards (integer 2..64); anything else = legacy. */
+const ENV_ARCHIVE_SHARDS = "CACHE_ARCHIVE_SHARDS";
+const MIN_ARCHIVE_SHARDS = 2;
+const MAX_ARCHIVE_SHARDS = 64;
+/** `format` field of the manifest object stored at the legacy archive key. */
+const SHARDED_ARCHIVE_FORMAT = "sharded-tzst-v1";
+/** Appended to the entry's S3 key to form the part prefix: `<key>.shards/part-00.tzst`. */
+const shardedArchive_SHARDS_KEY_SUFFIX = ".shards/";
+/** Objects at or above this size are never inspected as a manifest candidate. */
+const shardedArchive_SHARD_MANIFEST_MAX_BYTES = (/* unused pure expression or super */ null && (1024 * 1024));
+/** How many parts are downloaded at once on restore (each download is itself
+ *  a highly concurrent multipart transfer, so a small fan-out is enough). */
+const shardedArchive_SHARD_DOWNLOAD_CONCURRENCY = 2;
+// ---------------------------------------------------------------------------
+// Pure helpers (unit-tested without a real tar/zstd/S3).
+// ---------------------------------------------------------------------------
+/**
+ * Parse `CACHE_ARCHIVE_SHARDS`. Returns the shard count (2..64) when set to a
+ * valid integer in range; returns 1 (= legacy single archive) when unset,
+ * blank, 0, 1, or invalid. An out-of-range or non-integer value warns once per
+ * call so a typo is visible in the log but can never break a save.
+ */
+function getArchiveShardCount(env = process.env) {
+    const raw = (env[ENV_ARCHIVE_SHARDS] ?? "").trim();
+    if (raw === "") {
+        return 1;
+    }
+    if (!/^\d+$/.test(raw)) {
+        warning(`${ENV_ARCHIVE_SHARDS}='${raw}' is not an integer; using a single archive.`);
+        return 1;
+    }
+    const count = Number(raw);
+    if (count <= 1) {
+        return 1;
+    }
+    if (count > MAX_ARCHIVE_SHARDS) {
+        warning(`${ENV_ARCHIVE_SHARDS}=${count} exceeds the maximum of ${MAX_ARCHIVE_SHARDS}; using a single archive.`);
+        return 1;
+    }
+    return count;
+}
+/** True for a shard part object (`<key>.shards/part-NN.tzst`), which must
+ *  never be picked as "the newest cache entry" by a prefix listing. */
+function shardedArchive_isShardPartObjectKey(key) {
+    return key.includes(shardedArchive_SHARDS_KEY_SUFFIX);
+}
+/** Object name of shard `index`: `part-00.tzst`, `part-01.tzst`, ... */
+function shardPartName(index) {
+    return `part-${String(index).padStart(2, "0")}.tzst`;
+}
+/** File name of the `--files-from` list for shard `index`. */
+function shardListName(index) {
+    return `shard-${String(index).padStart(2, "0")}.txt`;
+}
+const PART_NAME_PATTERN = /^part-\d{2,}\.tzst$/;
+/**
+ * Decide whether an object body is a sharded-archive manifest. Anything that
+ * is not UTF-8 JSON with `format === "sharded-tzst-v1"` and a well-formed,
+ * non-empty `shards` array (safe names, numeric sizes) is NOT a manifest — a
+ * legacy zstd archive, whose bytes never parse as JSON, returns undefined.
+ */
+function shardedArchive_parseShardManifest(body) {
+    const text = typeof body === "string" ? body : body.toString("utf8");
+    let parsed;
+    try {
+        parsed = JSON.parse(text);
+    }
+    catch {
+        return undefined;
+    }
+    if (typeof parsed !== "object" || parsed === null) {
+        return undefined;
+    }
+    const candidate = parsed;
+    if (candidate.format !== SHARDED_ARCHIVE_FORMAT) {
+        return undefined;
+    }
+    if (!Array.isArray(candidate.shards) || candidate.shards.length === 0) {
+        return undefined;
+    }
+    const shards = [];
+    for (const entry of candidate.shards) {
+        if (typeof entry !== "object" || entry === null) {
+            return undefined;
+        }
+        const { name, bytes, files } = entry;
+        if (typeof name !== "string" ||
+            !PART_NAME_PATTERN.test(name) ||
+            typeof bytes !== "number" ||
+            !Number.isFinite(bytes) ||
+            bytes < 0 ||
+            typeof files !== "number" ||
+            !Number.isFinite(files) ||
+            files < 0) {
+            return undefined;
+        }
+        shards.push({ name, bytes, files });
+    }
+    const totalBytes = typeof candidate.totalBytes === "number"
+        ? candidate.totalBytes
+        : shards.reduce((sum, shard) => sum + shard.bytes, 0);
+    const totalFiles = typeof candidate.totalFiles === "number"
+        ? candidate.totalFiles
+        : shards.reduce((sum, shard) => sum + shard.files, 0);
+    return {
+        format: SHARDED_ARCHIVE_FORMAT,
+        shards,
+        totalBytes,
+        totalFiles,
+        createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : ""
+    };
+}
+/**
+ * Greedy largest-first bin packing: files are visited by size descending
+ * (ties broken by path, so the result is deterministic for a given input set)
+ * and each goes to the shard that currently holds the fewest bytes (ties to
+ * the lowest index). Empty directories always go to shard 0. Shards that end
+ * up with nothing (fewer entries than shards) are dropped, so the returned
+ * array may be shorter than `shardCount` but is never empty when there is
+ * anything to archive.
+ */
+function assignFilesToShards(files, emptyDirs, shardCount) {
+    const count = Math.max(1, Math.floor(shardCount));
+    const shards = [];
+    for (let index = 0; index < count; index++) {
+        shards.push({ relPaths: [], bytes: 0, files: 0 });
+    }
+    const ordered = files
+        .slice()
+        .sort((a, b) => b.size - a.size ||
+        (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0));
+    for (const file of ordered) {
+        let target = 0;
+        for (let index = 1; index < shards.length; index++) {
+            if (shards[index].bytes < shards[target].bytes) {
+                target = index;
+            }
+        }
+        shards[target].relPaths.push(file.relPath);
+        shards[target].bytes += file.size;
+        shards[target].files += 1;
+    }
+    for (const dir of emptyDirs.slice().sort()) {
+        shards[0].relPaths.push(dir);
+    }
+    return shards.filter(shard => shard.relPaths.length > 0);
+}
+/**
+ * Cap zstd's thread count per shard so N concurrent compressors do not
+ * oversubscribe the box: a literal `-T0` (all cores) becomes
+ * `-T<max(1, floor(cpus / shardCount))>`. An explicit thread count the
+ * operator chose (`-T8`) is left alone, and so is every other token.
+ */
+function rewriteZstdThreadsForShards(compressArgs, shardCount, cpuCount = external_os_.cpus().length) {
+    const cores = Number.isFinite(cpuCount) && cpuCount > 0 ? cpuCount : 1;
+    const perShard = Math.max(1, Math.floor(cores / Math.max(1, Math.floor(shardCount))));
+    return compressArgs
+        .split(/\s+/)
+        .filter(token => token !== "")
+        .map(token => (token === "-T0" ? `-T${perShard}` : token))
+        .join(" ");
+}
+/**
+ * A `--files-from` list is newline-separated, so a path containing a newline
+ * cannot be expressed. Library paths never do; reject loudly rather than
+ * silently splitting one entry into two bogus ones.
+ */
+function assertShardablePaths(relPaths) {
+    for (const relPath of relPaths) {
+        if (relPath.includes("\n") || relPath.includes("\r")) {
+            throw new Error(`Cache path contains a newline and cannot be written to a shard file list: ${JSON.stringify(relPath)}`);
+        }
+    }
+}
+/** Run `worker` over `items` with at most `limit` in flight; rejects with the
+ *  first failure after every started worker has settled. */
+async function shardedArchive_mapWithConcurrency(items, limit, worker) {
+    const results = new Array(items.length);
+    const errors = [];
+    let next = 0;
+    const lanes = Math.max(1, Math.min(limit, items.length));
+    const runLane = async () => {
+        while (next < items.length) {
+            const index = next++;
+            try {
+                results[index] = await worker(items[index], index);
+            }
+            catch (error) {
+                errors.push(error);
+                return;
+            }
+        }
+    };
+    await Promise.all(Array.from({ length: lanes }, () => runLane()));
+    if (errors.length > 0) {
+        throw errors[0];
+    }
+    return results;
+}
+// ---------------------------------------------------------------------------
+// File enumeration.
+// ---------------------------------------------------------------------------
+function toManifestPath(relativePath) {
+    return relativePath.split(external_path_.sep).join("/");
+}
+function shardedArchive_getWorkingDirectory() {
+    return process.env["GITHUB_WORKSPACE"] ?? process.cwd();
+}
+/**
+ * Enumerate every regular file (and every empty directory) under the resolved
+ * cache paths, as forward-slash paths relative to tar's working directory —
+ * the same normalization the legacy manifest uses, so a sharded restore lands
+ * files exactly where a legacy one would. Directories are walked with stat()
+ * (not lstat) so Windows junctions and directory symlinks are descended, as
+ * the legacy junction expansion does; a vanished or broken entry is skipped.
+ */
+function enumerateCacheEntries(cachePaths, workspaceRoot = shardedArchive_getWorkingDirectory()) {
+    const files = [];
+    const emptyDirs = [];
+    const seen = new Set();
+    const relative = (absolutePath) => {
+        const rel = external_path_.relative(workspaceRoot, absolutePath);
+        return rel === "" ? "." : toManifestPath(rel);
+    };
+    const walk = (absoluteDir) => {
+        let children;
+        try {
+            children = external_fs_namespaceObject.readdirSync(absoluteDir, { withFileTypes: true });
+        }
+        catch {
+            return;
+        }
+        if (children.length === 0) {
+            const rel = relative(absoluteDir);
+            if (!seen.has(rel)) {
+                seen.add(rel);
+                emptyDirs.push(rel);
+            }
+            return;
+        }
+        for (const child of children) {
+            const absoluteChild = external_path_.join(absoluteDir, child.name);
+            let stats;
+            try {
+                stats = external_fs_namespaceObject.statSync(absoluteChild);
+            }
+            catch {
+                continue;
+            }
+            if (stats.isDirectory()) {
+                walk(absoluteChild);
+            }
+            else {
+                const rel = relative(absoluteChild);
+                if (!seen.has(rel)) {
+                    seen.add(rel);
+                    files.push({ relPath: rel, size: stats.size });
+                }
+            }
+        }
+    };
+    for (const cachePath of cachePaths) {
+        const absolutePath = external_path_.resolve(workspaceRoot, cachePath);
+        let stats;
+        try {
+            stats = external_fs_namespaceObject.statSync(absolutePath);
+        }
+        catch {
+            continue;
+        }
+        if (stats.isDirectory()) {
+            walk(absolutePath);
+        }
+        else {
+            const rel = relative(absolutePath);
+            if (!seen.has(rel)) {
+                seen.add(rel);
+                files.push({ relPath: rel, size: stats.size });
+            }
+        }
+    }
+    return { files, emptyDirs };
+}
+const defaultDeps = {
+    createTarFromFileList: createTarFromFileList,
+    extractTar: archivePath => uncompressedTar_extractTar(archivePath, constants_CompressionMethod.Zstd),
+    cpuCount: () => external_os_.cpus().length
+};
+function formatMb(bytes) {
+    return `${Math.round(bytes / (1024 * 1024))} MB`;
+}
+function elapsedSeconds(startedAtMs) {
+    return ((Date.now() - startedAtMs) / 1000).toFixed(1);
+}
+async function settleAll(tasks, describeFailure) {
+    const outcomes = await Promise.allSettled(tasks);
+    const failures = outcomes
+        .map((outcome, index) => ({ outcome, index }))
+        .filter(({ outcome }) => outcome.status === "rejected")
+        .map(({ outcome, index }) => describeFailure(index, outcome.reason));
+    if (failures.length > 0) {
+        throw new Error(failures.join("; "));
+    }
+}
+/**
+ * Archive `cachePaths` as `shardCount` size-balanced zstd tar parts inside
+ * `archiveFolder`, all created concurrently. Returns the manifest to store at
+ * the entry key plus the local part files to upload. Any shard failure rejects
+ * after every shard has settled (so no tar is left running while the caller
+ * cleans up).
+ */
+async function createShardedArchive(archiveFolder, cachePaths, shardCount, deps = defaultDeps) {
+    const workspaceRoot = shardedArchive_getWorkingDirectory();
+    const enumerateStartedAt = Date.now();
+    const { files, emptyDirs } = enumerateCacheEntries(cachePaths, workspaceRoot);
+    const rawBytes = files.reduce((sum, file) => sum + file.size, 0);
+    info(`Sharded archive: enumerated ${files.length} files (${formatMb(rawBytes)}) and ${emptyDirs.length} empty directories in ${elapsedSeconds(enumerateStartedAt)}s.`);
+    const assignments = assignFilesToShards(files, emptyDirs, shardCount);
+    if (assignments.length === 0) {
+        throw new Error("Path Validation Error: no files found under the cache path(s), hence no cache is being saved.");
+    }
+    assertShardablePaths(assignments.flatMap(shard => shard.relPaths));
+    const compressArgs = rewriteZstdThreadsForShards(getZstdCompressArgs(), assignments.length, deps.cpuCount());
+    const compressProgram = `zstd ${compressArgs}`;
+    info(`Sharded archive: ${assignments.length} shard(s) requested via ${ENV_ARCHIVE_SHARDS}=${shardCount}; compressor per shard: ${compressProgram}`);
+    for (let index = 0; index < assignments.length; index++) {
+        external_fs_namespaceObject.writeFileSync(external_path_.join(archiveFolder, shardListName(index)), assignments[index].relPaths.join("\n") + "\n");
+    }
+    const tarStartedAt = Date.now();
+    await settleAll(assignments.map((_, index) => deps.createTarFromFileList(archiveFolder, shardListName(index), shardPartName(index), compressProgram)), (index, error) => `shard ${index} tar failed: ${error.message}`);
+    const tarSeconds = elapsedSeconds(tarStartedAt);
+    const parts = assignments.map((shard, index) => {
+        const partPath = external_path_.join(archiveFolder, shardPartName(index));
+        return {
+            index,
+            name: shardPartName(index),
+            path: partPath,
+            bytes: external_fs_namespaceObject.statSync(partPath).size,
+            files: shard.files
+        };
+    });
+    for (const part of parts) {
+        const raw = assignments[part.index].bytes;
+        info(`  ${part.name}: ${part.files} files, ${formatMb(raw)} raw -> ${formatMb(part.bytes)} compressed (${part.bytes} B)`);
+    }
+    const totalBytes = parts.reduce((sum, part) => sum + part.bytes, 0);
+    const totalFiles = parts.reduce((sum, part) => sum + part.files, 0);
+    info(`Sharded archive: ${parts.length} part(s), ${formatMb(totalBytes)} compressed (${totalBytes} B) for ${totalFiles} files, created in ${tarSeconds}s.`);
+    const manifest = {
+        format: SHARDED_ARCHIVE_FORMAT,
+        shards: parts.map(part => ({
+            name: part.name,
+            bytes: part.bytes,
+            files: part.files
+        })),
+        totalBytes,
+        totalFiles,
+        createdAt: new Date().toISOString()
+    };
+    return { manifest, parts };
+}
+/**
+ * Extract every downloaded part concurrently with the legacy extract command
+ * (each part is an ordinary zstd tar, so the decompressor is unchanged).
+ * Rejects after every extraction has settled if any part failed.
+ */
+async function shardedArchive_extractShardedArchive(partPaths, deps = defaultDeps) {
+    const startedAt = Date.now();
+    await settleAll(partPaths.map(partPath => deps.extractTar(partPath)), (index, error) => `part ${path.basename(partPaths[index])} extract failed: ${error.message}`);
+    core.info(`Sharded archive: extracted ${partPaths.length} part(s) concurrently in ${elapsedSeconds(startedAt)}s.`);
+}
+
 ;// CONCATENATED MODULE: ./src/custom/transferEngine.ts
 // Transfer-engine fallback chain for the single cache archive (cache.tzst).
 //
@@ -127467,7 +128129,7 @@ function transferEngine_buildAwsCliStreamCpArgs(params) {
     args.push("--only-show-errors");
     return args;
 }
-function sanitizeEnv(env) {
+function transferEngine_sanitizeEnv(env) {
     const sanitized = {};
     for (const [key, value] of Object.entries(env)) {
         if (value !== undefined) {
@@ -127496,7 +128158,7 @@ function transferEngine_buildEngineEnv(params) {
         .slice(2)}`;
     const configFile = external_path_.join(external_os_.tmpdir(), `runs-on-aws-config-${unique}`);
     const credentialsFile = external_path_.join(external_os_.tmpdir(), `runs-on-aws-credentials-${unique}`);
-    const env = sanitizeEnv({
+    const env = transferEngine_sanitizeEnv({
         ...process.env,
         AWS_REGION: resolveRegion(params.region),
         AWS_CONFIG_FILE: configFile,
@@ -127562,7 +128224,7 @@ function logThroughput(engine, direction, params, startedAtMs) {
     const mbPerSec = (mb / elapsedSec).toFixed(1);
     info(`Cache ${direction} via ${engine}: ${bytes} B (~${Math.round(mb)} MB) in ${elapsedSec.toFixed(1)}s = ${mbPerSec} MB/s`);
 }
-const defaultDeps = {
+const transferEngine_defaultDeps = {
     findExecutable,
     runS5cmd,
     runAwsCli
@@ -127582,7 +128244,7 @@ const defaultDeps = {
  * engine (never a hard fail). The node fallback validates its own byte count,
  * and uploads never expose a partial object, so neither needs this hook.
  */
-async function transferEngine_transferArchive(direction, params, nodeFallback, deps = defaultDeps, verifyNativeDownload) {
+async function transferEngine_transferArchive(direction, params, nodeFallback, deps = transferEngine_defaultDeps, verifyNativeDownload) {
     const startedAtMs = Date.now();
     // Engine 1: s5cmd.
     const s5cmdPath = await deps.findExecutable("s5cmd");
@@ -127622,232 +128284,6 @@ async function transferEngine_transferArchive(direction, params, nodeFallback, d
     await nodeFallback();
     logThroughput("node", direction, params, startedAtMs);
     return "node";
-}
-
-;// CONCATENATED MODULE: ./src/custom/utils/uncompressedTar.ts
-
-
-
-
-
-
-const ENV_ZSTD_COMPRESS_ARGS = "CACHE_ZSTD_COMPRESS_ARGS";
-const DEFAULT_ZSTD_COMPRESS_ARGS = "-T0 -3 --long=30";
-// Each token must look like a zstd option: no shell metacharacters, no paths.
-const ZSTD_ARG_TOKEN = /^-{1,2}[A-Za-z0-9][A-Za-z0-9=,.-]*$/;
-/**
- * zstd flags used when creating the archive. `CACHE_ZSTD_COMPRESS_ARGS` (e.g.
- * `-T0 -1` to trade a few percent of size for a much faster save, or `-T0 -3`
- * to drop the 1 GiB long-range window) replaces the default when every
- * whitespace-separated token is a plain option; anything else is ignored with a
- * warning so a typo can never break a save. The decompressor always passes
- * --long=30 and therefore reads either archive shape.
- */
-function getZstdCompressArgs(env = process.env) {
-    const raw = (env[ENV_ZSTD_COMPRESS_ARGS] ?? "").trim();
-    if (raw === "") {
-        return DEFAULT_ZSTD_COMPRESS_ARGS;
-    }
-    const tokens = raw.split(/\s+/);
-    if (tokens.every(token => ZSTD_ARG_TOKEN.test(token))) {
-        return tokens.join(" ");
-    }
-    warning(`${ENV_ZSTD_COMPRESS_ARGS}='${raw}' contains a non-option token; using the default '${DEFAULT_ZSTD_COMPRESS_ARGS}'.`);
-    return DEFAULT_ZSTD_COMPRESS_ARGS;
-}
-function getZstdCompressProgram(env = process.env) {
-    return `zstd ${getZstdCompressArgs(env)}`;
-}
-async function getTarTool() {
-    switch (process.platform) {
-        case "win32": {
-            const gnuTar = await getGnuTarPathOnWindows();
-            if (gnuTar) {
-                return {
-                    path: gnuTar,
-                    type: ArchiveToolType.GNU
-                };
-            }
-            if ((0,external_fs_namespaceObject.existsSync)(SystemTarPathOnWindows)) {
-                return {
-                    path: SystemTarPathOnWindows,
-                    type: ArchiveToolType.BSD
-                };
-            }
-            break;
-        }
-        case "darwin": {
-            const gnuTar = await which("gtar", false);
-            if (gnuTar) {
-                return { path: gnuTar, type: ArchiveToolType.GNU };
-            }
-            return {
-                path: await which("tar", true),
-                type: ArchiveToolType.BSD
-            };
-        }
-        default:
-            break;
-    }
-    return {
-        path: await which("tar", true),
-        type: ArchiveToolType.GNU
-    };
-}
-function uncompressedTar_getWorkingDirectory() {
-    return process.env["GITHUB_WORKSPACE"] ?? process.cwd();
-}
-function normalizeForTar(targetPath) {
-    return targetPath.replace(new RegExp(`\\${external_path_.sep}`, "g"), "/");
-}
-function appendPlatformSpecificArgs(tool, args) {
-    if (tool.type === ArchiveToolType.GNU) {
-        if (process.platform === "win32") {
-            args.push("--force-local");
-        }
-        else if (process.platform === "darwin") {
-            args.push("--delay-directory-restore");
-        }
-    }
-}
-function uncompressedTar_sanitizeEnv(env) {
-    const sanitized = {};
-    for (const [key, value] of Object.entries(env)) {
-        if (value !== undefined) {
-            sanitized[key] = value;
-        }
-    }
-    return sanitized;
-}
-function getExecEnv() {
-    return uncompressedTar_sanitizeEnv({ ...process.env, MSYS: "winsymlinks:nativestrict" });
-}
-// createTar shells out to `zstd` (the no-compression fast path compresses with
-// multithreaded zstd). If zstd isn't on PATH the tar invocation fails and the
-// cache is silently skipped upstream — surface one clear warning so the cause is
-// obvious in the log instead of a generic tar error. Emitted at most once.
-let zstdMissingWarned = false;
-async function warnIfZstdMissing() {
-    if (zstdMissingWarned) {
-        return;
-    }
-    const zstdPath = await which("zstd", false);
-    if (!zstdPath) {
-        zstdMissingWarned = true;
-        warning("zstd not found on PATH — cache disabled for this run. Install zstd to enable caching.");
-    }
-}
-async function runTar(tool, args, options) {
-    await exec_exec(`"${tool.path}"`, args, options);
-}
-async function uncompressedTar_createTar(archiveFolder, sourceDirectories, compressionMethod) {
-    const tool = await getTarTool();
-    await warnIfZstdMissing();
-    const cacheFileName = getCacheFileName(compressionMethod);
-    const normalizedArchiveName = normalizeForTar(cacheFileName);
-    const normalizedManifestPath = normalizeForTar(external_path_.join(archiveFolder, ManifestFilename));
-    const workingDirectory = normalizeForTar(uncompressedTar_getWorkingDirectory());
-    (0,external_fs_namespaceObject.writeFileSync)(normalizedManifestPath, sourceDirectories.join("\n"));
-    const compressProgram = getZstdCompressProgram();
-    info(`Cache archive compressor: ${compressProgram}`);
-    const args = [
-        "--posix",
-        // Multithreaded zstd (-T0 = all cores) at the fast level 3, with long-range
-        // matching (--long=30 = 1 GiB window) by default; overridable per job via
-        // CACHE_ZSTD_COMPRESS_ARGS. tar splits this value on whitespace and runs it
-        // as the compression filter. The decompressor in extractTar/listTar stays
-        // `zstd -d --long=30`, which reads archives produced with or without --long.
-        "--use-compress-program",
-        compressProgram,
-        "-cf",
-        normalizedArchiveName,
-        "--exclude",
-        normalizedArchiveName,
-        "-P",
-        "-C",
-        workingDirectory,
-        "--files-from",
-        ManifestFilename
-    ];
-    appendPlatformSpecificArgs(tool, args);
-    await runTar(tool, args, {
-        cwd: archiveFolder,
-        env: getExecEnv()
-    });
-}
-async function uncompressedTar_extractTar(archivePath, _compressionMethod) {
-    void _compressionMethod;
-    const tool = await getTarTool();
-    const workingDirectory = normalizeForTar(uncompressedTar_getWorkingDirectory());
-    await mkdirP(workingDirectory);
-    const args = [
-        // Decompress with zstd (long-range window must match the create side).
-        // `zstd -d` is used rather than `unzstd` because it is the form proven on the
-        // Windows Git tar bundle used by the runner (the toolkit's own zstd path and
-        // the observed restore log both invoke `zstd -d`), and it is equally valid on
-        // Linux/macOS.
-        "--use-compress-program",
-        "zstd -d --long=30",
-        "-xf",
-        normalizeForTar(archivePath),
-        "-P",
-        "-C",
-        workingDirectory
-    ];
-    appendPlatformSpecificArgs(tool, args);
-    await runTar(tool, args, {
-        env: getExecEnv()
-    });
-}
-// Core tar argv for reading the COMPRESSED archive from stdin (`-xf -`) instead
-// of a file, decompressing via the exact same `zstd -d --long=30` filter as the
-// file-based extractTar. The `--long=30` window MUST match the create side; it
-// is preserved unchanged here (no save-side/format change). Split out (pure, no
-// I/O) so the streaming extract args are unit-testable without a real tar/zstd.
-function buildStreamExtractCoreArgs(workingDirectory) {
-    return [
-        "--use-compress-program",
-        "zstd -d --long=30",
-        "-xf",
-        "-",
-        "-P",
-        "-C",
-        workingDirectory
-    ];
-}
-/**
- * Build the tar command that extracts the archive from STDIN, for the streamed
- * `<downloader> | tar -xf -` restore pipeline. Same tar tool, same
- * `zstd -d --long=30` decompressor, same `-P -C <workspace>` target as the
- * file-based extractTar — only the input source changes (stdin, not a file), so
- * no scratch archive is written or read. Returns a spawn-ready spec; the caller
- * (streamingRestore.runPipeline) wires the downloader's stdout into this tar's
- * stdin via Node stream piping (no shell pipe, no FIFO).
- */
-async function buildExtractTarStreamCommand() {
-    const tool = await getTarTool();
-    const workingDirectory = normalizeForTar(uncompressedTar_getWorkingDirectory());
-    await mkdirP(workingDirectory);
-    const args = buildStreamExtractCoreArgs(workingDirectory);
-    appendPlatformSpecificArgs(tool, args);
-    return { command: tool.path, args, env: getExecEnv() };
-}
-async function uncompressedTar_listTar(archivePath, _compressionMethod) {
-    void _compressionMethod;
-    const tool = await getTarTool();
-    // Same zstd decompressor as extractTar so debug listing works on the
-    // now-compressed archive.
-    const args = [
-        "--use-compress-program",
-        "zstd -d --long=30",
-        "-tf",
-        normalizeForTar(archivePath),
-        "-P"
-    ];
-    appendPlatformSpecificArgs(tool, args);
-    await runTar(tool, args, {
-        env: getExecEnv()
-    });
 }
 
 ;// CONCATENATED MODULE: ./src/custom/streamingRestore.ts
@@ -128139,6 +128575,7 @@ function computeEffectivePartSize(cacheSize, configuredPartSize) {
 
 
 
+
 // if executing from RunsOn, unset any existing AWS credential env variables so that we can use the IAM instance profile for credentials
 // see unsetCredentials() in https://github.com/aws-actions/configure-aws-credentials/blob/v4.0.2/src/helpers.ts#L44
 // Note: we preserve AWS_REGION and AWS_DEFAULT_REGION as they are needed for SDK initialization
@@ -128206,6 +128643,24 @@ function getS3Prefix(paths, { compressionMethod, enableCrossOsArchive }) {
     const version = backend_getCacheVersion(paths, compressionMethod, enableCrossOsArchive);
     return ["cache", repository, version].join("/");
 }
+/**
+ * Pick the most recently modified object among a prefix listing, ignoring
+ * shard part objects (`<key>.shards/part-NN.tzst`). A sharded entry stores
+ * its parts under the entry key plus `.shards/`, so they match the same
+ * restore-key prefix and are uploaded BEFORE the manifest; without this
+ * filter a part could be chosen as "the newest key" and handed to the
+ * download as if it were a whole archive. Returns undefined when nothing
+ * eligible is listed.
+ */
+function selectNewestArchiveObject(contents) {
+    const candidates = contents.filter(object => !!object.Key && !isShardPartObjectKey(object.Key));
+    if (candidates.length === 0) {
+        return undefined;
+    }
+    // Sort keys by LastModified time in descending order
+    candidates.sort((a, b) => Number(b.LastModified) - Number(a.LastModified));
+    return candidates[0].Key;
+}
 async function backend_getCacheEntry(keys, paths, { compressionMethod, enableCrossOsArchive }) {
     const cacheEntry = {};
     // Find the most recent key matching one of the restoreKeys prefixes
@@ -128220,11 +128675,9 @@ async function backend_getCacheEntry(keys, paths, { compressionMethod, enableCro
         };
         try {
             const { Contents = [] } = await s3Client.send(new ListObjectsV2Command(listObjectsParams));
-            if (Contents.length > 0) {
-                // Sort keys by LastModified time in descending order
-                const sortedKeys = Contents.sort((a, b) => Number(b.LastModified) - Number(a.LastModified));
-                const s3Path = sortedKeys[0].Key; // Return the most recent key
-                cacheEntry.cacheKey = s3Path?.replace(`${s3Prefix}/`, "");
+            const s3Path = selectNewestArchiveObject(Contents); // The most recent key
+            if (s3Path) {
+                cacheEntry.cacheKey = s3Path.replace(`${s3Prefix}/`, "");
                 cacheEntry.archiveLocation = `s3://${bucketName}/${s3Path}`;
                 return cacheEntry;
             }
@@ -128372,6 +128825,62 @@ async function downloadCacheStreaming(archiveLocation) {
         return false;
     }
 }
+/**
+ * Probe the object a cache entry points at and return its sharded-archive
+ * manifest when it is one, or undefined for a legacy single archive (or on
+ * any error, so the legacy download path can surface its own clear failure).
+ * A manifest is a small JSON object; a HeadObject first keeps this a cheap
+ * check (multi-GB legacy archives are never fetched here), and only a body
+ * under SHARD_MANIFEST_MAX_BYTES that parses with the expected `format` is
+ * treated as sharded.
+ */
+async function getShardManifest(archiveLocation) {
+    if (!bucketName) {
+        return undefined;
+    }
+    const bucket = bucketName;
+    const objectKey = new URL(archiveLocation).pathname.slice(1);
+    let contentLength;
+    try {
+        const head = await s3Client.send(new HeadObjectCommand({ Bucket: bucket, Key: objectKey }));
+        contentLength = head.ContentLength;
+    }
+    catch (error) {
+        core.debug(`Sharded-archive probe skipped (HeadObject failed: ${error.message}); treating the entry as a single archive.`);
+        return undefined;
+    }
+    if (typeof contentLength !== "number" ||
+        contentLength <= 0 ||
+        contentLength > SHARD_MANIFEST_MAX_BYTES) {
+        return undefined;
+    }
+    try {
+        const object = await s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: objectKey }));
+        const body = await readObjectBody(object.Body);
+        return parseShardManifest(body);
+    }
+    catch (error) {
+        core.debug(`Sharded-archive probe skipped (GetObject failed: ${error.message}); treating the entry as a single archive.`);
+        return undefined;
+    }
+}
+// Collect a GetObject body as a UTF-8 string: the SDK mixes in
+// transformToString() on Node streams; fall back to draining the stream so a
+// bare Readable (e.g. a test double) works too.
+async function readObjectBody(body) {
+    if (body === undefined || body === null) {
+        return "";
+    }
+    const mixed = body;
+    if (typeof mixed.transformToString === "function") {
+        return mixed.transformToString();
+    }
+    const chunks = [];
+    for await (const chunk of body) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks).toString("utf8");
+}
 async function backend_saveCache(key, paths, archivePath, { compressionMethod, enableCrossOsArchive, cacheSize: archiveFileSize, uploadChunkSize }) {
     void archiveFileSize;
     if (!bucketName) {
@@ -128380,14 +128889,67 @@ async function backend_saveCache(key, paths, archivePath, { compressionMethod, e
     if (!region) {
         throw new Error("Environment variable RUNS_ON_AWS_REGION not set");
     }
-    // Narrow the module-level env const to non-undefined for use inside the
-    // closure below (the guard above already asserted it).
+    const s3Prefix = getS3Prefix(paths, {
+        compressionMethod,
+        enableCrossOsArchive
+    });
+    const s3Key = `${s3Prefix}/${key}`;
+    await uploadArchiveObject(s3Key, archivePath, uploadChunkSize);
+    info(`Cache saved successfully.`);
+}
+/**
+ * Save a sharded cache entry: upload every part to
+ * `<s3prefix>/<key>.shards/<part name>` (through the same engine chain as a
+ * single archive), THEN write the JSON manifest as the object at
+ * `<s3prefix>/<key>` — the very key a legacy archive would occupy. The
+ * manifest goes last so a listing can never find a manifest whose parts are
+ * still missing; a save that dies mid-way leaves only orphan parts, which the
+ * entry lookup ignores.
+ */
+async function saveShardedCache(key, paths, parts, manifest, { compressionMethod, enableCrossOsArchive, uploadChunkSize }) {
+    if (!bucketName) {
+        throw new Error("Environment variable RUNS_ON_S3_BUCKET_CACHE not set");
+    }
+    if (!region) {
+        throw new Error("Environment variable RUNS_ON_AWS_REGION not set");
+    }
     const bucket = bucketName;
     const s3Prefix = getS3Prefix(paths, {
         compressionMethod,
         enableCrossOsArchive
     });
     const s3Key = `${s3Prefix}/${key}`;
+    info(`Cache Size: ~${Math.round(manifest.totalBytes / (1024 * 1024))} MB (${manifest.totalBytes} B) across ${parts.length} part(s)`);
+    // Parts are uploaded one after another: each upload is already a
+    // many-way multipart transfer that saturates the send side, and the
+    // aws-cli engine rewrites its shared config before every transfer.
+    const uploadStartedAt = Date.now();
+    for (const part of parts) {
+        await uploadArchiveObject(`${s3Key}${shardedArchive_SHARDS_KEY_SUFFIX}${part.name}`, part.path, uploadChunkSize);
+    }
+    const manifestBody = JSON.stringify(manifest);
+    info(`Uploading shard manifest to ${bucket}/${s3Key}`);
+    await s3Client.send(new dist_cjs.PutObjectCommand({
+        Bucket: bucket,
+        Key: s3Key,
+        Body: manifestBody,
+        ContentType: "application/json"
+    }));
+    info(`Cache saved successfully (${parts.length} part(s) + manifest uploaded in ${((Date.now() - uploadStartedAt) /
+        1000).toFixed(1)}s).`);
+}
+/**
+ * Upload one local archive file to `s3Key` through the engine chain
+ * (s5cmd -> aws-cli -> node lib-storage). Shared by the single-archive save
+ * and every part of a sharded save.
+ */
+async function uploadArchiveObject(s3Key, archivePath, uploadChunkSize) {
+    if (!bucketName) {
+        throw new Error("Environment variable RUNS_ON_S3_BUCKET_CACHE not set");
+    }
+    // Narrow the module-level env const to non-undefined for use inside the
+    // closure below (the guard above already asserted it).
+    const bucket = bucketName;
     // Stat the archive up front so we can both report its size and size the
     // multipart upload against it.
     const cacheSize = getArchiveFileSizeInBytes(archivePath);
@@ -128454,7 +129016,6 @@ async function backend_saveCache(key, paths, archivePath, { compressionMethod, e
         sizeBytes: cacheSize,
         partSizeMb: effectivePartSize / (1024 * 1024)
     }, nodeUpload);
-    info(`Cache saved successfully.`);
 }
 class backend_UploadProgress {
     totalBytes;
@@ -128610,7 +129171,7 @@ async function archiveStagingDir_removeArchiveStagingDirectory(dir) {
 
 // Normalize an OS path to the forward-slash manifest form, matching the
 // separator normalization @actions/cache's resolvePaths() applies to its output.
-function toManifestPath(relativePath) {
+function reparsePoints_toManifestPath(relativePath) {
     return relativePath.split(external_path_.sep).join("/");
 }
 /**
@@ -128651,7 +129212,7 @@ function collectReparsePointEntries(absoluteDir, workspaceRoot, out) {
     }
     if (children.length === 0) {
         // Preserve an otherwise-lost empty directory as its own entry.
-        out.push(toManifestPath(external_path_.relative(workspaceRoot, absoluteDir)));
+        out.push(reparsePoints_toManifestPath(external_path_.relative(workspaceRoot, absoluteDir)));
         return;
     }
     for (const child of children) {
@@ -128671,7 +129232,7 @@ function collectReparsePointEntries(absoluteDir, workspaceRoot, out) {
             collectReparsePointEntries(absoluteChild, workspaceRoot, out);
         }
         else {
-            out.push(toManifestPath(external_path_.relative(workspaceRoot, absoluteChild)));
+            out.push(reparsePoints_toManifestPath(external_path_.relative(workspaceRoot, absoluteChild)));
         }
     }
 }
@@ -128715,6 +129276,7 @@ function expandWindowsReparsePoints(cachePaths, workspaceRoot = process.env["GIT
 
 ;// CONCATENATED MODULE: ./src/custom/cache.ts
 // https://github.com/actions/toolkit/blob/%40actions/cache%403.2.2/packages/cache/src/cache.ts
+
 
 
 
@@ -128783,7 +129345,7 @@ async function resolveCompressionMethod() {
         compressionLevelLogged = true;
     }
     if (!shouldSkipCompression()) {
-        return CompressionMethod.Gzip;
+        return constants_CompressionMethod.Gzip;
     }
     return getCompressionMethod();
 }
@@ -128836,6 +129398,8 @@ async function cache_restoreCache(paths, primaryKey, restoreKeys, options, enabl
     let archivePath = "";
     let archiveFolder = "";
     let archiveDirIsCustom = false;
+    // Local part files of a sharded restore (empty for a legacy archive).
+    let shardPartPaths = [];
     try {
         // path are needed to compute version
         const cacheEntry = await cacheHttpClient.getCacheEntry(keys, paths, {
@@ -128849,6 +129413,23 @@ async function cache_restoreCache(paths, primaryKey, restoreKeys, options, enabl
         if (options?.lookupOnly) {
             core.info("Lookup only - skipping download");
             return cacheEntry.cacheKey;
+        }
+        // Sharded entry? Only the zstd (no-compression) path ever writes one,
+        // and the gzip path has its own cache version, so the probe is skipped
+        // there to keep it byte-for-byte unchanged. The decision is made per
+        // entry from the stored object, never from CACHE_ARCHIVE_SHARDS, so a
+        // job restores whichever shape the saving job produced.
+        if (shouldSkipCompression()) {
+            const manifest = await cacheHttpClient.getShardManifest(cacheEntry.archiveLocation);
+            if (manifest) {
+                const staging = await createArchiveStagingDirectory();
+                archiveFolder = staging.dir;
+                archiveDirIsCustom = staging.isCustom;
+                shardPartPaths = manifest.shards.map(shard => path.join(archiveFolder, shard.name));
+                await restoreShardedArchive(manifest, cacheEntry.archiveLocation, shardPartPaths, options);
+                core.info("Cache restored successfully");
+                return cacheEntry.cacheKey;
+            }
         }
         // Fast path: STREAMED restore (download|extract overlapped, no scratch
         // archive on disk). Only for the no-compression zstd path, whose extract
@@ -128910,6 +129491,9 @@ async function cache_restoreCache(paths, primaryKey, restoreKeys, options, enabl
         if (archiveDirIsCustom) {
             await removeArchiveStagingDirectory(archiveFolder);
         }
+        else if (shardPartPaths.length > 0) {
+            await unlinkFiles(shardPartPaths);
+        }
         else {
             try {
                 await utils.unlinkFile(archivePath);
@@ -128920,6 +129504,46 @@ async function cache_restoreCache(paths, primaryKey, restoreKeys, options, enabl
         }
     }
     return undefined;
+}
+// Download every part of a sharded entry into the staging dir (a bounded
+// number at a time; each download is itself a wide multipart transfer), check
+// each against the size the manifest recorded, then extract all parts
+// concurrently. Any failure throws so restoreCache's catch turns it into the
+// usual warning + undefined; a partially extracted workspace is harmless
+// because a later restore or the build itself overwrites it.
+async function restoreShardedArchive(manifest, archiveLocation, partPaths, options) {
+    core.info(`Sharded cache entry: ${manifest.shards.length} part(s), ~${Math.round(manifest.totalBytes / (1024 * 1024))} MB (${manifest.totalBytes} B), ${manifest.totalFiles} files.`);
+    const downloadStartedAt = Date.now();
+    await mapWithConcurrency(manifest.shards, SHARD_DOWNLOAD_CONCURRENCY, async (shard, index) => {
+        const partPath = partPaths[index];
+        await cacheHttpClient.downloadCache(`${archiveLocation}${SHARDS_KEY_SUFFIX}${shard.name}`, partPath, options);
+        const partSize = utils.getArchiveFileSizeInBytes(partPath);
+        core.info(`  ${shard.name}: ~${Math.round(partSize / (1024 * 1024))} MB (${partSize} B), ${shard.files} files`);
+        if (partSize === 0) {
+            throw new DownloadValidationError(`Downloaded cache part ${shard.name} is empty (0 bytes). This may indicate a failed download or corrupted cache.`);
+        }
+        if (partSize !== shard.bytes) {
+            throw new DownloadValidationError(`Downloaded cache part ${shard.name} is ${partSize} B but the manifest recorded ${shard.bytes} B.`);
+        }
+    });
+    core.info(`Sharded cache: downloaded ${manifest.shards.length} part(s) in ${((Date.now() - downloadStartedAt) /
+        1000).toFixed(1)}s.`);
+    if (core.isDebug()) {
+        for (const partPath of partPaths) {
+            await uncompressedListTar(partPath, CompressionMethod.Zstd);
+        }
+    }
+    await extractShardedArchive(partPaths);
+}
+async function unlinkFiles(filePaths) {
+    for (const filePath of filePaths) {
+        try {
+            await unlinkFile(filePath);
+        }
+        catch (error) {
+            core_debug(`Failed to delete ${filePath}: ${error}`);
+        }
+    }
 }
 /**
  * Saves a list of files with the specified key
@@ -128947,6 +129571,16 @@ async function custom_cache_saveCache(paths, key, options, enableCrossOsArchive 
     core_debug(`${JSON.stringify(cachePaths)}`);
     if (cachePaths.length === 0) {
         throw new Error(`Path Validation Error: Path(s) specified in the action for caching do(es) not exist, hence no cache is being saved.`);
+    }
+    // Opt-in sharded save: N parallel tar|zstd parts + a manifest, only on the
+    // zstd (no-compression) path. Everything below this block is the legacy
+    // single-archive save, untouched.
+    const shardCount = getArchiveShardCount();
+    if (shardCount >= 2) {
+        if (shouldSkipCompression()) {
+            return cache_saveShardedCache(paths, cachePaths, key, shardCount, compressionMethod, enableCrossOsArchive, options);
+        }
+        info(`${ENV_ARCHIVE_SHARDS}=${shardCount} ignored: sharded archives require compression-level 0 (zstd).`);
     }
     // Stage the scratch archive under CACHE_ARCHIVE_DIR when set (e.g. NVMe),
     // otherwise the upstream RUNNER_TEMP default. createTar writes cache.tzst
@@ -129001,6 +129635,60 @@ async function custom_cache_saveCache(paths, key, options, enableCrossOsArchive 
             catch (error) {
                 core_debug(`Failed to delete archive: ${error}`);
             }
+        }
+    }
+    return cacheId;
+}
+// Sharded save: enumerate + balance + N concurrent tars in the staging dir,
+// upload the parts, then the manifest. Same fail-soft contract as the legacy
+// save (ValidationError rethrown, everything else a warning and cacheId -1),
+// same staging cleanup (whole custom dir, or file-only unlinks by default).
+async function cache_saveShardedCache(paths, cachePaths, key, shardCount, compressionMethod, enableCrossOsArchive, options) {
+    let cacheId = -1;
+    const staging = await archiveStagingDir_createArchiveStagingDirectory();
+    const archiveFolder = staging.dir;
+    core_debug(`Archive Folder (sharded): ${archiveFolder}`);
+    const scratchFiles = [];
+    try {
+        const startedAt = Date.now();
+        const { manifest, parts } = await createShardedArchive(archiveFolder, cachePaths, shardCount);
+        scratchFiles.push(...parts.map(part => part.path), ...parts.map(part => external_path_.join(archiveFolder, shardListName(part.index))));
+        const tarFinishedAt = Date.now();
+        if (isDebug()) {
+            for (const part of parts) {
+                await uncompressedTar_listTar(part.path, compressionMethod);
+            }
+        }
+        await saveShardedCache(key, paths, parts, manifest, {
+            compressionMethod,
+            enableCrossOsArchive,
+            uploadChunkSize: options?.uploadChunkSize
+        });
+        const finishedAt = Date.now();
+        info(`Sharded cache save: tar ${((tarFinishedAt - startedAt) /
+            1000).toFixed(1)}s, upload ${((finishedAt - tarFinishedAt) /
+            1000).toFixed(1)}s, total ${((finishedAt - startedAt) / 1000).toFixed(1)}s.`);
+        // dummy cacheId, if we get there without raising, it means the cache has been saved
+        cacheId = 1;
+    }
+    catch (error) {
+        const typedError = error;
+        if (typedError.name === cache_ValidationError.name) {
+            throw error;
+        }
+        else if (typedError.name === cache_ReserveCacheError.name) {
+            info(`Failed to save: ${typedError.message}`);
+        }
+        else {
+            warning(`Failed to save: ${typedError.message}`);
+        }
+    }
+    finally {
+        if (staging.isCustom) {
+            await archiveStagingDir_removeArchiveStagingDirectory(archiveFolder);
+        }
+        else {
+            await unlinkFiles(scratchFiles);
         }
     }
     return cacheId;
