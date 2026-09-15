@@ -127510,10 +127510,14 @@ async function uncompressedTar_listTar(archivePath, _compressionMethod) {
 // replacement save that is interrupted (or that a restore overlaps with)
 // leaves the previous manifest and every part it references untouched, and a
 // partial upload never looks like a valid cache entry. Once the new manifest
-// is in place, parts of earlier generations are deleted on a best-effort
-// basis so they do not accumulate. The restore side recognizes the manifest,
-// downloads exactly the keys it lists, verifies size and sha256, and extracts
-// all parts concurrently with the legacy extract command.
+// is in place, parts of earlier generations are retired on a best-effort
+// basis so they do not accumulate — but only after a retention window (see
+// planShardGenerationCleanup): the generation just superseded and any
+// generation with a young object are left alone, because a reader may still
+// be downloading the former and a concurrent writer may still be uploading
+// the latter. The restore side recognizes the manifest, downloads exactly the
+// keys it lists, verifies size and sha256, and extracts all parts
+// concurrently with the legacy extract command.
 //
 // Everything here is opt-in: with the knob unset (or 0 / 1 / invalid) the save
 // and restore paths are byte-for-byte the legacy single-archive behavior, and a
@@ -127530,6 +127534,15 @@ async function uncompressedTar_listTar(archivePath, _compressionMethod) {
 const ENV_ARCHIVE_SHARDS = "CACHE_ARCHIVE_SHARDS";
 const MIN_ARCHIVE_SHARDS = 2;
 const MAX_ARCHIVE_SHARDS = 64;
+/** Env var: hours a superseded shard generation is retained before a later
+ *  save may delete it (integer 1..720); anything else = the default. */
+const ENV_SHARD_RETENTION_HOURS = "CACHE_SHARD_RETENTION_HOURS";
+const DEFAULT_SHARD_RETENTION_HOURS = 24;
+const MIN_SHARD_RETENTION_HOURS = 1;
+const MAX_SHARD_RETENTION_HOURS = 720;
+/** Pseudo generation id of the un-generationed parts a manifest written
+ *  before generations existed references (`<key>.shards/part-NN.tzst`). */
+const LEGACY_SHARD_GENERATION = "(legacy)";
 /** `format` field of the manifest object stored at the legacy archive key. */
 const SHARDED_ARCHIVE_FORMAT = "sharded-tzst-v1";
 /** Appended to the entry's S3 key to form the part prefix:
@@ -127537,7 +127550,7 @@ const SHARDED_ARCHIVE_FORMAT = "sharded-tzst-v1";
  *  for manifests written before generations existed). */
 const SHARDS_KEY_SUFFIX = ".shards/";
 /** Objects at or above this size are never inspected as a manifest candidate. */
-const shardedArchive_SHARD_MANIFEST_MAX_BYTES = (/* unused pure expression or super */ null && (1024 * 1024));
+const shardedArchive_SHARD_MANIFEST_MAX_BYTES = 1024 * 1024;
 /** How many parts are downloaded at once on restore (each download is itself
  *  a highly concurrent multipart transfer, so a small fan-out is enough). */
 const shardedArchive_SHARD_DOWNLOAD_CONCURRENCY = 2;
@@ -127568,6 +127581,110 @@ function getArchiveShardCount(env = process.env) {
         return 1;
     }
     return count;
+}
+/**
+ * Parse `CACHE_SHARD_RETENTION_HOURS`. Returns the retention window in hours
+ * (1..720) when set to a valid integer in range, otherwise the 24 h default;
+ * an invalid value warns so a typo is visible but can never break a save.
+ */
+function getShardRetentionHours(env = process.env) {
+    const raw = (env[ENV_SHARD_RETENTION_HOURS] ?? "").trim();
+    if (raw === "") {
+        return DEFAULT_SHARD_RETENTION_HOURS;
+    }
+    if (!/^\d+$/.test(raw)) {
+        warning(`${ENV_SHARD_RETENTION_HOURS}='${raw}' is not an integer; using the default of ${DEFAULT_SHARD_RETENTION_HOURS} hours.`);
+        return DEFAULT_SHARD_RETENTION_HOURS;
+    }
+    const hours = Number(raw);
+    if (hours < MIN_SHARD_RETENTION_HOURS ||
+        hours > MAX_SHARD_RETENTION_HOURS) {
+        warning(`${ENV_SHARD_RETENTION_HOURS}=${hours} is outside ${MIN_SHARD_RETENTION_HOURS}..${MAX_SHARD_RETENTION_HOURS}; using the default of ${DEFAULT_SHARD_RETENTION_HOURS} hours.`);
+        return DEFAULT_SHARD_RETENTION_HOURS;
+    }
+    return hours;
+}
+/** Generation id of a part object under `shardsPrefix` (its first path
+ *  segment), or LEGACY_SHARD_GENERATION for a bare `part-NN.tzst`. */
+function shardObjectGeneration(objectKey, shardsPrefix) {
+    const rest = objectKey.slice(shardsPrefix.length);
+    const slash = rest.indexOf("/");
+    return slash === -1 ? LEGACY_SHARD_GENERATION : rest.slice(0, slash);
+}
+/**
+ * Decide which generations under `<key>.shards/` a save that just published
+ * `currentGeneration` may delete. Concurrent saves of the same key are not
+ * mutually exclusive, and a restore may be downloading the manifest it
+ * picked while a save replaces it, so deletion is deferred and protected:
+ * a generation G is deleted only when ALL of these hold —
+ *  1. G is not the generation just published;
+ *  2. G is not the generation of the manifest just superseded (`previous`),
+ *     whose readers may still be downloading its parts;
+ *  3. the superseded entry was itself published more than the retention
+ *     window ago, so every generation older than it stopped being the
+ *     current entry at least that long ago (an absent previous entry
+ *     imposes nothing; an undated or uninspectable one defers everything);
+ *  4. every object of G is older than the retention window (a young object
+ *     is a concurrent writer's part whose manifest is not published yet).
+ * Legacy un-generationed parts count as one pseudo-generation subject to the
+ * same rules. An object without a LastModified counts as young.
+ */
+function planShardGenerationCleanup(objects, shardsPrefix, currentGeneration, previous, retentionMs, now = new Date()) {
+    const cutoff = now.getTime() - retentionMs;
+    const isOld = (stamp) => stamp !== undefined && stamp.getTime() < cutoff;
+    const byGeneration = new Map();
+    for (const object of objects) {
+        const generation = shardObjectGeneration(object.key, shardsPrefix);
+        const group = byGeneration.get(generation);
+        if (group) {
+            group.push(object);
+        }
+        else {
+            byGeneration.set(generation, [object]);
+        }
+    }
+    const plan = {
+        deleteKeys: [],
+        deletedGenerations: [],
+        keptGenerations: [],
+        deferredGenerations: []
+    };
+    let holdAll;
+    if (previous.kind === "unknown") {
+        holdAll = "the previous entry could not be inspected before the upload";
+    }
+    else if (previous.kind !== "absent" && !isOld(previous.lastModified)) {
+        holdAll =
+            previous.lastModified === undefined
+                ? "the previous entry has no LastModified"
+                : `the previous entry was published ${describeAge(previous.lastModified, now)} ago, within the retention window`;
+    }
+    for (const [generation, group] of byGeneration) {
+        if (generation === currentGeneration ||
+            (previous.kind === "sharded" && generation === previous.generation)) {
+            plan.keptGenerations.push(generation);
+            continue;
+        }
+        if (holdAll !== undefined) {
+            plan.deferredGenerations.push(generation);
+            continue;
+        }
+        if (group.every(object => isOld(object.lastModified))) {
+            plan.deletedGenerations.push(generation);
+            plan.deleteKeys.push(...group.map(object => object.key));
+        }
+        else {
+            plan.deferredGenerations.push(generation);
+        }
+    }
+    if (holdAll !== undefined && plan.deferredGenerations.length > 0) {
+        plan.deferredReason = holdAll;
+    }
+    return plan;
+}
+function describeAge(stamp, now) {
+    const minutes = Math.max(0, Math.round((now.getTime() - stamp.getTime()) / 60000));
+    return minutes < 120 ? `${minutes} min` : `${(minutes / 60).toFixed(1)} h`;
 }
 /** True for a shard part object (`<key>.shards/<generation>/part-NN.tzst`,
  *  or the legacy `<key>.shards/part-NN.tzst`), which must never be picked as
@@ -129160,7 +129277,43 @@ async function backend_saveCache(key, paths, archivePath, { compressionMethod, e
     await uploadArchiveObject(s3Key, archivePath, uploadChunkSize);
     info(`Cache saved successfully.`);
 }
+function isNotFoundError(error) {
+    const typed = error;
+    return (typed?.name === "NotFound" ||
+        typed?.name === "NoSuchKey" ||
+        typed?.$metadata?.httpStatusCode === 404);
+}
 const defaultShardedSaveDeps = {
+    readEntryObject: async (s3Key) => {
+        let head;
+        try {
+            head = await s3Client.send(new dist_cjs.HeadObjectCommand({ Bucket: bucketName, Key: s3Key }));
+        }
+        catch (error) {
+            if (isNotFoundError(error)) {
+                return undefined;
+            }
+            throw error;
+        }
+        const read = { lastModified: head.LastModified };
+        if (typeof head.ContentLength !== "number" ||
+            head.ContentLength <= 0 ||
+            head.ContentLength > shardedArchive_SHARD_MANIFEST_MAX_BYTES) {
+            return read;
+        }
+        try {
+            const object = await s3Client.send(new dist_cjs.GetObjectCommand({ Bucket: bucketName, Key: s3Key }));
+            read.body = Buffer.from(await readObjectBody(object.Body), "utf8");
+            read.lastModified = object.LastModified ?? read.lastModified;
+        }
+        catch (error) {
+            if (isNotFoundError(error)) {
+                return undefined;
+            }
+            throw error;
+        }
+        return read;
+    },
     uploadObject: (s3Key, archivePath, uploadChunkSize) => uploadArchiveObject(s3Key, archivePath, uploadChunkSize),
     putJsonObject: async (s3Key, body) => {
         await s3Client.send(new dist_cjs.PutObjectCommand({
@@ -129170,8 +129323,8 @@ const defaultShardedSaveDeps = {
             ContentType: "application/json"
         }));
     },
-    listObjectKeys: async (prefix) => {
-        const keys = [];
+    listObjects: async (prefix) => {
+        const objects = [];
         let continuationToken;
         do {
             const page = await s3Client.send(new dist_cjs.ListObjectsV2Command({
@@ -129181,14 +129334,17 @@ const defaultShardedSaveDeps = {
             }));
             for (const object of page.Contents ?? []) {
                 if (object.Key) {
-                    keys.push(object.Key);
+                    objects.push({
+                        key: object.Key,
+                        lastModified: object.LastModified
+                    });
                 }
             }
             continuationToken = page.IsTruncated
                 ? page.NextContinuationToken
                 : undefined;
         } while (continuationToken);
-        return keys;
+        return objects;
     },
     deleteObjectKeys: async (keys) => {
         if (keys.length === 0) {
@@ -129201,57 +129357,99 @@ const defaultShardedSaveDeps = {
                 Quiet: true
             }
         }));
-    }
+    },
+    now: () => new Date()
 };
 /** S3 DeleteObjects accepts at most this many keys per request. */
 const DELETE_BATCH_SIZE = 1000;
 /**
- * Best-effort removal of every part object under `<s3Key>.shards/` that does
- * not belong to `generation` (earlier generations, orphans of interrupted
- * saves, and legacy un-generationed parts). Called only AFTER the new
- * manifest is in place, so nothing a visible manifest references is ever
- * touched; the current generation is never deleted. Errors are logged and
- * swallowed: stale objects cost storage, not correctness.
+ * Inspect the object currently stored at the entry key BEFORE a save uploads
+ * anything, so the cleanup that follows the publish knows which generation
+ * it superseded and when that one became current. Never throws: an
+ * uninspectable entry is reported as `unknown`, which makes the cleanup hold
+ * back everything.
  */
-async function cleanupOtherShardGenerations(s3Key, generation, deps = defaultShardedSaveDeps) {
-    const allPrefix = shardsKeyPrefix(s3Key);
-    const keepPrefix = shardGenerationKeyPrefix(s3Key, generation);
+async function readPreviousEntryState(s3Key, deps = defaultShardedSaveDeps) {
     try {
-        const keys = await deps.listObjectKeys(allPrefix);
-        const stale = keys.filter(objectKey => !objectKey.startsWith(keepPrefix));
-        const kept = keys.length - stale.length;
-        if (stale.length === 0) {
-            info(`Sharded cache: no stale part objects under ${allPrefix} (${kept} current).`);
-            return { deleted: 0, kept };
+        const read = await deps.readEntryObject(s3Key);
+        if (read === undefined) {
+            info(`Sharded cache: no previous entry at ${s3Key}; this save creates it.`);
+            return { kind: "absent" };
         }
-        const generations = new Set(stale.map(objectKey => {
-            const rest = objectKey.slice(allPrefix.length);
-            return rest.includes("/")
-                ? rest.slice(0, rest.indexOf("/"))
-                : "(legacy)";
-        }));
-        for (let start = 0; start < stale.length; start += DELETE_BATCH_SIZE) {
-            await deps.deleteObjectKeys(stale.slice(start, start + DELETE_BATCH_SIZE));
+        const manifest = read.body === undefined ? undefined : shardedArchive_parseShardManifest(read.body);
+        const stamp = read.lastModified?.toISOString() ?? "unknown time";
+        if (manifest === undefined) {
+            info(`Sharded cache: previous entry at ${s3Key} is a single archive (published ${stamp}).`);
+            return { kind: "single", lastModified: read.lastModified };
         }
-        info(`Sharded cache: deleted ${stale.length} stale part object(s) from ${generations.size} earlier generation(s) under ${allPrefix}; kept ${kept} of generation ${generation}.`);
-        return { deleted: stale.length, kept };
+        const generation = manifest.generation ?? LEGACY_SHARD_GENERATION;
+        info(`Sharded cache: previous entry at ${s3Key} is generation ${generation} (published ${stamp}).`);
+        return { kind: "sharded", generation, lastModified: read.lastModified };
+    }
+    catch (error) {
+        info(`Sharded cache: could not inspect the previous entry at ${s3Key} (${error.message}); stale part cleanup will be deferred.`);
+        return { kind: "unknown" };
+    }
+}
+const NO_CLEANUP = {
+    deletedObjects: 0,
+    deletedGenerations: 0,
+    keptGenerations: 0,
+    deferredGenerations: 0
+};
+/**
+ * Best-effort, deferred removal of generations under `<s3Key>.shards/` that
+ * nothing can still be using. Called only AFTER the new manifest is in
+ * place. A generation is deleted only when it is neither the one just
+ * published nor the one just superseded (`previous`), the superseded entry
+ * itself became current more than `retentionMs` ago, and every object of
+ * the generation is older than `retentionMs` — see
+ * planShardGenerationCleanup for why each condition is needed. Errors are
+ * logged and swallowed: stale objects cost storage, not correctness.
+ */
+async function cleanupOtherShardGenerations(s3Key, generation, previous, retentionMs, deps = defaultShardedSaveDeps) {
+    const allPrefix = shardsKeyPrefix(s3Key);
+    const retentionHours = (retentionMs / 3600000).toFixed(1);
+    try {
+        const objects = await deps.listObjects(allPrefix);
+        const plan = planShardGenerationCleanup(objects, allPrefix, generation, previous, retentionMs, deps.now());
+        for (let start = 0; start < plan.deleteKeys.length; start += DELETE_BATCH_SIZE) {
+            await deps.deleteObjectKeys(plan.deleteKeys.slice(start, start + DELETE_BATCH_SIZE));
+        }
+        const summary = `deleted ${plan.deletedGenerations.length} generation(s) (${plan.deleteKeys.length} object(s)), kept ${plan.keptGenerations.length} (${plan.keptGenerations.join(", ")}), deferred ${plan.deferredGenerations.length}${plan.deferredGenerations.length > 0
+            ? ` (${plan.deferredGenerations.join(", ")})`
+            : ""}; retention ${retentionHours} h`;
+        if (plan.deferredReason !== undefined) {
+            info(`Sharded cache: stale part cleanup under ${allPrefix} deferred because ${plan.deferredReason}: ${summary}.`);
+        }
+        else {
+            info(`Sharded cache: stale part cleanup under ${allPrefix}: ${summary}.`);
+        }
+        return {
+            deletedObjects: plan.deleteKeys.length,
+            deletedGenerations: plan.deletedGenerations.length,
+            keptGenerations: plan.keptGenerations.length,
+            deferredGenerations: plan.deferredGenerations.length
+        };
     }
     catch (error) {
         info(`Sharded cache: stale part cleanup under ${allPrefix} skipped (${error.message}); the entry is complete regardless.`);
-        return { deleted: 0, kept: 0 };
+        return NO_CLEANUP;
     }
 }
 /**
- * Save a sharded cache entry: upload every part to the generation-scoped key
- * the manifest records (`<s3prefix>/<key>.shards/<generation>/<part name>`,
- * through the same engine chain as a single archive), THEN write the JSON
- * manifest as the object at `<s3prefix>/<key>` — the very key a legacy
- * archive would occupy — and finally delete the parts of earlier generations.
- * The manifest goes last so a listing can never find a manifest whose parts
- * are still missing, and because a generation's part keys are unique, a
- * replacement save that dies mid-way leaves the previous manifest AND every
- * object it references intact: it only adds orphan parts, which the entry
- * lookup ignores and the next successful save cleans up.
+ * Save a sharded cache entry: note what is currently stored at the entry
+ * key, upload every part to the generation-scoped key the manifest records
+ * (`<s3prefix>/<key>.shards/<generation>/<part name>`, through the same
+ * engine chain as a single archive), THEN write the JSON manifest as the
+ * object at `<s3prefix>/<key>` — the very key a legacy archive would occupy
+ * — and finally retire generations that have been superseded for longer
+ * than the retention window. The manifest goes last so a listing can never
+ * find a manifest whose parts are still missing, and because a generation's
+ * part keys are unique, a replacement save that dies mid-way leaves the
+ * previous manifest AND every object it references intact: it only adds
+ * orphan parts, which the entry lookup ignores and a later save retires once
+ * they are old enough. Nothing is ever deleted when the publish fails.
  */
 async function saveShardedCache(key, paths, parts, manifest, { compressionMethod, enableCrossOsArchive, uploadChunkSize }, deps = defaultShardedSaveDeps) {
     if (!bucketName) {
@@ -129277,6 +129475,10 @@ async function saveShardedCache(key, paths, parts, manifest, { compressionMethod
         }
     }
     info(`Sharded cache generation: ${manifest.generation}`);
+    // Remember what this save supersedes before touching the bucket: the
+    // cleanup after the publish must protect that generation (its readers
+    // may still be downloading) and needs to know when it became current.
+    const previous = await readPreviousEntryState(s3Key, deps);
     // Parts are uploaded one after another: each upload is already a
     // many-way multipart transfer that saturates the send side, and the
     // aws-cli engine rewrites its shared config before every transfer.
@@ -129290,9 +129492,10 @@ async function saveShardedCache(key, paths, parts, manifest, { compressionMethod
     await deps.putJsonObject(s3Key, manifestBody);
     info(`Cache saved successfully (${parts.length} part(s) + manifest uploaded in ${((Date.now() - uploadStartedAt) /
         1000).toFixed(1)}s).`);
-    // Only now, with the new manifest visible, retire the parts nothing
-    // references any more.
-    await cleanupOtherShardGenerations(s3Key, manifest.generation, deps);
+    // Only now, with the new manifest visible, retire what nothing can
+    // still be using. Reached only when the publish above succeeded.
+    const retentionMs = getShardRetentionHours() * 3600000;
+    await cleanupOtherShardGenerations(s3Key, manifest.generation, previous, retentionMs, deps);
 }
 /**
  * Upload one local archive file to `s3Key` through the engine chain

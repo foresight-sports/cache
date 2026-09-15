@@ -21,6 +21,8 @@ import * as path from "path";
 import { Readable } from "stream";
 
 import {
+    ENV_SHARD_RETENTION_HOURS,
+    LEGACY_SHARD_GENERATION,
     parseShardManifest,
     SHARDED_ARCHIVE_FORMAT,
     ShardManifest,
@@ -319,7 +321,8 @@ describe("getShardManifest", () => {
 });
 
 // ============================================================================
-// Sharded save against an in-memory bucket: immutable generations.
+// Sharded save against an in-memory bucket: immutable generations with
+// deferred, protected cleanup of superseded ones.
 // ============================================================================
 describe("saveShardedCache (in-memory bucket)", () => {
     const key = "lib-abc";
@@ -334,47 +337,123 @@ describe("saveShardedCache (in-memory bucket)", () => {
         false
     )}`;
     const s3Key = `${s3Prefix}/${key}`;
+    const HOUR = 3600000;
+    const T0 = new Date("2026-09-15T00:00:00Z");
 
     let staging: string;
+    const originalRetention = process.env[ENV_SHARD_RETENTION_HOURS];
     beforeAll(() => {
         staging = fs.mkdtempSync(path.join(os.tmpdir(), "shards-save-"));
+    });
+    afterEach(() => {
+        if (originalRetention === undefined) {
+            delete process.env[ENV_SHARD_RETENTION_HOURS];
+        } else {
+            process.env[ENV_SHARD_RETENTION_HOURS] = originalRetention;
+        }
     });
     afterAll(() => {
         fs.rmSync(staging, { recursive: true, force: true });
     });
 
-    /** Fake S3: object key -> body. Records the order of every mutation. */
+    interface FakeObject {
+        body: Buffer;
+        lastModified: Date;
+    }
+
+    /** Fake S3: object key -> body + LastModified, on a settable clock.
+     *  Records the order of every operation. */
     class FakeBucket {
-        readonly objects = new Map<string, Buffer>();
+        readonly objects = new Map<string, FakeObject>();
         readonly log: string[] = [];
-        deps(uploadHook?: (s3Key: string) => void): backend.ShardedSaveDeps {
+        clock = T0;
+
+        /** Move the clock forward by `hours`. */
+        advance(hours: number): void {
+            this.clock = new Date(this.clock.getTime() + hours * HOUR);
+        }
+
+        put(objectKey: string, body: Buffer | string, at?: Date): void {
+            this.objects.set(objectKey, {
+                body: Buffer.isBuffer(body) ? body : Buffer.from(body, "utf8"),
+                lastModified: at ?? this.clock
+            });
+        }
+
+        deps(hooks?: {
+            beforeUpload?: (s3Key: string) => Promise<void> | void;
+        }): backend.ShardedSaveDeps {
             return {
+                readEntryObject: async objectKey => {
+                    this.log.push(`head ${objectKey}`);
+                    const object = this.objects.get(objectKey);
+                    return object === undefined
+                        ? undefined
+                        : {
+                              body: object.body,
+                              lastModified: object.lastModified
+                          };
+                },
                 uploadObject: async (objectKey, archivePath) => {
-                    uploadHook?.(objectKey);
-                    this.objects.set(objectKey, fs.readFileSync(archivePath));
+                    await hooks?.beforeUpload?.(objectKey);
+                    this.put(objectKey, fs.readFileSync(archivePath));
                     this.log.push(`put ${objectKey}`);
                 },
                 putJsonObject: async (objectKey, body) => {
-                    this.objects.set(objectKey, Buffer.from(body, "utf8"));
+                    this.put(objectKey, body);
                     this.log.push(`put ${objectKey}`);
                 },
-                listObjectKeys: async prefix => {
+                listObjects: async prefix => {
                     this.log.push(`list ${prefix}`);
-                    return [...this.objects.keys()]
-                        .filter(objectKey => objectKey.startsWith(prefix))
-                        .sort();
+                    return [...this.objects.entries()]
+                        .filter(([objectKey]) => objectKey.startsWith(prefix))
+                        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+                        .map(([objectKey, object]) => ({
+                            key: objectKey,
+                            lastModified: object.lastModified
+                        }));
                 },
                 deleteObjectKeys: async keys => {
                     for (const objectKey of keys) {
                         this.objects.delete(objectKey);
                         this.log.push(`delete ${objectKey}`);
                     }
-                }
+                },
+                now: () => this.clock
             };
         }
+
         manifest(): ShardManifest | undefined {
-            const body = this.objects.get(s3Key);
-            return body === undefined ? undefined : parseShardManifest(body);
+            const object = this.objects.get(s3Key);
+            return object === undefined
+                ? undefined
+                : parseShardManifest(object.body);
+        }
+
+        shardKeys(): string[] {
+            return [...this.objects.keys()]
+                .filter(objectKey => objectKey.startsWith(`${s3Key}.shards/`))
+                .sort();
+        }
+
+        deletes(): string[] {
+            return this.log
+                .filter(line => line.startsWith("delete "))
+                .map(line => line.slice("delete ".length))
+                .sort();
+        }
+
+        /** Every object key a manifest references exists with matching bytes. */
+        expectManifestComplete(manifest: ShardManifest | undefined): void {
+            expect(manifest).toBeDefined();
+            for (const shard of manifest!.shards) {
+                const object = this.objects.get(`${s3Prefix}/${shard.key}`);
+                expect(object).toBeDefined();
+                expect(object!.body.length).toBe(shard.bytes);
+                expect(
+                    createHash("sha256").update(object!.body).digest("hex")
+                ).toBe(shard.sha256);
+            }
         }
     }
 
@@ -421,35 +500,46 @@ describe("saveShardedCache (in-memory bucket)", () => {
         };
     }
 
-    test("uploads every part to its manifest key, then the manifest, then retires other generations", async () => {
-        const bucket = new FakeBucket();
-        // Left-overs from before: a legacy un-generationed part and an orphan
-        // of an interrupted save.
-        bucket.objects.set(`${s3Key}.shards/part-00.tzst`, Buffer.from("old"));
-        bucket.objects.set(
-            `${s3Key}.shards/gen-orphan/part-00.tzst`,
-            Buffer.from("orphan")
-        );
-        // An unrelated entry that shares the restore-key prefix must survive.
-        bucket.objects.set(
-            `${s3Key}-2.shards/gen-x/part-00.tzst`,
-            Buffer.from("x")
-        );
-        bucket.objects.set(`${s3Key}-2`, Buffer.from("{}"));
-
-        const { parts, manifest } = makeGeneration("gen-a", 2);
+    async function save(
+        bucket: FakeBucket,
+        generation: string,
+        partCount = 2,
+        hooks?: Parameters<FakeBucket["deps"]>[0]
+    ): Promise<ShardManifest> {
+        const { parts, manifest } = makeGeneration(generation, partCount);
         await backend.saveShardedCache(
             key,
             paths,
             parts,
             manifest,
             saveOptions,
-            bucket.deps()
+            bucket.deps(hooks)
         );
+        return manifest;
+    }
 
-        // Order: parts (at the exact keys the manifest records) -> manifest
-        // -> listing -> deletes of everything else under .shards/.
+    test("reads the previous entry first, uploads every part to its manifest key, then the manifest, then retires only old generations", async () => {
+        const bucket = new FakeBucket();
+        // Left-overs from long ago: a legacy un-generationed part and an
+        // orphan of an interrupted save, both far older than the window.
+        bucket.put(`${s3Key}.shards/part-00.tzst`, "old", new Date(0));
+        bucket.put(
+            `${s3Key}.shards/gen-orphan/part-00.tzst`,
+            "orphan",
+            new Date(0)
+        );
+        // A young orphan: some other writer may be mid-upload.
+        bucket.put(`${s3Key}.shards/gen-young/part-00.tzst`, "young");
+        // An unrelated entry that shares the restore-key prefix must survive.
+        bucket.put(`${s3Key}-2.shards/gen-x/part-00.tzst`, "x", new Date(0));
+        bucket.put(`${s3Key}-2`, "{}", new Date(0));
+
+        const manifest = await save(bucket, "gen-a");
+
+        // Order: inspect the entry -> parts (at the exact keys the manifest
+        // records) -> manifest -> listing -> deletes of the old generations.
         expect(bucket.log).toEqual([
+            `head ${s3Key}`,
             `put ${s3Prefix}/${key}.shards/gen-a/part-00.tzst`,
             `put ${s3Prefix}/${key}.shards/gen-a/part-01.tzst`,
             `put ${s3Key}`,
@@ -457,38 +547,234 @@ describe("saveShardedCache (in-memory bucket)", () => {
             `delete ${s3Key}.shards/gen-orphan/part-00.tzst`,
             `delete ${s3Key}.shards/part-00.tzst`
         ]);
-        for (const shard of manifest.shards) {
-            expect(bucket.objects.has(`${s3Prefix}/${shard.key}`)).toBe(true);
-        }
+        bucket.expectManifestComplete(bucket.manifest());
         expect(bucket.manifest()).toEqual(manifest);
+        expect(bucket.shardKeys()).toEqual([
+            `${s3Key}.shards/gen-a/part-00.tzst`,
+            `${s3Key}.shards/gen-a/part-01.tzst`,
+            `${s3Key}.shards/gen-young/part-00.tzst`
+        ]);
         expect(bucket.objects.has(`${s3Key}-2.shards/gen-x/part-00.tzst`)).toBe(
             true
         );
         expect(bucket.objects.has(`${s3Key}-2`)).toBe(true);
     });
 
-    test("regression: an interrupted replacement leaves the previous manifest and all of its parts intact", async () => {
+    test("race (a): overlapping writers — the finishing writer keeps the other's young part, and both manifests stay complete", async () => {
         const bucket = new FakeBucket();
-        const generationA = makeGeneration("gen-a", 2);
-        await backend.saveShardedCache(
-            key,
-            paths,
-            generationA.parts,
-            generationA.manifest,
-            saveOptions,
-            bucket.deps()
+        // Two old entries exist so that A's cleanup is not held back by the
+        // "previous entry is young" rule and has something it may delete
+        // (gen-00): only the young-object rule then protects B.
+        await save(bucket, "gen-00");
+        bucket.advance(1);
+        await save(bucket, "gen-0");
+        bucket.advance(48);
+        bucket.log.length = 0;
+
+        // Writer B starts, uploads part 0, and pauses; writer A then runs to
+        // completion (publishes and cleans up) before B resumes.
+        let manifestA: ShardManifest | undefined;
+        let released = false;
+        const manifestB = await save(bucket, "gen-b", 2, {
+            beforeUpload: async objectKey => {
+                if (objectKey.endsWith("/gen-b/part-01.tzst") && !released) {
+                    released = true;
+                    manifestA = await save(bucket, "gen-a");
+                }
+            }
+        });
+
+        // A's cleanup ran while B's part 0 was already uploaded: A must not
+        // have deleted it (it is young), while gen-00 was old and went
+        // (gen-0 is the generation A superseded, so it stays too).
+        expect(bucket.deletes()).toEqual([
+            `${s3Key}.shards/gen-00/part-00.tzst`,
+            `${s3Key}.shards/gen-00/part-01.tzst`
+        ]);
+        expect(bucket.log).toContain(
+            `put ${s3Prefix}/${key}.shards/gen-b/part-00.tzst`
         );
+
+        // B published last: its manifest is the visible one and references
+        // only objects that exist; A's manifest is superseded but its objects
+        // are all still there for any reader that picked it.
+        expect(bucket.manifest()).toEqual(manifestB);
+        bucket.expectManifestComplete(manifestB);
+        bucket.expectManifestComplete(manifestA);
+        expect(bucket.shardKeys()).toEqual([
+            `${s3Key}.shards/gen-0/part-00.tzst`,
+            `${s3Key}.shards/gen-0/part-01.tzst`,
+            `${s3Key}.shards/gen-a/part-00.tzst`,
+            `${s3Key}.shards/gen-a/part-01.tzst`,
+            `${s3Key}.shards/gen-b/part-00.tzst`,
+            `${s3Key}.shards/gen-b/part-01.tzst`
+        ]);
+    });
+
+    test("race (b): a reader holding manifest A keeps A's parts while B publishes", async () => {
+        const bucket = new FakeBucket();
+        const manifestA = await save(bucket, "gen-a");
+        // A reader picked manifest A and is downloading its parts...
+        const held = bucket.manifest();
+        expect(held).toEqual(manifestA);
+
+        // ...while B publishes right away (A still within the window).
+        bucket.advance(0.5);
+        bucket.log.length = 0;
+        const manifestB = await save(bucket, "gen-b");
+        expect(bucket.deletes()).toEqual([]);
+        expect(bucket.manifest()).toEqual(manifestB);
+        bucket.expectManifestComplete(held);
+
+        // Even when A had been current for longer than the window, it is the
+        // generation B supersedes and is never deleted in the same save.
+        const laterBucket = new FakeBucket();
+        const olderA = await save(laterBucket, "gen-a");
+        laterBucket.advance(72);
+        const laterHeld = laterBucket.manifest();
+        laterBucket.log.length = 0;
+        await save(laterBucket, "gen-b");
+        expect(laterBucket.deletes()).toEqual([]);
+        expect(laterHeld).toEqual(olderA);
+        laterBucket.expectManifestComplete(laterHeld);
+    });
+
+    test("a generation superseded more than the window ago, whose objects are all old, is deleted by the next save", async () => {
+        const bucket = new FakeBucket();
+        await save(bucket, "gen-a"); // T0
+        bucket.advance(1);
+        await save(bucket, "gen-b"); // T0 + 1 h: A is previous -> kept
+        expect(bucket.deletes()).toEqual([]);
+
+        bucket.advance(25); // B has been current for 25 h
+        bucket.log.length = 0;
+        const manifestC = await save(bucket, "gen-c");
+        // A stopped being current 25 h ago (when B was published) and all of
+        // its objects are older than 24 h: gone. B is previous: kept.
+        expect(bucket.deletes()).toEqual([
+            `${s3Key}.shards/gen-a/part-00.tzst`,
+            `${s3Key}.shards/gen-a/part-01.tzst`
+        ]);
+        expect(bucket.shardKeys()).toEqual([
+            `${s3Key}.shards/gen-b/part-00.tzst`,
+            `${s3Key}.shards/gen-b/part-01.tzst`,
+            `${s3Key}.shards/gen-c/part-00.tzst`,
+            `${s3Key}.shards/gen-c/part-01.tzst`
+        ]);
+        expect(bucket.manifest()).toEqual(manifestC);
+    });
+
+    test("the previous generation is never deleted in the save that supersedes it, and a young previous entry defers everything", async () => {
+        const bucket = new FakeBucket();
+        bucket.put(
+            `${s3Key}.shards/gen-ancient/part-00.tzst`,
+            "z",
+            new Date(0)
+        );
+        await save(bucket, "gen-a"); // previous absent: ancient is deleted
+        expect(bucket.deletes()).toEqual([
+            `${s3Key}.shards/gen-ancient/part-00.tzst`
+        ]);
+
+        bucket.put(
+            `${s3Key}.shards/gen-ancient2/part-00.tzst`,
+            "z",
+            new Date(0)
+        );
+        bucket.advance(2);
+        bucket.log.length = 0;
+        await save(bucket, "gen-b");
+        // A is previous (kept); ancient2 is old but A was published only 2 h
+        // ago, so the sweep is deferred wholesale.
+        expect(bucket.deletes()).toEqual([]);
+        expect(bucket.shardKeys()).toEqual([
+            `${s3Key}.shards/gen-a/part-00.tzst`,
+            `${s3Key}.shards/gen-a/part-01.tzst`,
+            `${s3Key}.shards/gen-ancient2/part-00.tzst`,
+            `${s3Key}.shards/gen-b/part-00.tzst`,
+            `${s3Key}.shards/gen-b/part-01.tzst`
+        ]);
+    });
+
+    test("honors CACHE_SHARD_RETENTION_HOURS for the window", async () => {
+        process.env[ENV_SHARD_RETENTION_HOURS] = "2";
+        const bucket = new FakeBucket();
+        await save(bucket, "gen-a");
+        bucket.advance(1);
+        await save(bucket, "gen-b");
+        bucket.advance(3); // B current for 3 h > 2 h window; A's objects 4 h old
+        bucket.log.length = 0;
+        await save(bucket, "gen-c");
+        expect(bucket.deletes()).toEqual([
+            `${s3Key}.shards/gen-a/part-00.tzst`,
+            `${s3Key}.shards/gen-a/part-01.tzst`
+        ]);
+
+        // An invalid value falls back to the 24 h default (nothing is old enough).
+        process.env[ENV_SHARD_RETENTION_HOURS] = "soon";
+        bucket.advance(3);
+        bucket.log.length = 0;
+        await save(bucket, "gen-d");
+        expect(bucket.deletes()).toEqual([]);
+    });
+
+    test("legacy un-generationed parts are one pseudo-generation: protected while a legacy manifest is previous, retired by age afterwards", async () => {
+        const bucket = new FakeBucket();
+        const legacyManifest: ShardManifest = {
+            format: SHARDED_ARCHIVE_FORMAT,
+            shards: [{ name: "part-00.tzst", bytes: 3, files: 1 }],
+            totalBytes: 3,
+            totalFiles: 1,
+            createdAt: "2026-01-01T00:00:00.000Z"
+        };
+        bucket.put(`${s3Key}.shards/part-00.tzst`, "old", new Date(0));
+        bucket.put(s3Key, JSON.stringify(legacyManifest), new Date(0));
+
+        // The legacy manifest is what this save supersedes: its parts stay.
+        await save(bucket, "gen-a");
+        expect(bucket.deletes()).toEqual([]);
+        expect(bucket.objects.has(`${s3Key}.shards/part-00.tzst`)).toBe(true);
+        expect(bucket.log.join("\n")).toContain(`head ${s3Key}`);
+
+        // A day later the legacy parts are neither previous nor young: gone.
+        bucket.advance(25);
+        bucket.log.length = 0;
+        await save(bucket, "gen-b");
+        expect(bucket.deletes()).toEqual([`${s3Key}.shards/part-00.tzst`]);
+        expect(bucket.shardKeys()).toEqual([
+            `${s3Key}.shards/gen-a/part-00.tzst`,
+            `${s3Key}.shards/gen-a/part-01.tzst`,
+            `${s3Key}.shards/gen-b/part-00.tzst`,
+            `${s3Key}.shards/gen-b/part-01.tzst`
+        ]);
+    });
+
+    test("a previous single archive gates cleanup by its age but is not a generation", async () => {
+        const bucket = new FakeBucket();
+        bucket.put(`${s3Key}.shards/gen-old/part-00.tzst`, "o", new Date(0));
+        bucket.put(s3Key, Buffer.alloc(2 * 1024 * 1024, 1), new Date(0));
+        // The fake hands back the whole body; the real seam would omit it for
+        // an object this large, which parses the same way (not a manifest).
+        await save(bucket, "gen-a");
+        expect(bucket.deletes()).toEqual([
+            `${s3Key}.shards/gen-old/part-00.tzst`
+        ]);
+    });
+
+    test("regression: an interrupted replacement leaves the previous manifest and all of its parts intact, and deletes nothing", async () => {
+        const bucket = new FakeBucket();
+        const manifestA = await save(bucket, "gen-a");
         const snapshotA = new Map(
-            generationA.manifest.shards.map(shard => [
+            manifestA.shards.map(shard => [
                 `${s3Prefix}/${shard.key}`,
-                bucket.objects.get(`${s3Prefix}/${shard.key}`)
+                bucket.objects.get(`${s3Prefix}/${shard.key}`)!.body
             ])
         );
+        bucket.advance(48);
         bucket.log.length = 0;
 
         // Generation B: part 0 lands, part 1 dies mid-transfer.
         const generationB = makeGeneration("gen-b", 2);
-        let uploads = 0;
         await expect(
             backend.saveShardedCache(
                 key,
@@ -496,9 +782,11 @@ describe("saveShardedCache (in-memory bucket)", () => {
                 generationB.parts,
                 generationB.manifest,
                 saveOptions,
-                bucket.deps(() => {
-                    if (++uploads === 2) {
-                        throw new Error("connection reset by peer");
+                bucket.deps({
+                    beforeUpload: objectKey => {
+                        if (objectKey.endsWith("/gen-b/part-01.tzst")) {
+                            throw new Error("connection reset by peer");
+                        }
                     }
                 })
             )
@@ -506,12 +794,13 @@ describe("saveShardedCache (in-memory bucket)", () => {
 
         // Only B's first part was written; no manifest, no listing, no delete.
         expect(bucket.log).toEqual([
+            `head ${s3Key}`,
             `put ${s3Prefix}/${key}.shards/gen-b/part-00.tzst`
         ]);
 
         // The visible manifest is still A's, byte for byte.
         const visible = bucket.manifest();
-        expect(visible).toEqual(generationA.manifest);
+        expect(visible).toEqual(manifestA);
         expect(visible?.generation).toBe("gen-a");
 
         // And every key it references still resolves to A's own bytes — never
@@ -520,7 +809,7 @@ describe("saveShardedCache (in-memory bucket)", () => {
         for (const shard of visible!.shards) {
             const objectKey = `${s3Prefix}/${shard.key}`;
             expect(shard.key).toBe(`${key}.shards/gen-a/${shard.name}`);
-            const body = bucket.objects.get(objectKey);
+            const body = bucket.objects.get(objectKey)?.body;
             expect(body).toBeDefined();
             expect(body!.equals(snapshotA.get(objectKey)!)).toBe(true);
             expect(body!.length).toBe(shard.bytes);
@@ -545,43 +834,35 @@ describe("saveShardedCache (in-memory bucket)", () => {
             )
         ).toBe(s3Key);
 
-        // A later complete save (C) replaces A and sweeps A's parts and B's orphan.
+        // A complete save C right away replaces A but keeps A (previous) and
+        // B's orphan (young); a save D a day later sweeps both.
         bucket.log.length = 0;
-        const generationC = makeGeneration("gen-c", 2);
-        await backend.saveShardedCache(
-            key,
-            paths,
-            generationC.parts,
-            generationC.manifest,
-            saveOptions,
-            bucket.deps()
-        );
-        expect(bucket.manifest()).toEqual(generationC.manifest);
-        expect(
-            bucket.log.filter(line => line.startsWith("delete")).sort()
-        ).toEqual([
-            `delete ${s3Key}.shards/gen-a/part-00.tzst`,
-            `delete ${s3Key}.shards/gen-a/part-01.tzst`,
-            `delete ${s3Key}.shards/gen-b/part-00.tzst`
+        const manifestC = await save(bucket, "gen-c");
+        expect(bucket.manifest()).toEqual(manifestC);
+        expect(bucket.deletes()).toEqual([]);
+
+        bucket.advance(25);
+        bucket.log.length = 0;
+        const manifestD = await save(bucket, "gen-d");
+        expect(bucket.manifest()).toEqual(manifestD);
+        expect(bucket.deletes()).toEqual([
+            `${s3Key}.shards/gen-a/part-00.tzst`,
+            `${s3Key}.shards/gen-a/part-01.tzst`,
+            `${s3Key}.shards/gen-b/part-00.tzst`
         ]);
-        expect(
-            [...bucket.objects.keys()]
-                .filter(objectKey => objectKey.startsWith(`${s3Key}.shards/`))
-                .sort()
-        ).toEqual([
+        expect(bucket.shardKeys()).toEqual([
             `${s3Key}.shards/gen-c/part-00.tzst`,
-            `${s3Key}.shards/gen-c/part-01.tzst`
+            `${s3Key}.shards/gen-c/part-01.tzst`,
+            `${s3Key}.shards/gen-d/part-00.tzst`,
+            `${s3Key}.shards/gen-d/part-01.tzst`
         ]);
     });
 
     test("a cleanup failure never fails the save (the manifest is already in place)", async () => {
         const bucket = new FakeBucket();
-        bucket.objects.set(
-            `${s3Key}.shards/gen-old/part-00.tzst`,
-            Buffer.from("o")
-        );
+        bucket.put(`${s3Key}.shards/gen-old/part-00.tzst`, "o", new Date(0));
         const deps = bucket.deps();
-        deps.listObjectKeys = async () => {
+        deps.listObjects = async () => {
             throw new Error("AccessDenied: s3:ListBucket");
         };
         const { parts, manifest } = makeGeneration("gen-a", 1);
@@ -596,6 +877,49 @@ describe("saveShardedCache (in-memory bucket)", () => {
             )
         ).resolves.toBeUndefined();
         expect(bucket.manifest()).toEqual(manifest);
+        expect(bucket.objects.has(`${s3Key}.shards/gen-old/part-00.tzst`)).toBe(
+            true
+        );
+
+        // A failing delete is swallowed the same way.
+        const bucket2 = new FakeBucket();
+        bucket2.put(`${s3Key}.shards/gen-old/part-00.tzst`, "o", new Date(0));
+        const deps2 = bucket2.deps();
+        deps2.deleteObjectKeys = async () => {
+            throw new Error("AccessDenied: s3:DeleteObject");
+        };
+        const generationB = makeGeneration("gen-b", 1);
+        await expect(
+            backend.saveShardedCache(
+                key,
+                paths,
+                generationB.parts,
+                generationB.manifest,
+                saveOptions,
+                deps2
+            )
+        ).resolves.toBeUndefined();
+        expect(bucket2.manifest()).toEqual(generationB.manifest);
+    });
+
+    test("an uninspectable previous entry still saves, but defers every deletion", async () => {
+        const bucket = new FakeBucket();
+        bucket.put(`${s3Key}.shards/gen-old/part-00.tzst`, "o", new Date(0));
+        const deps = bucket.deps();
+        deps.readEntryObject = async () => {
+            throw new Error("AccessDenied: s3:GetObject");
+        };
+        const { parts, manifest } = makeGeneration("gen-a", 1);
+        await backend.saveShardedCache(
+            key,
+            paths,
+            parts,
+            manifest,
+            saveOptions,
+            deps
+        );
+        expect(bucket.manifest()).toEqual(manifest);
+        expect(bucket.deletes()).toEqual([]);
         expect(bucket.objects.has(`${s3Key}.shards/gen-old/part-00.tzst`)).toBe(
             true
         );
@@ -625,6 +949,113 @@ describe("saveShardedCache (in-memory bucket)", () => {
             )
         ).rejects.toThrow(/not under generation gen-a/);
         expect(bucket.objects.size).toBe(0);
+        expect(bucket.log).toEqual([]);
+    });
+});
+
+// ============================================================================
+// Previous-entry inspection through the real S3 commands.
+// ============================================================================
+describe("readPreviousEntryState (S3 commands)", () => {
+    const s3Key = "cache/owner/repo/v/lib-abc";
+    const stamp = at("2026-09-14T10:00:00Z");
+
+    test("a missing object is `absent`", async () => {
+        send.mockImplementation(async (command: unknown) => {
+            if (command instanceof HeadObjectCommand) {
+                const error = new Error("NotFound");
+                error.name = "NotFound";
+                (error as { $metadata?: unknown }).$metadata = {
+                    httpStatusCode: 404
+                };
+                throw error;
+            }
+            throw new Error("unexpected command");
+        });
+        await expect(backend.readPreviousEntryState(s3Key)).resolves.toEqual({
+            kind: "absent"
+        });
+        expect(send).toHaveBeenCalledTimes(1);
+    });
+
+    test("a small manifest is `sharded` with its generation and LastModified, read via HEAD then GET", async () => {
+        const body = JSON.stringify({
+            format: SHARDED_ARCHIVE_FORMAT,
+            generation: "gen-prev",
+            shards: [
+                {
+                    name: "part-00.tzst",
+                    key: "lib-abc.shards/gen-prev/part-00.tzst",
+                    bytes: 1,
+                    files: 1
+                }
+            ]
+        });
+        send.mockImplementation(async (command: unknown) => {
+            if (command instanceof HeadObjectCommand) {
+                expect(command.input.Key).toBe(s3Key);
+                return { ContentLength: body.length, LastModified: stamp };
+            }
+            if (command instanceof GetObjectCommand) {
+                return {
+                    Body: Readable.from([Buffer.from(body, "utf8")]),
+                    LastModified: stamp
+                };
+            }
+            throw new Error("unexpected command");
+        });
+        await expect(backend.readPreviousEntryState(s3Key)).resolves.toEqual({
+            kind: "sharded",
+            generation: "gen-prev",
+            lastModified: stamp
+        });
+    });
+
+    test("a legacy manifest without a generation maps to the legacy pseudo-generation", async () => {
+        const body = JSON.stringify({
+            format: SHARDED_ARCHIVE_FORMAT,
+            shards: [{ name: "part-00.tzst", bytes: 1, files: 1 }]
+        });
+        send.mockImplementation(async (command: unknown) => {
+            if (command instanceof HeadObjectCommand) {
+                return { ContentLength: body.length, LastModified: stamp };
+            }
+            if (command instanceof GetObjectCommand) {
+                return { Body: Readable.from([Buffer.from(body, "utf8")]) };
+            }
+            throw new Error("unexpected command");
+        });
+        await expect(backend.readPreviousEntryState(s3Key)).resolves.toEqual({
+            kind: "sharded",
+            generation: LEGACY_SHARD_GENERATION,
+            lastModified: stamp
+        });
+    });
+
+    test("a large object is `single` without being fetched", async () => {
+        send.mockImplementation(async (command: unknown) => {
+            if (command instanceof HeadObjectCommand) {
+                return {
+                    ContentLength: 60 * 1024 * 1024 * 1024,
+                    LastModified: stamp
+                };
+            }
+            throw new Error("GetObject must not be issued for a large object");
+        });
+        await expect(backend.readPreviousEntryState(s3Key)).resolves.toEqual({
+            kind: "single",
+            lastModified: stamp
+        });
+        expect(send).toHaveBeenCalledTimes(1);
+    });
+
+    test("any other failure is `unknown` (never throws)", async () => {
+        send.mockImplementation(async () => {
+            throw new Error("AccessDenied");
+        });
+        await expect(backend.readPreviousEntryState(s3Key)).resolves.toEqual({
+            kind: "unknown"
+        });
     });
 });
 
@@ -633,8 +1064,17 @@ describe("saveShardedCache (in-memory bucket)", () => {
 // ============================================================================
 describe("cleanupOtherShardGenerations (S3 commands)", () => {
     const s3Key = "cache/owner/repo/v/lib-abc";
+    const HOUR = 3600000;
+    const retention = 24 * HOUR;
+    const now = at("2026-09-15T12:00:00Z");
+    const hoursAgo = (hours: number): Date =>
+        new Date(now.getTime() - hours * HOUR);
+    const deps = (): backend.ShardedSaveDeps => ({
+        ...backend.defaultShardedSaveDeps,
+        now: () => now
+    });
 
-    test("lists every page under .shards/ and deletes only other generations", async () => {
+    test("lists every page under .shards/ and deletes only generations that are old, not current and not previous", async () => {
         const deleted: string[][] = [];
         send.mockImplementation(async (command: unknown) => {
             if (command instanceof ListObjectsV2Command) {
@@ -645,8 +1085,18 @@ describe("cleanupOtherShardGenerations (S3 commands)", () => {
                         IsTruncated: true,
                         NextContinuationToken: "page-2",
                         Contents: [
-                            { Key: `${s3Key}.shards/gen-old/part-00.tzst` },
-                            { Key: `${s3Key}.shards/gen-new/part-00.tzst` }
+                            {
+                                Key: `${s3Key}.shards/gen-old/part-00.tzst`,
+                                LastModified: hoursAgo(100)
+                            },
+                            {
+                                Key: `${s3Key}.shards/gen-new/part-00.tzst`,
+                                LastModified: hoursAgo(0)
+                            },
+                            {
+                                Key: `${s3Key}.shards/gen-prev/part-00.tzst`,
+                                LastModified: hoursAgo(60)
+                            }
                         ]
                     };
                 }
@@ -654,9 +1104,22 @@ describe("cleanupOtherShardGenerations (S3 commands)", () => {
                 return {
                     IsTruncated: false,
                     Contents: [
-                        { Key: `${s3Key}.shards/gen-new/part-01.tzst` },
-                        { Key: `${s3Key}.shards/part-00.tzst` },
-                        { Key: `${s3Key}.shards/gen-old/part-01.tzst` }
+                        {
+                            Key: `${s3Key}.shards/gen-new/part-01.tzst`,
+                            LastModified: hoursAgo(0)
+                        },
+                        {
+                            Key: `${s3Key}.shards/part-00.tzst`,
+                            LastModified: hoursAgo(300)
+                        },
+                        {
+                            Key: `${s3Key}.shards/gen-old/part-01.tzst`,
+                            LastModified: hoursAgo(99)
+                        },
+                        {
+                            Key: `${s3Key}.shards/gen-inflight/part-00.tzst`,
+                            LastModified: hoursAgo(0.2)
+                        }
                     ]
                 };
             }
@@ -673,29 +1136,130 @@ describe("cleanupOtherShardGenerations (S3 commands)", () => {
         });
 
         await expect(
-            backend.cleanupOtherShardGenerations(s3Key, "gen-new")
-        ).resolves.toEqual({ deleted: 3, kept: 2 });
+            backend.cleanupOtherShardGenerations(
+                s3Key,
+                "gen-new",
+                {
+                    kind: "sharded",
+                    generation: "gen-prev",
+                    lastModified: hoursAgo(60)
+                },
+                retention,
+                deps()
+            )
+        ).resolves.toEqual({
+            deletedObjects: 3,
+            deletedGenerations: 2,
+            keptGenerations: 2,
+            deferredGenerations: 1
+        });
         expect(deleted).toEqual([
             [
                 `${s3Key}.shards/gen-old/part-00.tzst`,
-                `${s3Key}.shards/part-00.tzst`,
-                `${s3Key}.shards/gen-old/part-01.tzst`
+                `${s3Key}.shards/gen-old/part-01.tzst`,
+                `${s3Key}.shards/part-00.tzst`
             ]
         ]);
+    });
+
+    test("batches deletes in groups of 1000", async () => {
+        const batches: number[] = [];
+        send.mockImplementation(async (command: unknown) => {
+            if (command instanceof ListObjectsV2Command) {
+                return {
+                    Contents: Array.from({ length: 2005 }, (_, index) => ({
+                        Key: `${s3Key}.shards/gen-old/part-${String(
+                            index
+                        ).padStart(4, "0")}.tzst`,
+                        LastModified: hoursAgo(100)
+                    }))
+                };
+            }
+            if (command instanceof DeleteObjectsCommand) {
+                batches.push(command.input.Delete?.Objects?.length ?? 0);
+                return { Deleted: [] };
+            }
+            throw new Error("unexpected command");
+        });
+        await expect(
+            backend.cleanupOtherShardGenerations(
+                s3Key,
+                "gen-new",
+                { kind: "absent" },
+                retention,
+                deps()
+            )
+        ).resolves.toMatchObject({ deletedObjects: 2005 });
+        expect(batches).toEqual([1000, 1000, 5]);
+    });
+
+    test("issues no delete while the previous entry is within the window", async () => {
+        send.mockImplementation(async (command: unknown) => {
+            if (command instanceof ListObjectsV2Command) {
+                return {
+                    Contents: [
+                        {
+                            Key: `${s3Key}.shards/gen-old/part-00.tzst`,
+                            LastModified: hoursAgo(100)
+                        },
+                        {
+                            Key: `${s3Key}.shards/gen-new/part-00.tzst`,
+                            LastModified: hoursAgo(0)
+                        }
+                    ]
+                };
+            }
+            throw new Error("DeleteObjects must not be issued");
+        });
+        await expect(
+            backend.cleanupOtherShardGenerations(
+                s3Key,
+                "gen-new",
+                {
+                    kind: "sharded",
+                    generation: "gen-prev",
+                    lastModified: hoursAgo(1)
+                },
+                retention,
+                deps()
+            )
+        ).resolves.toEqual({
+            deletedObjects: 0,
+            deletedGenerations: 0,
+            keptGenerations: 1,
+            deferredGenerations: 1
+        });
+        expect(send).toHaveBeenCalledTimes(1);
     });
 
     test("issues no delete when only the current generation exists", async () => {
         send.mockImplementation(async (command: unknown) => {
             if (command instanceof ListObjectsV2Command) {
                 return {
-                    Contents: [{ Key: `${s3Key}.shards/gen-new/part-00.tzst` }]
+                    Contents: [
+                        {
+                            Key: `${s3Key}.shards/gen-new/part-00.tzst`,
+                            LastModified: hoursAgo(0)
+                        }
+                    ]
                 };
             }
             throw new Error("DeleteObjects must not be issued");
         });
         await expect(
-            backend.cleanupOtherShardGenerations(s3Key, "gen-new")
-        ).resolves.toEqual({ deleted: 0, kept: 1 });
+            backend.cleanupOtherShardGenerations(
+                s3Key,
+                "gen-new",
+                { kind: "absent" },
+                retention,
+                deps()
+            )
+        ).resolves.toEqual({
+            deletedObjects: 0,
+            deletedGenerations: 0,
+            keptGenerations: 1,
+            deferredGenerations: 0
+        });
         expect(send).toHaveBeenCalledTimes(1);
     });
 
@@ -704,7 +1268,18 @@ describe("cleanupOtherShardGenerations (S3 commands)", () => {
             throw new Error("AccessDenied");
         });
         await expect(
-            backend.cleanupOtherShardGenerations(s3Key, "gen-new")
-        ).resolves.toEqual({ deleted: 0, kept: 0 });
+            backend.cleanupOtherShardGenerations(
+                s3Key,
+                "gen-new",
+                { kind: "absent" },
+                retention,
+                deps()
+            )
+        ).resolves.toEqual({
+            deletedObjects: 0,
+            deletedGenerations: 0,
+            keptGenerations: 0,
+            deferredGenerations: 0
+        });
     });
 });

@@ -20,10 +20,14 @@
 // replacement save that is interrupted (or that a restore overlaps with)
 // leaves the previous manifest and every part it references untouched, and a
 // partial upload never looks like a valid cache entry. Once the new manifest
-// is in place, parts of earlier generations are deleted on a best-effort
-// basis so they do not accumulate. The restore side recognizes the manifest,
-// downloads exactly the keys it lists, verifies size and sha256, and extracts
-// all parts concurrently with the legacy extract command.
+// is in place, parts of earlier generations are retired on a best-effort
+// basis so they do not accumulate — but only after a retention window (see
+// planShardGenerationCleanup): the generation just superseded and any
+// generation with a young object are left alone, because a reader may still
+// be downloading the former and a concurrent writer may still be uploading
+// the latter. The restore side recognizes the manifest, downloads exactly the
+// keys it lists, verifies size and sha256, and extracts all parts
+// concurrently with the legacy extract command.
 //
 // Everything here is opt-in: with the knob unset (or 0 / 1 / invalid) the save
 // and restore paths are byte-for-byte the legacy single-archive behavior, and a
@@ -46,6 +50,17 @@ import {
 export const ENV_ARCHIVE_SHARDS = "CACHE_ARCHIVE_SHARDS";
 export const MIN_ARCHIVE_SHARDS = 2;
 export const MAX_ARCHIVE_SHARDS = 64;
+
+/** Env var: hours a superseded shard generation is retained before a later
+ *  save may delete it (integer 1..720); anything else = the default. */
+export const ENV_SHARD_RETENTION_HOURS = "CACHE_SHARD_RETENTION_HOURS";
+export const DEFAULT_SHARD_RETENTION_HOURS = 24;
+export const MIN_SHARD_RETENTION_HOURS = 1;
+export const MAX_SHARD_RETENTION_HOURS = 720;
+
+/** Pseudo generation id of the un-generationed parts a manifest written
+ *  before generations existed references (`<key>.shards/part-NN.tzst`). */
+export const LEGACY_SHARD_GENERATION = "(legacy)";
 
 /** `format` field of the manifest object stored at the legacy archive key. */
 export const SHARDED_ARCHIVE_FORMAT = "sharded-tzst-v1";
@@ -165,6 +180,179 @@ export function getArchiveShardCount(
         return 1;
     }
     return count;
+}
+
+/**
+ * Parse `CACHE_SHARD_RETENTION_HOURS`. Returns the retention window in hours
+ * (1..720) when set to a valid integer in range, otherwise the 24 h default;
+ * an invalid value warns so a typo is visible but can never break a save.
+ */
+export function getShardRetentionHours(
+    env: NodeJS.ProcessEnv = process.env
+): number {
+    const raw = (env[ENV_SHARD_RETENTION_HOURS] ?? "").trim();
+    if (raw === "") {
+        return DEFAULT_SHARD_RETENTION_HOURS;
+    }
+    if (!/^\d+$/.test(raw)) {
+        core.warning(
+            `${ENV_SHARD_RETENTION_HOURS}='${raw}' is not an integer; using the default of ${DEFAULT_SHARD_RETENTION_HOURS} hours.`
+        );
+        return DEFAULT_SHARD_RETENTION_HOURS;
+    }
+    const hours = Number(raw);
+    if (
+        hours < MIN_SHARD_RETENTION_HOURS ||
+        hours > MAX_SHARD_RETENTION_HOURS
+    ) {
+        core.warning(
+            `${ENV_SHARD_RETENTION_HOURS}=${hours} is outside ${MIN_SHARD_RETENTION_HOURS}..${MAX_SHARD_RETENTION_HOURS}; using the default of ${DEFAULT_SHARD_RETENTION_HOURS} hours.`
+        );
+        return DEFAULT_SHARD_RETENTION_HOURS;
+    }
+    return hours;
+}
+
+/** One object under `<key>.shards/` as a cleanup listing reports it. */
+export interface ShardObjectListing {
+    /** Full object key (including the S3 prefix and `<key>.shards/`). */
+    key: string;
+    /** S3 LastModified; undefined when the listing did not report one. */
+    lastModified?: Date;
+}
+
+/**
+ * What the object at the entry key looked like right before a save started
+ * uploading — i.e. the entry the new manifest supersedes.
+ * - `absent`: nothing was stored at the entry key.
+ * - `sharded`: a shard manifest; `generation` is its generation, or
+ *   LEGACY_SHARD_GENERATION for a manifest written before generations.
+ * - `single`: a legacy single archive (it references no shard parts).
+ * - `unknown`: the object could not be inspected, so nothing is known about
+ *   the readers of the previous entry and cleanup must hold back.
+ */
+export interface PreviousEntryState {
+    kind: "absent" | "sharded" | "single" | "unknown";
+    generation?: string;
+    lastModified?: Date;
+}
+
+export interface ShardCleanupPlan {
+    /** Object keys to delete, in listing order. */
+    deleteKeys: string[];
+    /** Generations whose every object is being deleted. */
+    deletedGenerations: string[];
+    /** Generations protected outright: the new one and the previous one. */
+    keptGenerations: string[];
+    /** Generations left for a later save because something is still young. */
+    deferredGenerations: string[];
+    /** Why every deletion was held back, when a blanket hold applied. */
+    deferredReason?: string;
+}
+
+/** Generation id of a part object under `shardsPrefix` (its first path
+ *  segment), or LEGACY_SHARD_GENERATION for a bare `part-NN.tzst`. */
+export function shardObjectGeneration(
+    objectKey: string,
+    shardsPrefix: string
+): string {
+    const rest = objectKey.slice(shardsPrefix.length);
+    const slash = rest.indexOf("/");
+    return slash === -1 ? LEGACY_SHARD_GENERATION : rest.slice(0, slash);
+}
+
+/**
+ * Decide which generations under `<key>.shards/` a save that just published
+ * `currentGeneration` may delete. Concurrent saves of the same key are not
+ * mutually exclusive, and a restore may be downloading the manifest it
+ * picked while a save replaces it, so deletion is deferred and protected:
+ * a generation G is deleted only when ALL of these hold —
+ *  1. G is not the generation just published;
+ *  2. G is not the generation of the manifest just superseded (`previous`),
+ *     whose readers may still be downloading its parts;
+ *  3. the superseded entry was itself published more than the retention
+ *     window ago, so every generation older than it stopped being the
+ *     current entry at least that long ago (an absent previous entry
+ *     imposes nothing; an undated or uninspectable one defers everything);
+ *  4. every object of G is older than the retention window (a young object
+ *     is a concurrent writer's part whose manifest is not published yet).
+ * Legacy un-generationed parts count as one pseudo-generation subject to the
+ * same rules. An object without a LastModified counts as young.
+ */
+export function planShardGenerationCleanup(
+    objects: ShardObjectListing[],
+    shardsPrefix: string,
+    currentGeneration: string,
+    previous: PreviousEntryState,
+    retentionMs: number,
+    now: Date = new Date()
+): ShardCleanupPlan {
+    const cutoff = now.getTime() - retentionMs;
+    const isOld = (stamp: Date | undefined): boolean =>
+        stamp !== undefined && stamp.getTime() < cutoff;
+
+    const byGeneration = new Map<string, ShardObjectListing[]>();
+    for (const object of objects) {
+        const generation = shardObjectGeneration(object.key, shardsPrefix);
+        const group = byGeneration.get(generation);
+        if (group) {
+            group.push(object);
+        } else {
+            byGeneration.set(generation, [object]);
+        }
+    }
+
+    const plan: ShardCleanupPlan = {
+        deleteKeys: [],
+        deletedGenerations: [],
+        keptGenerations: [],
+        deferredGenerations: []
+    };
+
+    let holdAll: string | undefined;
+    if (previous.kind === "unknown") {
+        holdAll = "the previous entry could not be inspected before the upload";
+    } else if (previous.kind !== "absent" && !isOld(previous.lastModified)) {
+        holdAll =
+            previous.lastModified === undefined
+                ? "the previous entry has no LastModified"
+                : `the previous entry was published ${describeAge(
+                      previous.lastModified,
+                      now
+                  )} ago, within the retention window`;
+    }
+
+    for (const [generation, group] of byGeneration) {
+        if (
+            generation === currentGeneration ||
+            (previous.kind === "sharded" && generation === previous.generation)
+        ) {
+            plan.keptGenerations.push(generation);
+            continue;
+        }
+        if (holdAll !== undefined) {
+            plan.deferredGenerations.push(generation);
+            continue;
+        }
+        if (group.every(object => isOld(object.lastModified))) {
+            plan.deletedGenerations.push(generation);
+            plan.deleteKeys.push(...group.map(object => object.key));
+        } else {
+            plan.deferredGenerations.push(generation);
+        }
+    }
+    if (holdAll !== undefined && plan.deferredGenerations.length > 0) {
+        plan.deferredReason = holdAll;
+    }
+    return plan;
+}
+
+function describeAge(stamp: Date, now: Date): string {
+    const minutes = Math.max(
+        0,
+        Math.round((now.getTime() - stamp.getTime()) / 60000)
+    );
+    return minutes < 120 ? `${minutes} min` : `${(minutes / 60).toFixed(1)} h`;
 }
 
 /** True for a shard part object (`<key>.shards/<generation>/part-NN.tzst`,

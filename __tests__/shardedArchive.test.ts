@@ -18,21 +18,29 @@ import {
     assignFilesToShards,
     CacheFileEntry,
     createShardedArchive,
+    DEFAULT_SHARD_RETENTION_HOURS,
     enumerateCacheEntries,
     ENV_ARCHIVE_SHARDS,
+    ENV_SHARD_RETENTION_HOURS,
     extractShardedArchive,
     getArchiveShardCount,
+    getShardRetentionHours,
     hashFileSha256,
     isShardPartObjectKey,
+    LEGACY_SHARD_GENERATION,
     mapWithConcurrency,
     newShardGeneration,
     parseShardManifest,
+    planShardGenerationCleanup,
+    PreviousEntryState,
     resolveShardPartLocation,
     rewriteZstdThreadsForShards,
     SHARDED_ARCHIVE_FORMAT,
     ShardedArchiveDeps,
     shardGenerationKeyPrefix,
     shardListName,
+    shardObjectGeneration,
+    ShardObjectListing,
     shardPartKey,
     shardPartName,
     shardsKeyPrefix
@@ -63,6 +71,265 @@ describe("getArchiveShardCount", () => {
         for (const bad of ["65", "1000", "-4", "4.5", "four", "8x", "0x8"]) {
             expect(getArchiveShardCount({ [ENV_ARCHIVE_SHARDS]: bad })).toBe(1);
         }
+    });
+});
+
+// ============================================================================
+// CACHE_SHARD_RETENTION_HOURS parsing (1..720; anything else = 24 h default).
+// ============================================================================
+describe("getShardRetentionHours", () => {
+    test("unset / blank mean the 24 h default", () => {
+        expect(DEFAULT_SHARD_RETENTION_HOURS).toBe(24);
+        expect(getShardRetentionHours({})).toBe(24);
+        expect(
+            getShardRetentionHours({ [ENV_SHARD_RETENTION_HOURS]: "" })
+        ).toBe(24);
+        expect(
+            getShardRetentionHours({ [ENV_SHARD_RETENTION_HOURS]: "  " })
+        ).toBe(24);
+    });
+
+    test("accepts integers in 1..720 (trimmed)", () => {
+        expect(
+            getShardRetentionHours({ [ENV_SHARD_RETENTION_HOURS]: "1" })
+        ).toBe(1);
+        expect(
+            getShardRetentionHours({ [ENV_SHARD_RETENTION_HOURS]: " 48 " })
+        ).toBe(48);
+        expect(
+            getShardRetentionHours({ [ENV_SHARD_RETENTION_HOURS]: "720" })
+        ).toBe(720);
+    });
+
+    test("rejects 0, out-of-range and non-integer values as the default", () => {
+        for (const bad of ["0", "721", "-1", "1.5", "day", "24h", "0x18"]) {
+            expect(
+                getShardRetentionHours({ [ENV_SHARD_RETENTION_HOURS]: bad })
+            ).toBe(24);
+        }
+    });
+});
+
+// ============================================================================
+// Cleanup plan: deferred, protected deletion of superseded generations.
+// ============================================================================
+describe("planShardGenerationCleanup", () => {
+    const prefix = "cache/v/lib-abc.shards/";
+    const HOUR = 3600000;
+    const retention = 24 * HOUR;
+    const now = new Date("2026-09-15T12:00:00Z");
+    const hoursAgo = (hours: number): Date =>
+        new Date(now.getTime() - hours * HOUR);
+    const object = (
+        generation: string | undefined,
+        index: number,
+        ageHours: number | undefined
+    ): ShardObjectListing => ({
+        key:
+            generation === undefined
+                ? `${prefix}part-0${index}.tzst`
+                : `${prefix}${generation}/part-0${index}.tzst`,
+        lastModified: ageHours === undefined ? undefined : hoursAgo(ageHours)
+    });
+    const superseded = (
+        generation: string | undefined,
+        ageHours: number
+    ): PreviousEntryState => ({
+        kind: "sharded",
+        generation: generation ?? LEGACY_SHARD_GENERATION,
+        lastModified: hoursAgo(ageHours)
+    });
+
+    test("groups objects by generation, legacy parts as one pseudo-generation", () => {
+        expect(
+            shardObjectGeneration(`${prefix}gen-a/part-00.tzst`, prefix)
+        ).toBe("gen-a");
+        expect(shardObjectGeneration(`${prefix}part-00.tzst`, prefix)).toBe(
+            LEGACY_SHARD_GENERATION
+        );
+    });
+
+    test("deletes a generation only when it is old, not current, not previous, and the previous entry is old", () => {
+        const plan = planShardGenerationCleanup(
+            [
+                object("gen-old", 0, 100),
+                object("gen-old", 1, 90),
+                object("gen-prev", 0, 30),
+                object("gen-new", 0, 0),
+                object(undefined, 0, 200),
+                object("gen-orphan-young", 0, 1)
+            ],
+            prefix,
+            "gen-new",
+            superseded("gen-prev", 30),
+            retention,
+            now
+        );
+        expect(plan.deleteKeys).toEqual([
+            `${prefix}gen-old/part-00.tzst`,
+            `${prefix}gen-old/part-01.tzst`,
+            `${prefix}part-00.tzst`
+        ]);
+        expect(plan.deletedGenerations).toEqual([
+            "gen-old",
+            LEGACY_SHARD_GENERATION
+        ]);
+        expect(plan.keptGenerations).toEqual(["gen-prev", "gen-new"]);
+        expect(plan.deferredGenerations).toEqual(["gen-orphan-young"]);
+        expect(plan.deferredReason).toBeUndefined();
+    });
+
+    test("never deletes the previous generation, however old it is", () => {
+        const plan = planShardGenerationCleanup(
+            [object("gen-prev", 0, 500), object("gen-new", 0, 0)],
+            prefix,
+            "gen-new",
+            superseded("gen-prev", 500),
+            retention,
+            now
+        );
+        expect(plan.deleteKeys).toEqual([]);
+        expect(plan.keptGenerations).toEqual(["gen-prev", "gen-new"]);
+    });
+
+    test("defers everything while the previous entry is within the window", () => {
+        const plan = planShardGenerationCleanup(
+            [
+                object("gen-old", 0, 100),
+                object("gen-prev", 0, 1),
+                object("gen-new", 0, 0)
+            ],
+            prefix,
+            "gen-new",
+            superseded("gen-prev", 1),
+            retention,
+            now
+        );
+        expect(plan.deleteKeys).toEqual([]);
+        expect(plan.deferredGenerations).toEqual(["gen-old"]);
+        expect(plan.keptGenerations).toEqual(["gen-prev", "gen-new"]);
+        expect(plan.deferredReason).toMatch(/within the retention window/);
+    });
+
+    test("a generation with one young object is deferred whole (in-progress writer)", () => {
+        const plan = planShardGenerationCleanup(
+            [
+                object("gen-b", 0, 100),
+                object("gen-b", 1, 0.1),
+                object("gen-new", 0, 0)
+            ],
+            prefix,
+            "gen-new",
+            { kind: "absent" },
+            retention,
+            now
+        );
+        expect(plan.deleteKeys).toEqual([]);
+        expect(plan.deferredGenerations).toEqual(["gen-b"]);
+    });
+
+    test("an object without LastModified counts as young", () => {
+        const plan = planShardGenerationCleanup(
+            [object("gen-b", 0, undefined), object("gen-new", 0, 0)],
+            prefix,
+            "gen-new",
+            { kind: "absent" },
+            retention,
+            now
+        );
+        expect(plan.deleteKeys).toEqual([]);
+        expect(plan.deferredGenerations).toEqual(["gen-b"]);
+    });
+
+    test("legacy manifest as the previous entry protects the legacy parts", () => {
+        const plan = planShardGenerationCleanup(
+            [
+                object(undefined, 0, 300),
+                object("gen-old", 0, 300),
+                object("gen-new", 0, 0)
+            ],
+            prefix,
+            "gen-new",
+            superseded(undefined, 300),
+            retention,
+            now
+        );
+        expect(plan.deleteKeys).toEqual([`${prefix}gen-old/part-00.tzst`]);
+        expect(plan.keptGenerations).toEqual([
+            LEGACY_SHARD_GENERATION,
+            "gen-new"
+        ]);
+    });
+
+    test("an absent previous entry imposes no hold: only the age rule applies", () => {
+        const plan = planShardGenerationCleanup(
+            [
+                object("gen-old", 0, 25),
+                object("gen-young", 0, 23),
+                object("gen-new", 0, 0)
+            ],
+            prefix,
+            "gen-new",
+            { kind: "absent" },
+            retention,
+            now
+        );
+        expect(plan.deletedGenerations).toEqual(["gen-old"]);
+        expect(plan.deferredGenerations).toEqual(["gen-young"]);
+    });
+
+    test("a single-archive previous entry is not a generation but its age still gates cleanup", () => {
+        const young = planShardGenerationCleanup(
+            [object("gen-old", 0, 100), object("gen-new", 0, 0)],
+            prefix,
+            "gen-new",
+            { kind: "single", lastModified: hoursAgo(2) },
+            retention,
+            now
+        );
+        expect(young.deleteKeys).toEqual([]);
+        expect(young.deferredGenerations).toEqual(["gen-old"]);
+
+        const old = planShardGenerationCleanup(
+            [object("gen-old", 0, 100), object("gen-new", 0, 0)],
+            prefix,
+            "gen-new",
+            { kind: "single", lastModified: hoursAgo(48) },
+            retention,
+            now
+        );
+        expect(old.deletedGenerations).toEqual(["gen-old"]);
+    });
+
+    test("an uninspectable or undated previous entry defers everything", () => {
+        for (const previous of [
+            { kind: "unknown" } as PreviousEntryState,
+            { kind: "sharded", generation: "gen-prev" } as PreviousEntryState
+        ]) {
+            const plan = planShardGenerationCleanup(
+                [object("gen-old", 0, 100), object("gen-new", 0, 0)],
+                prefix,
+                "gen-new",
+                previous,
+                retention,
+                now
+            );
+            expect(plan.deleteKeys).toEqual([]);
+            expect(plan.deferredGenerations).toEqual(["gen-old"]);
+            expect(plan.deferredReason).toBeDefined();
+        }
+    });
+
+    test("honors a custom retention window", () => {
+        const plan = planShardGenerationCleanup(
+            [object("gen-old", 0, 3), object("gen-new", 0, 0)],
+            prefix,
+            "gen-new",
+            superseded("gen-prev", 3),
+            2 * HOUR,
+            now
+        );
+        expect(plan.deletedGenerations).toEqual(["gen-old"]);
     });
 });
 
