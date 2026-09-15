@@ -11,19 +11,26 @@
 // under the cache paths, splits them into N size-balanced groups (greedy
 // largest-first bin packing), and runs N independent
 // `tar --no-recursion --files-from shard-<i>.txt | zstd` processes at once.
-// Each part is uploaded to `<s3prefix>/<key>.shards/part-<i>.tzst`, and a
-// small JSON manifest is written LAST as the object at `<s3prefix>/<key>` —
-// the exact S3 key the legacy single archive uses — so a listing that finds
-// the manifest always finds a complete set of parts, and a partial upload never
-// looks like a valid cache entry. The restore side recognizes the manifest,
-// downloads every part, and extracts all of them concurrently with the legacy
-// extract command.
+// Every save mints a fresh, unique GENERATION id and uploads its parts to
+// `<s3prefix>/<key>.shards/<generation>/part-<i>.tzst`; a small JSON manifest
+// naming those exact object keys (plus the size and sha256 of each part) is
+// written LAST as the object at `<s3prefix>/<key>` — the exact S3 key the
+// legacy single archive uses. Because part objects are never overwritten in
+// place, a manifest always refers to an immutable, complete set of parts: a
+// replacement save that is interrupted (or that a restore overlaps with)
+// leaves the previous manifest and every part it references untouched, and a
+// partial upload never looks like a valid cache entry. Once the new manifest
+// is in place, parts of earlier generations are deleted on a best-effort
+// basis so they do not accumulate. The restore side recognizes the manifest,
+// downloads exactly the keys it lists, verifies size and sha256, and extracts
+// all parts concurrently with the legacy extract command.
 //
 // Everything here is opt-in: with the knob unset (or 0 / 1 / invalid) the save
 // and restore paths are byte-for-byte the legacy single-archive behavior, and a
 // restore always accepts both shapes because it decides per entry by looking at
 // the stored object, never at the knob.
 import * as core from "@actions/core";
+import { createHash, randomBytes } from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -42,7 +49,9 @@ export const MAX_ARCHIVE_SHARDS = 64;
 
 /** `format` field of the manifest object stored at the legacy archive key. */
 export const SHARDED_ARCHIVE_FORMAT = "sharded-tzst-v1";
-/** Appended to the entry's S3 key to form the part prefix: `<key>.shards/part-00.tzst`. */
+/** Appended to the entry's S3 key to form the part prefix:
+ *  `<key>.shards/<generation>/part-00.tzst` (or `<key>.shards/part-00.tzst`
+ *  for manifests written before generations existed). */
 export const SHARDS_KEY_SUFFIX = ".shards/";
 /** Objects at or above this size are never inspected as a manifest candidate. */
 export const SHARD_MANIFEST_MAX_BYTES = 1024 * 1024;
@@ -52,16 +61,29 @@ export const SHARD_MANIFEST_MAX_BYTES = 1024 * 1024;
 export const SHARD_DOWNLOAD_CONCURRENCY = 2;
 
 export interface ShardManifestEntry {
-    /** Object name under `<key>.shards/`, e.g. `part-00.tzst`. */
+    /** Part file name, e.g. `part-00.tzst` (also the local staging name). */
     name: string;
+    /**
+     * Full object key of the part relative to the S3 prefix, e.g.
+     * `<key>.shards/<generation>/part-00.tzst`. A restore downloads exactly
+     * this key. Absent on manifests written before generations existed; those
+     * fall back to the legacy `<key>.shards/<name>` naming.
+     */
+    key?: string;
     /** Compressed size of the part in bytes. */
     bytes: number;
     /** Number of regular files stored in the part. */
     files: number;
+    /** Lowercase hex sha256 of the part file; absent on legacy manifests
+     *  (then the restore verifies the size only). */
+    sha256?: string;
 }
 
 export interface ShardManifest {
     format: typeof SHARDED_ARCHIVE_FORMAT;
+    /** Unique id of the save that wrote this manifest; its parts live under
+     *  `<key>.shards/<generation>/`. Absent on legacy manifests. */
+    generation?: string;
     shards: ShardManifestEntry[];
     totalBytes: number;
     totalFiles: number;
@@ -93,11 +115,15 @@ export interface ShardAssignment {
 export interface ShardPart {
     index: number;
     name: string;
+    /** Object key of the part relative to the S3 prefix (see ShardManifestEntry.key). */
+    key: string;
     /** Local path of the part file inside the archive staging directory. */
     path: string;
     /** Compressed size on disk. */
     bytes: number;
     files: number;
+    /** Lowercase hex sha256 of the part file on disk. */
+    sha256: string;
 }
 
 export interface ShardedArchiveResult {
@@ -141,8 +167,9 @@ export function getArchiveShardCount(
     return count;
 }
 
-/** True for a shard part object (`<key>.shards/part-NN.tzst`), which must
- *  never be picked as "the newest cache entry" by a prefix listing. */
+/** True for a shard part object (`<key>.shards/<generation>/part-NN.tzst`,
+ *  or the legacy `<key>.shards/part-NN.tzst`), which must never be picked as
+ *  "the newest cache entry" by a prefix listing. */
 export function isShardPartObjectKey(key: string): boolean {
     return key.includes(SHARDS_KEY_SUFFIX);
 }
@@ -152,18 +179,120 @@ export function shardPartName(index: number): string {
     return `part-${String(index).padStart(2, "0")}.tzst`;
 }
 
+const GENERATION_PATTERN = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * Mint a generation id for one save: the UTC timestamp compacted to
+ * `YYYYMMDDTHHMMSSmmmZ` plus 8 random hex characters, so ids sort by time in
+ * a listing and two saves started in the same millisecond still differ.
+ */
+export function newShardGeneration(now: Date = new Date()): string {
+    const stamp = now.toISOString().replace(/[-:]/g, "").replace(".", "");
+    return `${stamp}-${randomBytes(4).toString("hex")}`;
+}
+
+/** Prefix (relative to the S3 prefix) under which every generation of an
+ *  entry stores its parts: `<key>.shards/`. */
+export function shardsKeyPrefix(entryKey: string): string {
+    return `${entryKey}${SHARDS_KEY_SUFFIX}`;
+}
+
+/** Prefix (relative to the S3 prefix) of one generation's parts:
+ *  `<key>.shards/<generation>/`. */
+export function shardGenerationKeyPrefix(
+    entryKey: string,
+    generation: string
+): string {
+    return `${shardsKeyPrefix(entryKey)}${generation}/`;
+}
+
+/** Object key (relative to the S3 prefix) of shard `index` of `generation`. */
+export function shardPartKey(
+    entryKey: string,
+    generation: string,
+    index: number
+): string {
+    return `${shardGenerationKeyPrefix(entryKey, generation)}${shardPartName(
+        index
+    )}`;
+}
+
+/**
+ * Resolve the S3 location of one part of a manifest stored at
+ * `archiveLocation` (`s3://bucket/<s3prefix>/<entryKey>`). A manifest that
+ * records a `key` is downloaded from exactly that key; the key is required
+ * to sit under this entry's own `<entryKey>.shards/` prefix so a corrupt or
+ * foreign manifest can never point the restore at an unrelated object. A
+ * legacy manifest (no `key`) resolves to `<archiveLocation>.shards/<name>`.
+ */
+export function resolveShardPartLocation(
+    archiveLocation: string,
+    entryKey: string,
+    shard: ShardManifestEntry
+): string {
+    if (shard.key === undefined) {
+        return `${archiveLocation}${SHARDS_KEY_SUFFIX}${shard.name}`;
+    }
+    const entrySuffix = `/${entryKey}`;
+    if (entryKey === "" || !archiveLocation.endsWith(entrySuffix)) {
+        throw new Error(
+            `Sharded cache entry location ${archiveLocation} does not end with the entry key ${entryKey}.`
+        );
+    }
+    if (!shard.key.startsWith(shardsKeyPrefix(entryKey))) {
+        throw new Error(
+            `Sharded cache manifest for ${entryKey} references a part outside the entry: ${shard.key}`
+        );
+    }
+    const prefixLocation = archiveLocation.slice(
+        0,
+        archiveLocation.length - entrySuffix.length
+    );
+    return `${prefixLocation}/${shard.key}`;
+}
+
+/** Streaming sha256 of a file on disk, as lowercase hex. */
+export async function hashFileSha256(filePath: string): Promise<string> {
+    const hash = createHash("sha256");
+    for await (const chunk of fs.createReadStream(filePath)) {
+        hash.update(chunk as Buffer);
+    }
+    return hash.digest("hex");
+}
+
 /** File name of the `--files-from` list for shard `index`. */
 export function shardListName(index: number): string {
     return `shard-${String(index).padStart(2, "0")}.txt`;
 }
 
 const PART_NAME_PATTERN = /^part-\d{2,}\.tzst$/;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+
+/** A manifest `key` is a relative object key: no leading slash, no backslash,
+ *  no empty / `.` / `..` segments, and it must live under some `.shards/`
+ *  prefix and end with its own part name. */
+function isSafePartKey(key: string, name: string): boolean {
+    if (key.startsWith("/") || key.includes("\\")) {
+        return false;
+    }
+    if (!key.includes(SHARDS_KEY_SUFFIX) || !key.endsWith(`/${name}`)) {
+        return false;
+    }
+    return key
+        .split("/")
+        .every(
+            segment => segment !== "" && segment !== "." && segment !== ".."
+        );
+}
 
 /**
  * Decide whether an object body is a sharded-archive manifest. Anything that
  * is not UTF-8 JSON with `format === "sharded-tzst-v1"` and a well-formed,
  * non-empty `shards` array (safe names, numeric sizes) is NOT a manifest — a
  * legacy zstd archive, whose bytes never parse as JSON, returns undefined.
+ * The optional `generation`, per-part `key` and `sha256` fields are kept when
+ * present and well-formed; a manifest that carries a malformed one is
+ * rejected rather than silently downgraded to the legacy naming.
  */
 export function parseShardManifest(
     body: Buffer | string
@@ -185,12 +314,22 @@ export function parseShardManifest(
     if (!Array.isArray(candidate.shards) || candidate.shards.length === 0) {
         return undefined;
     }
+    if (
+        candidate.generation !== undefined &&
+        (typeof candidate.generation !== "string" ||
+            !GENERATION_PATTERN.test(candidate.generation))
+    ) {
+        return undefined;
+    }
     const shards: ShardManifestEntry[] = [];
     for (const entry of candidate.shards as unknown[]) {
         if (typeof entry !== "object" || entry === null) {
             return undefined;
         }
-        const { name, bytes, files } = entry as Record<string, unknown>;
+        const { name, key, bytes, files, sha256 } = entry as Record<
+            string,
+            unknown
+        >;
         if (
             typeof name !== "string" ||
             !PART_NAME_PATTERN.test(name) ||
@@ -203,7 +342,26 @@ export function parseShardManifest(
         ) {
             return undefined;
         }
-        shards.push({ name, bytes, files });
+        if (
+            key !== undefined &&
+            (typeof key !== "string" || !isSafePartKey(key, name))
+        ) {
+            return undefined;
+        }
+        if (
+            sha256 !== undefined &&
+            (typeof sha256 !== "string" || !SHA256_PATTERN.test(sha256))
+        ) {
+            return undefined;
+        }
+        const shard: ShardManifestEntry = { name, bytes, files };
+        if (key !== undefined) {
+            shard.key = key;
+        }
+        if (sha256 !== undefined) {
+            shard.sha256 = sha256;
+        }
+        shards.push(shard);
     }
     const totalBytes =
         typeof candidate.totalBytes === "number"
@@ -213,7 +371,7 @@ export function parseShardManifest(
         typeof candidate.totalFiles === "number"
             ? candidate.totalFiles
             : shards.reduce((sum, shard) => sum + shard.files, 0);
-    return {
+    const manifest: ShardManifest = {
         format: SHARDED_ARCHIVE_FORMAT,
         shards,
         totalBytes,
@@ -221,6 +379,10 @@ export function parseShardManifest(
         createdAt:
             typeof candidate.createdAt === "string" ? candidate.createdAt : ""
     };
+    if (typeof candidate.generation === "string") {
+        manifest.generation = candidate.generation;
+    }
+    return manifest;
 }
 
 /**
@@ -481,17 +643,24 @@ async function settleAll(
 
 /**
  * Archive `cachePaths` as `shardCount` size-balanced zstd tar parts inside
- * `archiveFolder`, all created concurrently. Returns the manifest to store at
- * the entry key plus the local part files to upload. Any shard failure rejects
- * after every shard has settled (so no tar is left running while the caller
- * cleans up).
+ * `archiveFolder`, all created concurrently, then sha256 each part on disk.
+ * Returns the manifest to store at the entry key `entryKey` plus the local
+ * part files to upload; the parts are keyed under a fresh `generation` (see
+ * shardPartKey) so they never overwrite an earlier save's objects. Any shard
+ * failure rejects after every shard has settled (so no tar is left running
+ * while the caller cleans up).
  */
 export async function createShardedArchive(
     archiveFolder: string,
     cachePaths: string[],
     shardCount: number,
-    deps: ShardedArchiveDeps = defaultDeps
+    entryKey: string,
+    deps: ShardedArchiveDeps = defaultDeps,
+    generation: string = newShardGeneration()
 ): Promise<ShardedArchiveResult> {
+    if (!GENERATION_PATTERN.test(generation)) {
+        throw new Error(`Invalid shard generation id: ${generation}`);
+    }
     const workspaceRoot = getWorkingDirectory();
 
     const enumerateStartedAt = Date.now();
@@ -547,14 +716,27 @@ export async function createShardedArchive(
     );
     const tarSeconds = elapsedSeconds(tarStartedAt);
 
+    // Digest every part while it is still on disk: the restore verifies the
+    // downloaded bytes against this, so a corrupted or mismatched object can
+    // never be extracted over the workspace.
+    const hashStartedAt = Date.now();
+    const digests = await Promise.all(
+        assignments.map((_, index) =>
+            hashFileSha256(path.join(archiveFolder, shardPartName(index)))
+        )
+    );
+    const hashSeconds = elapsedSeconds(hashStartedAt);
+
     const parts: ShardPart[] = assignments.map((shard, index) => {
         const partPath = path.join(archiveFolder, shardPartName(index));
         return {
             index,
             name: shardPartName(index),
+            key: shardPartKey(entryKey, generation, index),
             path: partPath,
             bytes: fs.statSync(partPath).size,
-            files: shard.files
+            files: shard.files,
+            sha256: digests[index]
         };
     });
     for (const part of parts) {
@@ -562,9 +744,14 @@ export async function createShardedArchive(
         core.info(
             `  ${part.name}: ${part.files} files, ${formatMb(
                 raw
-            )} raw -> ${formatMb(part.bytes)} compressed (${part.bytes} B)`
+            )} raw -> ${formatMb(part.bytes)} compressed (${
+                part.bytes
+            } B), sha256 ${part.sha256}`
         );
     }
+    core.info(
+        `Sharded archive: hashed ${parts.length} part(s) (sha256) in ${hashSeconds}s; generation ${generation}.`
+    );
 
     const totalBytes = parts.reduce((sum, part) => sum + part.bytes, 0);
     const totalFiles = parts.reduce((sum, part) => sum + part.files, 0);
@@ -576,10 +763,13 @@ export async function createShardedArchive(
 
     const manifest: ShardManifest = {
         format: SHARDED_ARCHIVE_FORMAT,
+        generation,
         shards: parts.map(part => ({
             name: part.name,
+            key: part.key,
             bytes: part.bytes,
-            files: part.files
+            files: part.files,
+            sha256: part.sha256
         })),
         totalBytes,
         totalFiles,

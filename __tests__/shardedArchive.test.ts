@@ -8,6 +8,7 @@ import {
     jest,
     test
 } from "@jest/globals";
+import { createHash } from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -21,15 +22,24 @@ import {
     ENV_ARCHIVE_SHARDS,
     extractShardedArchive,
     getArchiveShardCount,
+    hashFileSha256,
     isShardPartObjectKey,
     mapWithConcurrency,
+    newShardGeneration,
     parseShardManifest,
+    resolveShardPartLocation,
     rewriteZstdThreadsForShards,
     SHARDED_ARCHIVE_FORMAT,
     ShardedArchiveDeps,
+    shardGenerationKeyPrefix,
     shardListName,
-    shardPartName
+    shardPartKey,
+    shardPartName,
+    shardsKeyPrefix
 } from "../src/custom/shardedArchive";
+
+const sha256Of = (data: Buffer | string): string =>
+    createHash("sha256").update(data).digest("hex");
 
 // ============================================================================
 // CACHE_ARCHIVE_SHARDS parsing (2..64; anything else = legacy single archive).
@@ -218,6 +228,84 @@ describe("parseShardManifest", () => {
         ).toBeUndefined();
     });
 
+    test("keeps generation, per-part key and sha256 when present", () => {
+        const digest = sha256Of("part-00");
+        const modern = {
+            ...manifest,
+            generation: "20260915T101112123Z-0badf00d",
+            shards: [
+                {
+                    name: "part-00.tzst",
+                    key: "my-key.shards/20260915T101112123Z-0badf00d/part-00.tzst",
+                    bytes: 10,
+                    files: 2,
+                    sha256: digest
+                },
+                {
+                    name: "part-01.tzst",
+                    key: "my-key.shards/20260915T101112123Z-0badf00d/part-01.tzst",
+                    bytes: 20,
+                    files: 3,
+                    sha256: digest
+                }
+            ]
+        };
+        expect(parseShardManifest(JSON.stringify(modern))).toEqual(modern);
+        // A legacy manifest parses without the new fields at all.
+        const legacy = parseShardManifest(JSON.stringify(manifest));
+        expect(legacy).toBeDefined();
+        expect("generation" in legacy!).toBe(false);
+        expect("key" in legacy!.shards[0]).toBe(false);
+        expect("sha256" in legacy!.shards[0]).toBe(false);
+    });
+
+    test("rejects malformed generation, key or sha256 fields", () => {
+        const withGeneration = (generation: unknown): string =>
+            JSON.stringify({ ...manifest, generation });
+        expect(parseShardManifest(withGeneration(42))).toBeUndefined();
+        expect(parseShardManifest(withGeneration("a/b"))).toBeUndefined();
+        expect(parseShardManifest(withGeneration(""))).toBeUndefined();
+
+        const withKey = (key: unknown): string =>
+            JSON.stringify({
+                ...manifest,
+                shards: [{ name: "part-00.tzst", key, bytes: 1, files: 1 }]
+            });
+        expect(parseShardManifest(withKey(7))).toBeUndefined();
+        expect(
+            parseShardManifest(withKey("/abs.shards/g/part-00.tzst"))
+        ).toBeUndefined();
+        expect(
+            parseShardManifest(withKey("k.shards/../part-00.tzst"))
+        ).toBeUndefined();
+        expect(
+            parseShardManifest(withKey("k.shards/g//part-00.tzst"))
+        ).toBeUndefined();
+        expect(
+            parseShardManifest(withKey("k.shards\\g\\part-00.tzst"))
+        ).toBeUndefined();
+        expect(parseShardManifest(withKey("k/g/part-00.tzst"))).toBeUndefined();
+        // Key must end with the entry's own part name.
+        expect(
+            parseShardManifest(withKey("k.shards/g/part-01.tzst"))
+        ).toBeUndefined();
+        expect(
+            parseShardManifest(withKey("k.shards/g/part-00.tzst"))
+        ).toBeDefined();
+
+        const withSha = (sha256: unknown): string =>
+            JSON.stringify({
+                ...manifest,
+                shards: [{ name: "part-00.tzst", bytes: 1, files: 1, sha256 }]
+            });
+        expect(parseShardManifest(withSha(123))).toBeUndefined();
+        expect(parseShardManifest(withSha("abc"))).toBeUndefined();
+        expect(
+            parseShardManifest(withSha(sha256Of("x").toUpperCase()))
+        ).toBeUndefined();
+        expect(parseShardManifest(withSha(sha256Of("x")))).toBeDefined();
+    });
+
     test("rejects malformed shard entries (bad names, missing sizes)", () => {
         expect(
             parseShardManifest(JSON.stringify({ ...manifest, shards: [] }))
@@ -246,8 +334,98 @@ describe("shard object naming", () => {
         expect(
             isShardPartObjectKey("cache/o/r/v/key.shards/part-00.tzst")
         ).toBe(true);
+        expect(
+            isShardPartObjectKey(
+                "cache/o/r/v/key.shards/20260915T101112123Z-0badf00d/part-00.tzst"
+            )
+        ).toBe(true);
         expect(isShardPartObjectKey("cache/o/r/v/key")).toBe(false);
         expect(isShardPartObjectKey("cache/o/r/v/key.shards")).toBe(false);
+    });
+
+    test("generation ids are unique, sortable timestamps and key-safe", () => {
+        const fixed = new Date("2026-09-15T10:11:12.123Z");
+        const a = newShardGeneration(fixed);
+        const b = newShardGeneration(fixed);
+        expect(a).toMatch(/^20260915T101112123Z-[0-9a-f]{8}$/);
+        expect(b).toMatch(/^20260915T101112123Z-[0-9a-f]{8}$/);
+        expect(a).not.toBe(b);
+        expect(newShardGeneration()).toMatch(/^\d{8}T\d{9}Z-[0-9a-f]{8}$/);
+    });
+
+    test("generation-scoped part keys nest under the entry's .shards/ prefix", () => {
+        expect(shardsKeyPrefix("my-key")).toBe("my-key.shards/");
+        expect(shardGenerationKeyPrefix("my-key", "g1")).toBe(
+            "my-key.shards/g1/"
+        );
+        expect(shardPartKey("my-key", "g1", 0)).toBe(
+            "my-key.shards/g1/part-00.tzst"
+        );
+        expect(shardPartKey("my-key", "g1", 12)).toBe(
+            "my-key.shards/g1/part-12.tzst"
+        );
+        expect(
+            isShardPartObjectKey(`p/${shardPartKey("my-key", "g1", 0)}`)
+        ).toBe(true);
+    });
+
+    test("resolves part locations from the manifest key, or the legacy name", () => {
+        const location = "s3://bucket/cache/o/r/v/my-key";
+        // Modern manifest: exactly the recorded key under the S3 prefix.
+        expect(
+            resolveShardPartLocation(location, "my-key", {
+                name: "part-00.tzst",
+                key: "my-key.shards/g1/part-00.tzst",
+                bytes: 1,
+                files: 1
+            })
+        ).toBe("s3://bucket/cache/o/r/v/my-key.shards/g1/part-00.tzst");
+        // Entry keys may contain slashes; the key is still relative to the prefix.
+        expect(
+            resolveShardPartLocation("s3://bucket/cache/o/r/v/a/b", "a/b", {
+                name: "part-01.tzst",
+                key: "a/b.shards/g1/part-01.tzst",
+                bytes: 1,
+                files: 1
+            })
+        ).toBe("s3://bucket/cache/o/r/v/a/b.shards/g1/part-01.tzst");
+        // Legacy manifest (no key): the pre-generation naming.
+        expect(
+            resolveShardPartLocation(location, "my-key", {
+                name: "part-02.tzst",
+                bytes: 1,
+                files: 1
+            })
+        ).toBe("s3://bucket/cache/o/r/v/my-key.shards/part-02.tzst");
+        // A key that is not under this entry's own .shards/ prefix is refused.
+        expect(() =>
+            resolveShardPartLocation(location, "my-key", {
+                name: "part-00.tzst",
+                key: "other-key.shards/g1/part-00.tzst",
+                bytes: 1,
+                files: 1
+            })
+        ).toThrow(/outside the entry/);
+        expect(() =>
+            resolveShardPartLocation(location, "wrong-key", {
+                name: "part-00.tzst",
+                key: "wrong-key.shards/g1/part-00.tzst",
+                bytes: 1,
+                files: 1
+            })
+        ).toThrow(/does not end with the entry key/);
+    });
+
+    test("hashFileSha256 streams the file and matches node:crypto", async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "shard-hash-"));
+        try {
+            const body = Buffer.alloc(3 * 1024 * 1024 + 17, 0xab);
+            const file = path.join(dir, "part-00.tzst");
+            fs.writeFileSync(file, body);
+            await expect(hashFileSha256(file)).resolves.toBe(sha256Of(body));
+        } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
     });
 
     test("part and list names are zero-padded and stable", () => {
@@ -431,7 +609,9 @@ describe("createShardedArchive / extractShardedArchive (injected tar)", () => {
             archiveFolder,
             ["Library"],
             2,
-            deps
+            "my-key",
+            deps,
+            "gen-a"
         );
 
         expect(deps.createTarFromFileList).toHaveBeenCalledTimes(2);
@@ -464,20 +644,33 @@ describe("createShardedArchive / extractShardedArchive (injected tar)", () => {
             "part-01.tzst"
         ]);
         expect(parts.map(part => part.files)).toEqual([2, 2]);
+        expect(parts.map(part => part.key)).toEqual([
+            "my-key.shards/gen-a/part-00.tzst",
+            "my-key.shards/gen-a/part-01.tzst"
+        ]);
         for (const part of parts) {
             expect(fs.existsSync(part.path)).toBe(true);
             expect(part.bytes).toBe(fs.statSync(part.path).size);
             expect(part.bytes).toBeGreaterThan(0);
+            // The digest is of the part file as it sits on disk after tar.
+            expect(part.sha256).toBe(sha256Of(fs.readFileSync(part.path)));
         }
 
         expect(manifest.format).toBe(SHARDED_ARCHIVE_FORMAT);
+        expect(manifest.generation).toBe("gen-a");
         expect(manifest.shards).toEqual(
             parts.map(part => ({
                 name: part.name,
+                key: part.key,
                 bytes: part.bytes,
-                files: part.files
+                files: part.files,
+                sha256: part.sha256
             }))
         );
+        for (const shard of manifest.shards) {
+            expect(shard.key).toBe(`my-key.shards/gen-a/${shard.name}`);
+            expect(shard.sha256).toMatch(/^[0-9a-f]{64}$/);
+        }
         expect(manifest.totalBytes).toBe(parts[0].bytes + parts[1].bytes);
         expect(manifest.totalFiles).toBe(4);
         expect(Date.parse(manifest.createdAt)).not.toBeNaN();
@@ -491,10 +684,49 @@ describe("createShardedArchive / extractShardedArchive (injected tar)", () => {
             archiveFolder,
             ["Library/a.bin"],
             8,
+            "my-key",
             deps
         );
         expect(deps.createTarFromFileList).toHaveBeenCalledTimes(1);
         expect(manifest.shards).toHaveLength(1);
+    });
+
+    test("mints a fresh generation per save so two saves never share part keys", async () => {
+        const first = await createShardedArchive(
+            archiveFolder,
+            ["Library"],
+            2,
+            "my-key",
+            makeDeps()
+        );
+        const second = await createShardedArchive(
+            archiveFolder,
+            ["Library"],
+            2,
+            "my-key",
+            makeDeps()
+        );
+        expect(first.manifest.generation).toMatch(/^\d{8}T\d{9}Z-[0-9a-f]{8}$/);
+        expect(second.manifest.generation).not.toBe(first.manifest.generation);
+        const firstKeys = new Set(
+            first.manifest.shards.map(shard => shard.key)
+        );
+        for (const shard of second.manifest.shards) {
+            expect(firstKeys.has(shard.key)).toBe(false);
+            expect(shard.key).toBe(
+                `my-key.shards/${second.manifest.generation}/${shard.name}`
+            );
+        }
+        await expect(
+            createShardedArchive(
+                archiveFolder,
+                ["Library"],
+                2,
+                "my-key",
+                makeDeps(),
+                "bad/gen"
+            )
+        ).rejects.toThrow(/Invalid shard generation/);
     });
 
     test("fails the save when any shard's tar fails, after all shards settle", async () => {
@@ -507,14 +739,20 @@ describe("createShardedArchive / extractShardedArchive (injected tar)", () => {
             fs.writeFileSync(path.join(folder, archiveName), "x");
         });
         await expect(
-            createShardedArchive(archiveFolder, ["Library"], 2, deps)
+            createShardedArchive(archiveFolder, ["Library"], 2, "my-key", deps)
         ).rejects.toThrow(/shard 1 tar failed: zstd: not found/);
         expect(started).toBe(2);
     });
 
     test("rejects when the cache paths hold no files at all", async () => {
         await expect(
-            createShardedArchive(archiveFolder, ["missing"], 2, makeDeps())
+            createShardedArchive(
+                archiveFolder,
+                ["missing"],
+                2,
+                "my-key",
+                makeDeps()
+            )
         ).rejects.toThrow(/no files found/);
     });
 

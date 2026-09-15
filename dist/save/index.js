@@ -18207,6 +18207,144 @@ exports.getDefaultRoleAssumerWithWebIdentity = getDefaultRoleAssumerWithWebIdent
 
 /***/ }),
 
+/***/ 8505:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+var __webpack_unused_export__;
+const { formatUrl } = __nccwpck_require__(519);
+const { getEndpointFromInstructions } = __nccwpck_require__(2085);
+const { HttpRequest } = __nccwpck_require__(3422);
+const { SignatureV4MultiRegion } = __nccwpck_require__(5785);
+
+const UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD";
+const SHA256_HEADER = "X-Amz-Content-Sha256";
+
+class S3RequestPresigner {
+    signer;
+    constructor(options) {
+        const resolvedOptions = {
+            service: options.signingName || options.service || "s3",
+            uriEscapePath: options.uriEscapePath || false,
+            applyChecksum: options.applyChecksum || false,
+            ...options,
+        };
+        this.signer = new SignatureV4MultiRegion(resolvedOptions);
+    }
+    presign(requestToSign, { unsignableHeaders = new Set(), hoistableHeaders = new Set(), unhoistableHeaders = new Set(), ...options } = {}) {
+        this.prepareRequest(requestToSign, {
+            unsignableHeaders,
+            unhoistableHeaders,
+            hoistableHeaders,
+        });
+        return this.signer.presign(requestToSign, {
+            expiresIn: 900,
+            unsignableHeaders,
+            unhoistableHeaders,
+            ...options,
+        });
+    }
+    presignWithCredentials(requestToSign, credentials, { unsignableHeaders = new Set(), hoistableHeaders = new Set(), unhoistableHeaders = new Set(), ...options } = {}) {
+        this.prepareRequest(requestToSign, {
+            unsignableHeaders,
+            unhoistableHeaders,
+            hoistableHeaders,
+        });
+        return this.signer.presignWithCredentials(requestToSign, credentials, {
+            expiresIn: 900,
+            unsignableHeaders,
+            unhoistableHeaders,
+            ...options,
+        });
+    }
+    prepareRequest(requestToSign, { unsignableHeaders = new Set(), unhoistableHeaders = new Set(), hoistableHeaders = new Set(), } = {}) {
+        unsignableHeaders.add("content-type");
+        Object.keys(requestToSign.headers)
+            .map((header) => header.toLowerCase())
+            .filter((header) => header.startsWith("x-amz-server-side-encryption"))
+            .forEach((header) => {
+            if (!hoistableHeaders.has(header)) {
+                unhoistableHeaders.add(header);
+            }
+        });
+        requestToSign.headers[SHA256_HEADER] = UNSIGNED_PAYLOAD;
+        const currentHostHeader = requestToSign.headers.host;
+        const port = requestToSign.port;
+        const expectedHostHeader = `${requestToSign.hostname}${requestToSign.port != null ? ":" + port : ""}`;
+        if (!currentHostHeader || (currentHostHeader === requestToSign.hostname && requestToSign.port != null)) {
+            requestToSign.headers.host = expectedHostHeader;
+        }
+    }
+}
+
+const getSignedUrl = async (client, command, options = {}) => {
+    let s3Presigner;
+    let region;
+    if (typeof client.config.endpointProvider === "function") {
+        const endpointV2 = await getEndpointFromInstructions(command.input, command.constructor, client.config);
+        const authScheme = endpointV2.properties?.authSchemes?.[0];
+        if (authScheme?.name === "sigv4a") {
+            region = authScheme?.signingRegionSet?.join(",");
+        }
+        else {
+            region = authScheme?.signingRegion;
+        }
+        s3Presigner = new S3RequestPresigner({
+            ...client.config,
+            signingName: authScheme?.signingName,
+            region: async () => region,
+        });
+    }
+    else {
+        s3Presigner = new S3RequestPresigner(client.config);
+    }
+    const presignInterceptMiddleware = (next, context) => async (args) => {
+        const { request } = args;
+        if (!HttpRequest.isInstance(request)) {
+            throw new Error("Request to be presigned is not an valid HTTP request.");
+        }
+        delete request.headers["amz-sdk-invocation-id"];
+        delete request.headers["amz-sdk-request"];
+        delete request.headers["x-amz-user-agent"];
+        let presigned;
+        const presignerOptions = {
+            ...options,
+            signingRegion: options.signingRegion ?? context["signing_region"] ?? region,
+            signingService: options.signingService ?? context["signing_service"],
+        };
+        if (context.s3ExpressIdentity) {
+            presigned = await s3Presigner.presignWithCredentials(request, context.s3ExpressIdentity, presignerOptions);
+        }
+        else {
+            presigned = await s3Presigner.presign(request, presignerOptions);
+        }
+        return {
+            response: {},
+            output: {
+                $metadata: { httpStatusCode: 200 },
+                presigned,
+            },
+        };
+    };
+    const middlewareName = "presignInterceptMiddleware";
+    const clientStack = client.middlewareStack.clone();
+    clientStack.addRelativeTo(presignInterceptMiddleware, {
+        name: middlewareName,
+        relation: "before",
+        toMiddleware: "awsAuthMiddleware",
+        override: true,
+    });
+    const handler = command.resolveMiddleware(clientStack, client.config, {});
+    const { output } = await handler({ input: command.input });
+    const { presigned } = output;
+    return formatUrl(presigned);
+};
+
+__webpack_unused_export__ = S3RequestPresigner;
+exports.A = getSignedUrl;
+
+
+/***/ }),
+
 /***/ 5785:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -75008,14 +75146,14 @@ var CacheFilename;
     CacheFilename["Gzip"] = "cache.tgz";
     CacheFilename["Zstd"] = "cache.tzst";
 })(CacheFilename || (CacheFilename = {}));
-var constants_CompressionMethod;
+var CompressionMethod;
 (function (CompressionMethod) {
     CompressionMethod["Gzip"] = "gzip";
     // Long range mode was added to zstd in v1.3.2.
     // This enum is for earlier version of zstd that does not have --long support
     CompressionMethod["ZstdWithoutLong"] = "zstd-without-long";
     CompressionMethod["Zstd"] = "zstd";
-})(constants_CompressionMethod || (constants_CompressionMethod = {}));
+})(CompressionMethod || (CompressionMethod = {}));
 var ArchiveToolType;
 (function (ArchiveToolType) {
     ArchiveToolType["GNU"] = "gnu";
@@ -75166,15 +75304,15 @@ function getCompressionMethod() {
         const version = semver.clean(versionOutput);
         core_debug(`zstd version: ${version}`);
         if (versionOutput === '') {
-            return constants_CompressionMethod.Gzip;
+            return CompressionMethod.Gzip;
         }
         else {
-            return constants_CompressionMethod.ZstdWithoutLong;
+            return CompressionMethod.ZstdWithoutLong;
         }
     });
 }
 function getCacheFileName(compressionMethod) {
-    return compressionMethod === constants_CompressionMethod.Gzip
+    return compressionMethod === CompressionMethod.Gzip
         ? CacheFilename.Gzip
         : CacheFilename.Zstd;
 }
@@ -126064,7 +126202,7 @@ function getTarArgs(tarPath_1, compressionMethod_1, type_1) {
         const workingDirectory = getWorkingDirectory();
         // Speficic args for BSD tar on windows for workaround
         const BSD_TAR_ZSTD = tarPath.type === ArchiveToolType.BSD &&
-            compressionMethod !== constants_CompressionMethod.Gzip &&
+            compressionMethod !== CompressionMethod.Gzip &&
             tar_IS_WINDOWS;
         // Method specific args
         switch (type) {
@@ -126110,7 +126248,7 @@ function getCommands(compressionMethod_1, type_1) {
             ? yield getDecompressionProgram(tarPath, compressionMethod, archivePath)
             : yield getCompressionProgram(tarPath, compressionMethod);
         const BSD_TAR_ZSTD = tarPath.type === ArchiveToolType.BSD &&
-            compressionMethod !== constants_CompressionMethod.Gzip &&
+            compressionMethod !== CompressionMethod.Gzip &&
             tar_IS_WINDOWS;
         if (BSD_TAR_ZSTD && type !== 'create') {
             args = [[...compressionArgs].join(' '), [...tarArgs].join(' ')];
@@ -126136,10 +126274,10 @@ function getDecompressionProgram(tarPath, compressionMethod, archivePath) {
         // --long=#: Enables long distance matching with # bits. Maximum is 30 (1GB) on 32-bit OS and 31 (2GB) on 64-bit.
         // Using 30 here because we also support 32-bit self-hosted runners.
         const BSD_TAR_ZSTD = tarPath.type === ArchiveToolType.BSD &&
-            compressionMethod !== constants_CompressionMethod.Gzip &&
+            compressionMethod !== CompressionMethod.Gzip &&
             tar_IS_WINDOWS;
         switch (compressionMethod) {
-            case constants_CompressionMethod.Zstd:
+            case CompressionMethod.Zstd:
                 return BSD_TAR_ZSTD
                     ? [
                         'zstd -d --long=30 --force -o',
@@ -126150,7 +126288,7 @@ function getDecompressionProgram(tarPath, compressionMethod, archivePath) {
                         '--use-compress-program',
                         tar_IS_WINDOWS ? '"zstd -d --long=30"' : 'unzstd --long=30'
                     ];
-            case constants_CompressionMethod.ZstdWithoutLong:
+            case CompressionMethod.ZstdWithoutLong:
                 return BSD_TAR_ZSTD
                     ? [
                         'zstd -d --force -o',
@@ -126173,10 +126311,10 @@ function getCompressionProgram(tarPath, compressionMethod) {
     return tar_awaiter(this, void 0, void 0, function* () {
         const cacheFileName = getCacheFileName(compressionMethod);
         const BSD_TAR_ZSTD = tarPath.type === ArchiveToolType.BSD &&
-            compressionMethod !== constants_CompressionMethod.Gzip &&
+            compressionMethod !== CompressionMethod.Gzip &&
             tar_IS_WINDOWS;
         switch (compressionMethod) {
-            case constants_CompressionMethod.Zstd:
+            case CompressionMethod.Zstd:
                 return BSD_TAR_ZSTD
                     ? [
                         'zstd -T0 --long=30 --force -o',
@@ -126187,7 +126325,7 @@ function getCompressionProgram(tarPath, compressionMethod) {
                         '--use-compress-program',
                         tar_IS_WINDOWS ? '"zstd -T0 --long=30"' : 'zstdmt --long=30'
                     ];
-            case constants_CompressionMethod.ZstdWithoutLong:
+            case CompressionMethod.ZstdWithoutLong:
                 return BSD_TAR_ZSTD
                     ? [
                         'zstd -T0 --force -o',
@@ -126835,6 +126973,8 @@ const RefKey = "GITHUB_REF";
 var dist_cjs = __nccwpck_require__(3711);
 // EXTERNAL MODULE: ./node_modules/@aws-sdk/lib-storage/dist-cjs/index.js
 var lib_storage_dist_cjs = __nccwpck_require__(2358);
+// EXTERNAL MODULE: ./node_modules/@aws-sdk/s3-request-presigner/dist-cjs/index.js
+var s3_request_presigner_dist_cjs = __nccwpck_require__(8505);
 // EXTERNAL MODULE: ./node_modules/@smithy/node-http-handler/dist-cjs/index.js
 var node_http_handler_dist_cjs = __nccwpck_require__(1279);
 ;// CONCATENATED MODULE: ./src/custom/downloadUtils.ts
@@ -126875,7 +127015,7 @@ class downloadUtils_DownloadProgress {
         this.segmentIndex = this.segmentIndex + 1;
         this.segmentSize = segmentSize;
         this.receivedBytes = 0;
-        core.debug(`Downloading segment at offset ${this.segmentOffset} with length ${this.segmentSize}...`);
+        core_debug(`Downloading segment at offset ${this.segmentOffset} with length ${this.segmentSize}...`);
     }
     /**
      * Sets the number of bytes received for the current segment.
@@ -126912,7 +127052,7 @@ class downloadUtils_DownloadProgress {
         const downloadSpeed = (transferredBytes /
             (1024 * 1024) /
             (elapsedTime / 1000)).toFixed(1);
-        core.info(`Received ${transferredBytes} of ${this.contentLength} (${percentage}%), ${downloadSpeed} MBs/sec`);
+        info(`Received ${transferredBytes} of ${this.contentLength} (${percentage}%), ${downloadSpeed} MBs/sec`);
         if (this.isDone()) {
             this.displayedComplete = true;
         }
@@ -126959,7 +127099,7 @@ class downloadUtils_DownloadProgress {
  * @param archivePath the local path where the cache is saved
  */
 async function custom_downloadUtils_downloadCacheHttpClientConcurrent(archiveLocation, archivePath, options) {
-    const archiveDescriptor = await fs.promises.open(archivePath, "w");
+    const archiveDescriptor = await external_fs_namespaceObject.promises.open(archivePath, "w");
     // This downloader builds its OWN @actions/http-client (it does not use the
     // pooled s3Client in backend.ts, whose NodeHttpHandler maxSockets governs
     // only the upload path). @actions/http-client's keepAlive agent otherwise
@@ -126968,14 +127108,14 @@ async function custom_downloadUtils_downloadCacheHttpClientConcurrent(archiveLoc
     // (+ headroom for the initial Range 0-1 metadata probe) so concurrent range
     // requests each get their own connection.
     const downloadConcurrency = options.downloadConcurrency ?? 8;
-    const httpClient = new HttpClient("actions/cache", undefined, {
+    const httpClient = new lib_HttpClient("actions/cache", undefined, {
         socketTimeout: options.timeoutInMs,
         keepAlive: true,
         maxSockets: downloadConcurrency + 4
     });
     let progress;
     try {
-        const res = await retryHttpClientResponse("downloadCacheMetadata", async () => await httpClient.request("GET", archiveLocation, null, {
+        const res = await requestUtils_retryHttpClientResponse("downloadCacheMetadata", async () => await httpClient.request("GET", archiveLocation, null, {
             Range: "bytes=0-1"
         }));
         const contentRange = res.message.headers["content-range"];
@@ -127065,7 +127205,7 @@ async function downloadUtils_downloadSegmentRetry(httpClient, archiveLocation, o
     }
 }
 async function downloadUtils_downloadSegment(httpClient, archiveLocation, offset, count) {
-    const partRes = await retryHttpClientResponse("downloadCachePart", async () => await httpClient.get(archiveLocation, {
+    const partRes = await requestUtils_retryHttpClientResponse("downloadCachePart", async () => await httpClient.get(archiveLocation, {
         Range: `bytes=${offset}-${offset + count - 1}`
     }));
     if (!partRes.readBodyBuffer) {
@@ -127361,18 +127501,25 @@ async function uncompressedTar_listTar(archivePath, _compressionMethod) {
 // under the cache paths, splits them into N size-balanced groups (greedy
 // largest-first bin packing), and runs N independent
 // `tar --no-recursion --files-from shard-<i>.txt | zstd` processes at once.
-// Each part is uploaded to `<s3prefix>/<key>.shards/part-<i>.tzst`, and a
-// small JSON manifest is written LAST as the object at `<s3prefix>/<key>` —
-// the exact S3 key the legacy single archive uses — so a listing that finds
-// the manifest always finds a complete set of parts, and a partial upload never
-// looks like a valid cache entry. The restore side recognizes the manifest,
-// downloads every part, and extracts all of them concurrently with the legacy
-// extract command.
+// Every save mints a fresh, unique GENERATION id and uploads its parts to
+// `<s3prefix>/<key>.shards/<generation>/part-<i>.tzst`; a small JSON manifest
+// naming those exact object keys (plus the size and sha256 of each part) is
+// written LAST as the object at `<s3prefix>/<key>` — the exact S3 key the
+// legacy single archive uses. Because part objects are never overwritten in
+// place, a manifest always refers to an immutable, complete set of parts: a
+// replacement save that is interrupted (or that a restore overlaps with)
+// leaves the previous manifest and every part it references untouched, and a
+// partial upload never looks like a valid cache entry. Once the new manifest
+// is in place, parts of earlier generations are deleted on a best-effort
+// basis so they do not accumulate. The restore side recognizes the manifest,
+// downloads exactly the keys it lists, verifies size and sha256, and extracts
+// all parts concurrently with the legacy extract command.
 //
 // Everything here is opt-in: with the knob unset (or 0 / 1 / invalid) the save
 // and restore paths are byte-for-byte the legacy single-archive behavior, and a
 // restore always accepts both shapes because it decides per entry by looking at
 // the stored object, never at the knob.
+
 
 
 
@@ -127385,8 +127532,10 @@ const MIN_ARCHIVE_SHARDS = 2;
 const MAX_ARCHIVE_SHARDS = 64;
 /** `format` field of the manifest object stored at the legacy archive key. */
 const SHARDED_ARCHIVE_FORMAT = "sharded-tzst-v1";
-/** Appended to the entry's S3 key to form the part prefix: `<key>.shards/part-00.tzst`. */
-const shardedArchive_SHARDS_KEY_SUFFIX = ".shards/";
+/** Appended to the entry's S3 key to form the part prefix:
+ *  `<key>.shards/<generation>/part-00.tzst` (or `<key>.shards/part-00.tzst`
+ *  for manifests written before generations existed). */
+const SHARDS_KEY_SUFFIX = ".shards/";
 /** Objects at or above this size are never inspected as a manifest candidate. */
 const shardedArchive_SHARD_MANIFEST_MAX_BYTES = (/* unused pure expression or super */ null && (1024 * 1024));
 /** How many parts are downloaded at once on restore (each download is itself
@@ -127420,25 +127569,98 @@ function getArchiveShardCount(env = process.env) {
     }
     return count;
 }
-/** True for a shard part object (`<key>.shards/part-NN.tzst`), which must
- *  never be picked as "the newest cache entry" by a prefix listing. */
+/** True for a shard part object (`<key>.shards/<generation>/part-NN.tzst`,
+ *  or the legacy `<key>.shards/part-NN.tzst`), which must never be picked as
+ *  "the newest cache entry" by a prefix listing. */
 function shardedArchive_isShardPartObjectKey(key) {
-    return key.includes(shardedArchive_SHARDS_KEY_SUFFIX);
+    return key.includes(SHARDS_KEY_SUFFIX);
 }
 /** Object name of shard `index`: `part-00.tzst`, `part-01.tzst`, ... */
 function shardPartName(index) {
     return `part-${String(index).padStart(2, "0")}.tzst`;
+}
+const GENERATION_PATTERN = /^[A-Za-z0-9._-]+$/;
+/**
+ * Mint a generation id for one save: the UTC timestamp compacted to
+ * `YYYYMMDDTHHMMSSmmmZ` plus 8 random hex characters, so ids sort by time in
+ * a listing and two saves started in the same millisecond still differ.
+ */
+function newShardGeneration(now = new Date()) {
+    const stamp = now.toISOString().replace(/[-:]/g, "").replace(".", "");
+    return `${stamp}-${(0,external_crypto_namespaceObject.randomBytes)(4).toString("hex")}`;
+}
+/** Prefix (relative to the S3 prefix) under which every generation of an
+ *  entry stores its parts: `<key>.shards/`. */
+function shardsKeyPrefix(entryKey) {
+    return `${entryKey}${SHARDS_KEY_SUFFIX}`;
+}
+/** Prefix (relative to the S3 prefix) of one generation's parts:
+ *  `<key>.shards/<generation>/`. */
+function shardGenerationKeyPrefix(entryKey, generation) {
+    return `${shardsKeyPrefix(entryKey)}${generation}/`;
+}
+/** Object key (relative to the S3 prefix) of shard `index` of `generation`. */
+function shardPartKey(entryKey, generation, index) {
+    return `${shardGenerationKeyPrefix(entryKey, generation)}${shardPartName(index)}`;
+}
+/**
+ * Resolve the S3 location of one part of a manifest stored at
+ * `archiveLocation` (`s3://bucket/<s3prefix>/<entryKey>`). A manifest that
+ * records a `key` is downloaded from exactly that key; the key is required
+ * to sit under this entry's own `<entryKey>.shards/` prefix so a corrupt or
+ * foreign manifest can never point the restore at an unrelated object. A
+ * legacy manifest (no `key`) resolves to `<archiveLocation>.shards/<name>`.
+ */
+function shardedArchive_resolveShardPartLocation(archiveLocation, entryKey, shard) {
+    if (shard.key === undefined) {
+        return `${archiveLocation}${SHARDS_KEY_SUFFIX}${shard.name}`;
+    }
+    const entrySuffix = `/${entryKey}`;
+    if (entryKey === "" || !archiveLocation.endsWith(entrySuffix)) {
+        throw new Error(`Sharded cache entry location ${archiveLocation} does not end with the entry key ${entryKey}.`);
+    }
+    if (!shard.key.startsWith(shardsKeyPrefix(entryKey))) {
+        throw new Error(`Sharded cache manifest for ${entryKey} references a part outside the entry: ${shard.key}`);
+    }
+    const prefixLocation = archiveLocation.slice(0, archiveLocation.length - entrySuffix.length);
+    return `${prefixLocation}/${shard.key}`;
+}
+/** Streaming sha256 of a file on disk, as lowercase hex. */
+async function hashFileSha256(filePath) {
+    const hash = (0,external_crypto_namespaceObject.createHash)("sha256");
+    for await (const chunk of external_fs_namespaceObject.createReadStream(filePath)) {
+        hash.update(chunk);
+    }
+    return hash.digest("hex");
 }
 /** File name of the `--files-from` list for shard `index`. */
 function shardListName(index) {
     return `shard-${String(index).padStart(2, "0")}.txt`;
 }
 const PART_NAME_PATTERN = /^part-\d{2,}\.tzst$/;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+/** A manifest `key` is a relative object key: no leading slash, no backslash,
+ *  no empty / `.` / `..` segments, and it must live under some `.shards/`
+ *  prefix and end with its own part name. */
+function isSafePartKey(key, name) {
+    if (key.startsWith("/") || key.includes("\\")) {
+        return false;
+    }
+    if (!key.includes(SHARDS_KEY_SUFFIX) || !key.endsWith(`/${name}`)) {
+        return false;
+    }
+    return key
+        .split("/")
+        .every(segment => segment !== "" && segment !== "." && segment !== "..");
+}
 /**
  * Decide whether an object body is a sharded-archive manifest. Anything that
  * is not UTF-8 JSON with `format === "sharded-tzst-v1"` and a well-formed,
  * non-empty `shards` array (safe names, numeric sizes) is NOT a manifest — a
  * legacy zstd archive, whose bytes never parse as JSON, returns undefined.
+ * The optional `generation`, per-part `key` and `sha256` fields are kept when
+ * present and well-formed; a manifest that carries a malformed one is
+ * rejected rather than silently downgraded to the legacy naming.
  */
 function shardedArchive_parseShardManifest(body) {
     const text = typeof body === "string" ? body : body.toString("utf8");
@@ -127459,12 +127681,17 @@ function shardedArchive_parseShardManifest(body) {
     if (!Array.isArray(candidate.shards) || candidate.shards.length === 0) {
         return undefined;
     }
+    if (candidate.generation !== undefined &&
+        (typeof candidate.generation !== "string" ||
+            !GENERATION_PATTERN.test(candidate.generation))) {
+        return undefined;
+    }
     const shards = [];
     for (const entry of candidate.shards) {
         if (typeof entry !== "object" || entry === null) {
             return undefined;
         }
-        const { name, bytes, files } = entry;
+        const { name, key, bytes, files, sha256 } = entry;
         if (typeof name !== "string" ||
             !PART_NAME_PATTERN.test(name) ||
             typeof bytes !== "number" ||
@@ -127475,7 +127702,22 @@ function shardedArchive_parseShardManifest(body) {
             files < 0) {
             return undefined;
         }
-        shards.push({ name, bytes, files });
+        if (key !== undefined &&
+            (typeof key !== "string" || !isSafePartKey(key, name))) {
+            return undefined;
+        }
+        if (sha256 !== undefined &&
+            (typeof sha256 !== "string" || !SHA256_PATTERN.test(sha256))) {
+            return undefined;
+        }
+        const shard = { name, bytes, files };
+        if (key !== undefined) {
+            shard.key = key;
+        }
+        if (sha256 !== undefined) {
+            shard.sha256 = sha256;
+        }
+        shards.push(shard);
     }
     const totalBytes = typeof candidate.totalBytes === "number"
         ? candidate.totalBytes
@@ -127483,13 +127725,17 @@ function shardedArchive_parseShardManifest(body) {
     const totalFiles = typeof candidate.totalFiles === "number"
         ? candidate.totalFiles
         : shards.reduce((sum, shard) => sum + shard.files, 0);
-    return {
+    const manifest = {
         format: SHARDED_ARCHIVE_FORMAT,
         shards,
         totalBytes,
         totalFiles,
         createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : ""
     };
+    if (typeof candidate.generation === "string") {
+        manifest.generation = candidate.generation;
+    }
+    return manifest;
 }
 /**
  * Greedy largest-first bin packing: files are visited by size descending
@@ -127664,7 +127910,7 @@ function enumerateCacheEntries(cachePaths, workspaceRoot = shardedArchive_getWor
 }
 const defaultDeps = {
     createTarFromFileList: createTarFromFileList,
-    extractTar: archivePath => uncompressedTar_extractTar(archivePath, constants_CompressionMethod.Zstd),
+    extractTar: archivePath => uncompressedTar_extractTar(archivePath, CompressionMethod.Zstd),
     cpuCount: () => external_os_.cpus().length
 };
 function formatMb(bytes) {
@@ -127685,12 +127931,17 @@ async function settleAll(tasks, describeFailure) {
 }
 /**
  * Archive `cachePaths` as `shardCount` size-balanced zstd tar parts inside
- * `archiveFolder`, all created concurrently. Returns the manifest to store at
- * the entry key plus the local part files to upload. Any shard failure rejects
- * after every shard has settled (so no tar is left running while the caller
- * cleans up).
+ * `archiveFolder`, all created concurrently, then sha256 each part on disk.
+ * Returns the manifest to store at the entry key `entryKey` plus the local
+ * part files to upload; the parts are keyed under a fresh `generation` (see
+ * shardPartKey) so they never overwrite an earlier save's objects. Any shard
+ * failure rejects after every shard has settled (so no tar is left running
+ * while the caller cleans up).
  */
-async function createShardedArchive(archiveFolder, cachePaths, shardCount, deps = defaultDeps) {
+async function createShardedArchive(archiveFolder, cachePaths, shardCount, entryKey, deps = defaultDeps, generation = newShardGeneration()) {
+    if (!GENERATION_PATTERN.test(generation)) {
+        throw new Error(`Invalid shard generation id: ${generation}`);
+    }
     const workspaceRoot = shardedArchive_getWorkingDirectory();
     const enumerateStartedAt = Date.now();
     const { files, emptyDirs } = enumerateCacheEntries(cachePaths, workspaceRoot);
@@ -127710,29 +127961,41 @@ async function createShardedArchive(archiveFolder, cachePaths, shardCount, deps 
     const tarStartedAt = Date.now();
     await settleAll(assignments.map((_, index) => deps.createTarFromFileList(archiveFolder, shardListName(index), shardPartName(index), compressProgram)), (index, error) => `shard ${index} tar failed: ${error.message}`);
     const tarSeconds = elapsedSeconds(tarStartedAt);
+    // Digest every part while it is still on disk: the restore verifies the
+    // downloaded bytes against this, so a corrupted or mismatched object can
+    // never be extracted over the workspace.
+    const hashStartedAt = Date.now();
+    const digests = await Promise.all(assignments.map((_, index) => hashFileSha256(external_path_.join(archiveFolder, shardPartName(index)))));
+    const hashSeconds = elapsedSeconds(hashStartedAt);
     const parts = assignments.map((shard, index) => {
         const partPath = external_path_.join(archiveFolder, shardPartName(index));
         return {
             index,
             name: shardPartName(index),
+            key: shardPartKey(entryKey, generation, index),
             path: partPath,
             bytes: external_fs_namespaceObject.statSync(partPath).size,
-            files: shard.files
+            files: shard.files,
+            sha256: digests[index]
         };
     });
     for (const part of parts) {
         const raw = assignments[part.index].bytes;
-        info(`  ${part.name}: ${part.files} files, ${formatMb(raw)} raw -> ${formatMb(part.bytes)} compressed (${part.bytes} B)`);
+        info(`  ${part.name}: ${part.files} files, ${formatMb(raw)} raw -> ${formatMb(part.bytes)} compressed (${part.bytes} B), sha256 ${part.sha256}`);
     }
+    info(`Sharded archive: hashed ${parts.length} part(s) (sha256) in ${hashSeconds}s; generation ${generation}.`);
     const totalBytes = parts.reduce((sum, part) => sum + part.bytes, 0);
     const totalFiles = parts.reduce((sum, part) => sum + part.files, 0);
     info(`Sharded archive: ${parts.length} part(s), ${formatMb(totalBytes)} compressed (${totalBytes} B) for ${totalFiles} files, created in ${tarSeconds}s.`);
     const manifest = {
         format: SHARDED_ARCHIVE_FORMAT,
+        generation,
         shards: parts.map(part => ({
             name: part.name,
+            key: part.key,
             bytes: part.bytes,
-            files: part.files
+            files: part.files,
+            sha256: part.sha256
         })),
         totalBytes,
         totalFiles,
@@ -127745,10 +128008,10 @@ async function createShardedArchive(archiveFolder, cachePaths, shardCount, deps 
  * (each part is an ordinary zstd tar, so the decompressor is unchanged).
  * Rejects after every extraction has settled if any part failed.
  */
-async function shardedArchive_extractShardedArchive(partPaths, deps = defaultDeps) {
+async function extractShardedArchive(partPaths, deps = defaultDeps) {
     const startedAt = Date.now();
-    await settleAll(partPaths.map(partPath => deps.extractTar(partPath)), (index, error) => `part ${path.basename(partPaths[index])} extract failed: ${error.message}`);
-    core.info(`Sharded archive: extracted ${partPaths.length} part(s) concurrently in ${elapsedSeconds(startedAt)}s.`);
+    await settleAll(partPaths.map(partPath => deps.extractTar(partPath)), (index, error) => `part ${external_path_.basename(partPaths[index])} extract failed: ${error.message}`);
+    info(`Sharded archive: extracted ${partPaths.length} part(s) concurrently in ${elapsedSeconds(startedAt)}s.`);
 }
 
 ;// CONCATENATED MODULE: ./src/custom/transferEngine.ts
@@ -128244,7 +128507,7 @@ const transferEngine_defaultDeps = {
  * engine (never a hard fail). The node fallback validates its own byte count,
  * and uploads never expose a partial object, so neither needs this hook.
  */
-async function transferEngine_transferArchive(direction, params, nodeFallback, deps = transferEngine_defaultDeps, verifyNativeDownload) {
+async function transferArchive(direction, params, nodeFallback, deps = transferEngine_defaultDeps, verifyNativeDownload) {
     const startedAtMs = Date.now();
     // Engine 1: s5cmd.
     const s5cmdPath = await deps.findExecutable("s5cmd");
@@ -128645,12 +128908,12 @@ function getS3Prefix(paths, { compressionMethod, enableCrossOsArchive }) {
 }
 /**
  * Pick the most recently modified object among a prefix listing, ignoring
- * shard part objects (`<key>.shards/part-NN.tzst`). A sharded entry stores
- * its parts under the entry key plus `.shards/`, so they match the same
- * restore-key prefix and are uploaded BEFORE the manifest; without this
- * filter a part could be chosen as "the newest key" and handed to the
- * download as if it were a whole archive. Returns undefined when nothing
- * eligible is listed.
+ * shard part objects (`<key>.shards/<generation>/part-NN.tzst`, or the
+ * legacy `<key>.shards/part-NN.tzst`). A sharded entry stores its parts
+ * under the entry key plus `.shards/`, so they match the same restore-key
+ * prefix and are uploaded BEFORE the manifest; without this filter a part
+ * could be chosen as "the newest key" and handed to the download as if it
+ * were a whole archive. Returns undefined when nothing eligible is listed.
  */
 function selectNewestArchiveObject(contents) {
     const candidates = contents.filter(object => !!object.Key && !isShardPartObjectKey(object.Key));
@@ -128709,14 +128972,14 @@ async function backend_downloadCache(archiveLocation, archivePath, options) {
         let lastError;
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                const command = new GetObjectCommand({
+                const command = new dist_cjs.GetObjectCommand({
                     Bucket: bucket,
                     Key: objectKey
                 });
-                const url = await getSignedUrl(s3Client, command, {
+                const url = await (0,s3_request_presigner_dist_cjs/* getSignedUrl */.A)(s3Client, command, {
                     expiresIn: 3600
                 });
-                await downloadCacheHttpClientConcurrent(url, archivePath, {
+                await custom_downloadUtils_downloadCacheHttpClientConcurrent(url, archivePath, {
                     ...options,
                     downloadConcurrency: downloadQueueSize,
                     concurrentBlobDownloads: true,
@@ -128734,7 +128997,7 @@ async function backend_downloadCache(archiveLocation, archivePath, options) {
                     errorMessage.includes("Content-Range header")) {
                     if (attempt < maxRetries) {
                         const delayMs = Math.pow(2, attempt - 1) * 1000; // exponential backoff
-                        core.warning(`Download attempt ${attempt} failed: ${errorMessage}. Retrying in ${delayMs}ms...`);
+                        warning(`Download attempt ${attempt} failed: ${errorMessage}. Retrying in ${delayMs}ms...`);
                         await new Promise(resolve => setTimeout(resolve, delayMs));
                         continue;
                     }
@@ -128757,17 +129020,17 @@ async function backend_downloadCache(archiveLocation, archivePath, options) {
     const verifyNativeDownload = async () => {
         let expectedBytes;
         try {
-            const head = await s3Client.send(new HeadObjectCommand({ Bucket: bucket, Key: objectKey }));
+            const head = await s3Client.send(new dist_cjs.HeadObjectCommand({ Bucket: bucket, Key: objectKey }));
             expectedBytes = head.ContentLength;
         }
         catch (error) {
-            core.debug(`Skipping native-download size check (HeadObject failed: ${error.message}).`);
+            core_debug(`Skipping native-download size check (HeadObject failed: ${error.message}).`);
             return;
         }
         if (typeof expectedBytes !== "number") {
             return;
         }
-        const actualBytes = statSync(archivePath).size;
+        const actualBytes = (0,external_fs_namespaceObject.statSync)(archivePath).size;
         if (expectedBytes !== actualBytes) {
             throw new Error(`native download size mismatch: S3 ContentLength ${expectedBytes} B != local file ${actualBytes} B`);
         }
@@ -128897,16 +129160,100 @@ async function backend_saveCache(key, paths, archivePath, { compressionMethod, e
     await uploadArchiveObject(s3Key, archivePath, uploadChunkSize);
     info(`Cache saved successfully.`);
 }
+const defaultShardedSaveDeps = {
+    uploadObject: (s3Key, archivePath, uploadChunkSize) => uploadArchiveObject(s3Key, archivePath, uploadChunkSize),
+    putJsonObject: async (s3Key, body) => {
+        await s3Client.send(new dist_cjs.PutObjectCommand({
+            Bucket: bucketName,
+            Key: s3Key,
+            Body: body,
+            ContentType: "application/json"
+        }));
+    },
+    listObjectKeys: async (prefix) => {
+        const keys = [];
+        let continuationToken;
+        do {
+            const page = await s3Client.send(new dist_cjs.ListObjectsV2Command({
+                Bucket: bucketName,
+                Prefix: prefix,
+                ContinuationToken: continuationToken
+            }));
+            for (const object of page.Contents ?? []) {
+                if (object.Key) {
+                    keys.push(object.Key);
+                }
+            }
+            continuationToken = page.IsTruncated
+                ? page.NextContinuationToken
+                : undefined;
+        } while (continuationToken);
+        return keys;
+    },
+    deleteObjectKeys: async (keys) => {
+        if (keys.length === 0) {
+            return;
+        }
+        await s3Client.send(new dist_cjs.DeleteObjectsCommand({
+            Bucket: bucketName,
+            Delete: {
+                Objects: keys.map(Key => ({ Key })),
+                Quiet: true
+            }
+        }));
+    }
+};
+/** S3 DeleteObjects accepts at most this many keys per request. */
+const DELETE_BATCH_SIZE = 1000;
 /**
- * Save a sharded cache entry: upload every part to
- * `<s3prefix>/<key>.shards/<part name>` (through the same engine chain as a
- * single archive), THEN write the JSON manifest as the object at
- * `<s3prefix>/<key>` — the very key a legacy archive would occupy. The
- * manifest goes last so a listing can never find a manifest whose parts are
- * still missing; a save that dies mid-way leaves only orphan parts, which the
- * entry lookup ignores.
+ * Best-effort removal of every part object under `<s3Key>.shards/` that does
+ * not belong to `generation` (earlier generations, orphans of interrupted
+ * saves, and legacy un-generationed parts). Called only AFTER the new
+ * manifest is in place, so nothing a visible manifest references is ever
+ * touched; the current generation is never deleted. Errors are logged and
+ * swallowed: stale objects cost storage, not correctness.
  */
-async function saveShardedCache(key, paths, parts, manifest, { compressionMethod, enableCrossOsArchive, uploadChunkSize }) {
+async function cleanupOtherShardGenerations(s3Key, generation, deps = defaultShardedSaveDeps) {
+    const allPrefix = shardsKeyPrefix(s3Key);
+    const keepPrefix = shardGenerationKeyPrefix(s3Key, generation);
+    try {
+        const keys = await deps.listObjectKeys(allPrefix);
+        const stale = keys.filter(objectKey => !objectKey.startsWith(keepPrefix));
+        const kept = keys.length - stale.length;
+        if (stale.length === 0) {
+            info(`Sharded cache: no stale part objects under ${allPrefix} (${kept} current).`);
+            return { deleted: 0, kept };
+        }
+        const generations = new Set(stale.map(objectKey => {
+            const rest = objectKey.slice(allPrefix.length);
+            return rest.includes("/")
+                ? rest.slice(0, rest.indexOf("/"))
+                : "(legacy)";
+        }));
+        for (let start = 0; start < stale.length; start += DELETE_BATCH_SIZE) {
+            await deps.deleteObjectKeys(stale.slice(start, start + DELETE_BATCH_SIZE));
+        }
+        info(`Sharded cache: deleted ${stale.length} stale part object(s) from ${generations.size} earlier generation(s) under ${allPrefix}; kept ${kept} of generation ${generation}.`);
+        return { deleted: stale.length, kept };
+    }
+    catch (error) {
+        info(`Sharded cache: stale part cleanup under ${allPrefix} skipped (${error.message}); the entry is complete regardless.`);
+        return { deleted: 0, kept: 0 };
+    }
+}
+/**
+ * Save a sharded cache entry: upload every part to the generation-scoped key
+ * the manifest records (`<s3prefix>/<key>.shards/<generation>/<part name>`,
+ * through the same engine chain as a single archive), THEN write the JSON
+ * manifest as the object at `<s3prefix>/<key>` — the very key a legacy
+ * archive would occupy — and finally delete the parts of earlier generations.
+ * The manifest goes last so a listing can never find a manifest whose parts
+ * are still missing, and because a generation's part keys are unique, a
+ * replacement save that dies mid-way leaves the previous manifest AND every
+ * object it references intact: it only adds orphan parts, which the entry
+ * lookup ignores and the next successful save cleans up.
+ */
+async function saveShardedCache(key, paths, parts, manifest, { compressionMethod, enableCrossOsArchive, uploadChunkSize }, deps = defaultShardedSaveDeps) {
     if (!bucketName) {
         throw new Error("Environment variable RUNS_ON_S3_BUCKET_CACHE not set");
     }
@@ -128920,23 +129267,32 @@ async function saveShardedCache(key, paths, parts, manifest, { compressionMethod
     });
     const s3Key = `${s3Prefix}/${key}`;
     info(`Cache Size: ~${Math.round(manifest.totalBytes / (1024 * 1024))} MB (${manifest.totalBytes} B) across ${parts.length} part(s)`);
+    if (!manifest.generation) {
+        throw new Error("Sharded cache manifest has no generation; refusing to overwrite parts in place.");
+    }
+    const generationPrefix = shardGenerationKeyPrefix(key, manifest.generation);
+    for (const part of parts) {
+        if (!part.key.startsWith(generationPrefix)) {
+            throw new Error(`Sharded cache part ${part.name} key ${part.key} is not under generation ${manifest.generation} of ${key}.`);
+        }
+    }
+    info(`Sharded cache generation: ${manifest.generation}`);
     // Parts are uploaded one after another: each upload is already a
     // many-way multipart transfer that saturates the send side, and the
     // aws-cli engine rewrites its shared config before every transfer.
+    // Each part goes to the exact key its manifest entry records.
     const uploadStartedAt = Date.now();
     for (const part of parts) {
-        await uploadArchiveObject(`${s3Key}${shardedArchive_SHARDS_KEY_SUFFIX}${part.name}`, part.path, uploadChunkSize);
+        await deps.uploadObject(`${s3Prefix}/${part.key}`, part.path, uploadChunkSize);
     }
     const manifestBody = JSON.stringify(manifest);
     info(`Uploading shard manifest to ${bucket}/${s3Key}`);
-    await s3Client.send(new dist_cjs.PutObjectCommand({
-        Bucket: bucket,
-        Key: s3Key,
-        Body: manifestBody,
-        ContentType: "application/json"
-    }));
+    await deps.putJsonObject(s3Key, manifestBody);
     info(`Cache saved successfully (${parts.length} part(s) + manifest uploaded in ${((Date.now() - uploadStartedAt) /
         1000).toFixed(1)}s).`);
+    // Only now, with the new manifest visible, retire the parts nothing
+    // references any more.
+    await cleanupOtherShardGenerations(s3Key, manifest.generation, deps);
 }
 /**
  * Upload one local archive file to `s3Key` through the engine chain
@@ -129006,7 +129362,7 @@ async function uploadArchiveObject(s3Key, archivePath, uploadChunkSize) {
     // archive to the exact same s3://bucket/key the node path would, using the
     // same credential chain the S3Client uses; a missing/failing engine
     // transparently falls through to the next.
-    await transferEngine_transferArchive("upload", {
+    await transferArchive("upload", {
         bucket,
         key: s3Key,
         archivePath,
@@ -129345,7 +129701,7 @@ async function resolveCompressionMethod() {
         compressionLevelLogged = true;
     }
     if (!shouldSkipCompression()) {
-        return constants_CompressionMethod.Gzip;
+        return CompressionMethod.Gzip;
     }
     return getCompressionMethod();
 }
@@ -129426,7 +129782,7 @@ async function cache_restoreCache(paths, primaryKey, restoreKeys, options, enabl
                 archiveFolder = staging.dir;
                 archiveDirIsCustom = staging.isCustom;
                 shardPartPaths = manifest.shards.map(shard => path.join(archiveFolder, shard.name));
-                await restoreShardedArchive(manifest, cacheEntry.archiveLocation, shardPartPaths, options);
+                await restoreShardedArchive(manifest, cacheEntry.archiveLocation, cacheEntry.cacheKey ?? "", shardPartPaths, options);
                 core.info("Cache restored successfully");
                 return cacheEntry.cacheKey;
             }
@@ -129505,35 +129861,58 @@ async function cache_restoreCache(paths, primaryKey, restoreKeys, options, enabl
     }
     return undefined;
 }
+const defaultShardedRestoreDeps = {
+    downloadCache: (archiveLocation, archivePath, options) => backend_downloadCache(archiveLocation, archivePath, options),
+    hashFile: hashFileSha256,
+    listPart: partPath => uncompressedTar_listTar(partPath, CompressionMethod.Zstd),
+    extractParts: partPaths => extractShardedArchive(partPaths)
+};
 // Download every part of a sharded entry into the staging dir (a bounded
-// number at a time; each download is itself a wide multipart transfer), check
-// each against the size the manifest recorded, then extract all parts
-// concurrently. Any failure throws so restoreCache's catch turns it into the
-// usual warning + undefined; a partially extracted workspace is harmless
-// because a later restore or the build itself overwrites it.
-async function restoreShardedArchive(manifest, archiveLocation, partPaths, options) {
-    core.info(`Sharded cache entry: ${manifest.shards.length} part(s), ~${Math.round(manifest.totalBytes / (1024 * 1024))} MB (${manifest.totalBytes} B), ${manifest.totalFiles} files.`);
+// number at a time; each download is itself a wide multipart transfer), from
+// exactly the object keys the manifest lists (never reconstructed from the
+// entry key), check each against the size AND the sha256 the manifest
+// recorded, then extract all parts concurrently. Any failure throws so
+// restoreCache's catch turns it into the usual warning + undefined; a
+// partially extracted workspace is harmless because a later restore or the
+// build itself overwrites it.
+async function restoreShardedArchive(manifest, archiveLocation, entryKey, partPaths, options, deps = defaultShardedRestoreDeps) {
+    core.info(`Sharded cache entry: ${manifest.shards.length} part(s), ~${Math.round(manifest.totalBytes / (1024 * 1024))} MB (${manifest.totalBytes} B), ${manifest.totalFiles} files${manifest.generation
+        ? `, generation ${manifest.generation}`
+        : " (legacy manifest without a generation)"}.`);
+    // Resolve every location up front so a malformed manifest fails before
+    // any bytes move.
+    const locations = manifest.shards.map(shard => resolveShardPartLocation(archiveLocation, entryKey, shard));
     const downloadStartedAt = Date.now();
+    let hashMillis = 0;
     await mapWithConcurrency(manifest.shards, SHARD_DOWNLOAD_CONCURRENCY, async (shard, index) => {
         const partPath = partPaths[index];
-        await cacheHttpClient.downloadCache(`${archiveLocation}${SHARDS_KEY_SUFFIX}${shard.name}`, partPath, options);
+        await deps.downloadCache(locations[index], partPath, options);
         const partSize = utils.getArchiveFileSizeInBytes(partPath);
-        core.info(`  ${shard.name}: ~${Math.round(partSize / (1024 * 1024))} MB (${partSize} B), ${shard.files} files`);
+        core.info(`  ${shard.name}: ~${Math.round(partSize / (1024 * 1024))} MB (${partSize} B), ${shard.files} files, from ${locations[index]}`);
         if (partSize === 0) {
             throw new DownloadValidationError(`Downloaded cache part ${shard.name} is empty (0 bytes). This may indicate a failed download or corrupted cache.`);
         }
         if (partSize !== shard.bytes) {
             throw new DownloadValidationError(`Downloaded cache part ${shard.name} is ${partSize} B but the manifest recorded ${shard.bytes} B.`);
         }
+        if (shard.sha256 === undefined) {
+            core.info(`  ${shard.name}: manifest records no sha256; content not verified (size only).`);
+            return;
+        }
+        const hashStartedAt = Date.now();
+        const actual = await deps.hashFile(partPath);
+        hashMillis += Date.now() - hashStartedAt;
+        if (actual !== shard.sha256) {
+            throw new DownloadValidationError(`Downloaded cache part ${shard.name} has sha256 ${actual} but the manifest recorded ${shard.sha256}.`);
+        }
     });
-    core.info(`Sharded cache: downloaded ${manifest.shards.length} part(s) in ${((Date.now() - downloadStartedAt) /
-        1000).toFixed(1)}s.`);
+    core.info(`Sharded cache: downloaded and verified ${manifest.shards.length} part(s) in ${((Date.now() - downloadStartedAt) / 1000).toFixed(1)}s (sha256 hashing ${(hashMillis / 1000).toFixed(1)}s of that).`);
     if (core.isDebug()) {
         for (const partPath of partPaths) {
-            await uncompressedListTar(partPath, CompressionMethod.Zstd);
+            await deps.listPart(partPath);
         }
     }
-    await extractShardedArchive(partPaths);
+    await deps.extractParts(partPaths);
 }
 async function unlinkFiles(filePaths) {
     for (const filePath of filePaths) {
@@ -129651,7 +130030,7 @@ async function cache_saveShardedCache(paths, cachePaths, key, shardCount, compre
     const scratchFiles = [];
     try {
         const startedAt = Date.now();
-        const { manifest, parts } = await createShardedArchive(archiveFolder, cachePaths, shardCount);
+        const { manifest, parts } = await createShardedArchive(archiveFolder, cachePaths, shardCount, key);
         scratchFiles.push(...parts.map(part => part.path), ...parts.map(part => external_path_.join(archiveFolder, shardListName(part.index))));
         const tarFinishedAt = Date.now();
         if (isDebug()) {

@@ -1,8 +1,9 @@
 import { describe, expect, test } from "@jest/globals";
+import { execSync } from "child_process";
+import { createHash } from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { execSync } from "child_process";
 
 import {
     createShardedArchive,
@@ -29,8 +30,12 @@ maybe("sharded archive round trip (real tar/zstd)", () => {
         process.env["GITHUB_WORKSPACE"] = workspace;
         try {
             const lib = path.join(workspace, "Library");
-            fs.mkdirSync(path.join(lib, "Artifacts", "aa"), { recursive: true });
-            fs.mkdirSync(path.join(lib, "Artifacts", "bb"), { recursive: true });
+            fs.mkdirSync(path.join(lib, "Artifacts", "aa"), {
+                recursive: true
+            });
+            fs.mkdirSync(path.join(lib, "Artifacts", "bb"), {
+                recursive: true
+            });
             fs.mkdirSync(path.join(lib, "Empty"), { recursive: true });
             const expected = new Map<string, Buffer>();
             for (let i = 0; i < 12; i++) {
@@ -46,12 +51,29 @@ maybe("sharded archive round trip (real tar/zstd)", () => {
             fs.writeFileSync(path.join(lib, "ArtifactDB"), "db\n");
             expected.set("ArtifactDB", Buffer.from("db\n"));
 
-            const staging = fs.mkdtempSync(path.join(os.tmpdir(), "shard-stage-"));
-            const result = await createShardedArchive(staging, ["Library"], 3);
+            const staging = fs.mkdtempSync(
+                path.join(os.tmpdir(), "shard-stage-")
+            );
+            const result = await createShardedArchive(
+                staging,
+                ["Library"],
+                3,
+                "e2e-key"
+            );
             expect(result.parts.length).toBe(3);
             expect(result.manifest.totalFiles).toBe(13);
+            expect(result.manifest.generation).toBeDefined();
             for (const part of result.parts) {
                 expect(fs.statSync(part.path).size).toBeGreaterThan(0);
+                expect(part.key).toBe(
+                    `e2e-key.shards/${result.manifest.generation}/${part.name}`
+                );
+                // The recorded digest is of the real zstd part on disk.
+                expect(part.sha256).toBe(
+                    createHash("sha256")
+                        .update(fs.readFileSync(part.path))
+                        .digest("hex")
+                );
             }
 
             // Wipe the tree, then extract every part concurrently into the workspace.
@@ -62,7 +84,9 @@ maybe("sharded archive round trip (real tar/zstd)", () => {
                 const restored = fs.readFileSync(path.join(lib, rel));
                 expect(restored.equals(body)).toBe(true);
             }
-            expect(fs.statSync(path.join(lib, "Empty")).isDirectory()).toBe(true);
+            expect(fs.statSync(path.join(lib, "Empty")).isDirectory()).toBe(
+                true
+            );
             fs.rmSync(staging, { recursive: true, force: true });
         } finally {
             if (previousWorkspace === undefined) {

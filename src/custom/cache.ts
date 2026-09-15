@@ -18,11 +18,12 @@ import {
     ENV_ARCHIVE_SHARDS,
     extractShardedArchive,
     getArchiveShardCount,
+    hashFileSha256,
     mapWithConcurrency,
+    resolveShardPartLocation,
     SHARD_DOWNLOAD_CONCURRENCY,
     shardListName,
-    ShardManifest,
-    SHARDS_KEY_SUFFIX
+    ShardManifest
 } from "./shardedArchive";
 import { isStreamRestoreEnabled } from "./streamingRestore";
 import {
@@ -240,6 +241,7 @@ export async function restoreCache(
                 await restoreShardedArchive(
                     manifest,
                     cacheEntry.archiveLocation,
+                    cacheEntry.cacheKey ?? "",
                     shardPartPaths,
                     options
                 );
@@ -341,40 +343,72 @@ export async function restoreCache(
     return undefined;
 }
 
+/** I/O seams of a sharded restore, injectable for unit tests. */
+export interface ShardedRestoreDeps {
+    downloadCache: (
+        archiveLocation: string,
+        archivePath: string,
+        options?: DownloadOptions
+    ) => Promise<void>;
+    hashFile: (filePath: string) => Promise<string>;
+    listPart: (partPath: string) => Promise<void>;
+    extractParts: (partPaths: string[]) => Promise<void>;
+}
+
+const defaultShardedRestoreDeps: ShardedRestoreDeps = {
+    downloadCache: (archiveLocation, archivePath, options) =>
+        cacheHttpClient.downloadCache(archiveLocation, archivePath, options),
+    hashFile: hashFileSha256,
+    listPart: partPath => uncompressedListTar(partPath, CompressionMethod.Zstd),
+    extractParts: partPaths => extractShardedArchive(partPaths)
+};
+
 // Download every part of a sharded entry into the staging dir (a bounded
-// number at a time; each download is itself a wide multipart transfer), check
-// each against the size the manifest recorded, then extract all parts
-// concurrently. Any failure throws so restoreCache's catch turns it into the
-// usual warning + undefined; a partially extracted workspace is harmless
-// because a later restore or the build itself overwrites it.
-async function restoreShardedArchive(
+// number at a time; each download is itself a wide multipart transfer), from
+// exactly the object keys the manifest lists (never reconstructed from the
+// entry key), check each against the size AND the sha256 the manifest
+// recorded, then extract all parts concurrently. Any failure throws so
+// restoreCache's catch turns it into the usual warning + undefined; a
+// partially extracted workspace is harmless because a later restore or the
+// build itself overwrites it.
+export async function restoreShardedArchive(
     manifest: ShardManifest,
     archiveLocation: string,
+    entryKey: string,
     partPaths: string[],
-    options?: DownloadOptions
+    options?: DownloadOptions,
+    deps: ShardedRestoreDeps = defaultShardedRestoreDeps
 ): Promise<void> {
     core.info(
         `Sharded cache entry: ${manifest.shards.length} part(s), ~${Math.round(
             manifest.totalBytes / (1024 * 1024)
-        )} MB (${manifest.totalBytes} B), ${manifest.totalFiles} files.`
+        )} MB (${manifest.totalBytes} B), ${manifest.totalFiles} files${
+            manifest.generation
+                ? `, generation ${manifest.generation}`
+                : " (legacy manifest without a generation)"
+        }.`
+    );
+    // Resolve every location up front so a malformed manifest fails before
+    // any bytes move.
+    const locations = manifest.shards.map(shard =>
+        resolveShardPartLocation(archiveLocation, entryKey, shard)
     );
 
     const downloadStartedAt = Date.now();
+    let hashMillis = 0;
     await mapWithConcurrency(
         manifest.shards,
         SHARD_DOWNLOAD_CONCURRENCY,
         async (shard, index) => {
             const partPath = partPaths[index];
-            await cacheHttpClient.downloadCache(
-                `${archiveLocation}${SHARDS_KEY_SUFFIX}${shard.name}`,
-                partPath,
-                options
-            );
+            await deps.downloadCache(locations[index], partPath, options);
             const partSize = utils.getArchiveFileSizeInBytes(partPath);
             core.info(
                 `  ${shard.name}: ~${Math.round(
                     partSize / (1024 * 1024)
-                )} MB (${partSize} B), ${shard.files} files`
+                )} MB (${partSize} B), ${shard.files} files, from ${
+                    locations[index]
+                }`
             );
             if (partSize === 0) {
                 throw new DownloadValidationError(
@@ -386,22 +420,37 @@ async function restoreShardedArchive(
                     `Downloaded cache part ${shard.name} is ${partSize} B but the manifest recorded ${shard.bytes} B.`
                 );
             }
+            if (shard.sha256 === undefined) {
+                core.info(
+                    `  ${shard.name}: manifest records no sha256; content not verified (size only).`
+                );
+                return;
+            }
+            const hashStartedAt = Date.now();
+            const actual = await deps.hashFile(partPath);
+            hashMillis += Date.now() - hashStartedAt;
+            if (actual !== shard.sha256) {
+                throw new DownloadValidationError(
+                    `Downloaded cache part ${shard.name} has sha256 ${actual} but the manifest recorded ${shard.sha256}.`
+                );
+            }
         }
     );
     core.info(
-        `Sharded cache: downloaded ${manifest.shards.length} part(s) in ${(
-            (Date.now() - downloadStartedAt) /
-            1000
-        ).toFixed(1)}s.`
+        `Sharded cache: downloaded and verified ${
+            manifest.shards.length
+        } part(s) in ${((Date.now() - downloadStartedAt) / 1000).toFixed(
+            1
+        )}s (sha256 hashing ${(hashMillis / 1000).toFixed(1)}s of that).`
     );
 
     if (core.isDebug()) {
         for (const partPath of partPaths) {
-            await uncompressedListTar(partPath, CompressionMethod.Zstd);
+            await deps.listPart(partPath);
         }
     }
 
-    await extractShardedArchive(partPaths);
+    await deps.extractParts(partPaths);
 }
 
 async function unlinkFiles(filePaths: string[]): Promise<void> {
@@ -559,7 +608,8 @@ async function saveShardedCache(
         const { manifest, parts } = await createShardedArchive(
             archiveFolder,
             cachePaths,
-            shardCount
+            shardCount,
+            key
         );
         scratchFiles.push(
             ...parts.map(part => part.path),
