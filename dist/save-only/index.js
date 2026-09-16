@@ -127855,6 +127855,26 @@ function shardedArchive_parseShardManifest(body) {
     return manifest;
 }
 /**
+ * Every proper ancestor directory of `relPaths` (never "." or ""), ordered
+ * shallowest first so a tar stream creates parents before children.
+ */
+function ancestorDirectories(relPaths) {
+    const dirs = new Set();
+    for (const relPath of relPaths) {
+        const segments = relPath
+            .split("/")
+            .filter(segment => segment !== "" && segment !== ".");
+        for (let depth = 1; depth < segments.length; depth++) {
+            dirs.add(segments.slice(0, depth).join("/"));
+        }
+    }
+    return Array.from(dirs).sort((a, b) => {
+        const depthA = a.split("/").length;
+        const depthB = b.split("/").length;
+        return depthA - depthB || (a < b ? -1 : a > b ? 1 : 0);
+    });
+}
+/**
  * Greedy largest-first bin packing: files are visited by size descending
  * (ties broken by path, so the result is deterministic for a given input set)
  * and each goes to the shard that currently holds the fewest bytes (ties to
@@ -127862,6 +127882,15 @@ function shardedArchive_parseShardManifest(body) {
  * up with nothing (fewer entries than shards) are dropped, so the returned
  * array may be shorter than `shardCount` but is never empty when there is
  * anything to archive.
+ *
+ * Each shard's list is prefixed with every ancestor directory of its entries.
+ * The parts are extracted concurrently into one tree, and a tar stream that
+ * carries only files relies on tar creating missing parents on the fly, which
+ * races between the extractors (GNU tar loses that race with "Cannot open: No
+ * such file or directory" and the file is silently absent). With the directory
+ * entries in the same stream, every parent exists before its files are
+ * written, whatever the other extractors are doing; a directory that another
+ * part already created is simply reused.
  */
 function assignFilesToShards(files, emptyDirs, shardCount) {
     const count = Math.max(1, Math.floor(shardCount));
@@ -127886,6 +127915,14 @@ function assignFilesToShards(files, emptyDirs, shardCount) {
     }
     for (const dir of emptyDirs.slice().sort()) {
         shards[0].relPaths.push(dir);
+    }
+    for (const shard of shards) {
+        if (shard.relPaths.length > 0) {
+            shard.relPaths = [
+                ...ancestorDirectories(shard.relPaths),
+                ...shard.relPaths
+            ];
+        }
     }
     return shards.filter(shard => shard.relPaths.length > 0);
 }
@@ -128025,6 +128062,43 @@ function enumerateCacheEntries(cachePaths, workspaceRoot = shardedArchive_getWor
     }
     return { files, emptyDirs };
 }
+/**
+ * Remove everything below each cache path (the path itself stays, so a
+ * Windows junction that routes Library/ onto another disk survives). Used when
+ * a sharded restore fails after extraction started: a partially populated
+ * tree is worse than a miss, because the job would treat it as a warm cache,
+ * build against it, and possibly re-archive it. Errors are reported, never
+ * thrown, so the caller can still surface the original failure.
+ */
+function clearCachePathContents(cachePaths, workspaceRoot = shardedArchive_getWorkingDirectory()) {
+    for (const cachePath of cachePaths) {
+        const absolutePath = external_path_.resolve(workspaceRoot, cachePath);
+        let stats;
+        try {
+            stats = external_fs_namespaceObject.statSync(absolutePath);
+        }
+        catch {
+            continue;
+        }
+        try {
+            if (stats.isDirectory()) {
+                for (const child of external_fs_namespaceObject.readdirSync(absolutePath)) {
+                    external_fs_namespaceObject.rmSync(external_path_.join(absolutePath, child), {
+                        recursive: true,
+                        force: true,
+                        maxRetries: 3
+                    });
+                }
+            }
+            else {
+                external_fs_namespaceObject.rmSync(absolutePath, { force: true, maxRetries: 3 });
+            }
+        }
+        catch (error) {
+            warning(`Could not fully remove the partially restored ${absolutePath}: ${error.message}`);
+        }
+    }
+}
 const defaultDeps = {
     createTarFromFileList: createTarFromFileList,
     extractTar: archivePath => uncompressedTar_extractTar(archivePath, CompressionMethod.Zstd),
@@ -128098,7 +128172,8 @@ async function createShardedArchive(archiveFolder, cachePaths, shardCount, entry
     });
     for (const part of parts) {
         const raw = assignments[part.index].bytes;
-        info(`  ${part.name}: ${part.files} files, ${formatMb(raw)} raw -> ${formatMb(part.bytes)} compressed (${part.bytes} B), sha256 ${part.sha256}`);
+        const dirs = assignments[part.index].relPaths.length - part.files;
+        info(`  ${part.name}: ${part.files} files (+${dirs} directory entries), ${formatMb(raw)} raw -> ${formatMb(part.bytes)} compressed (${part.bytes} B), sha256 ${part.sha256}`);
     }
     info(`Sharded archive: hashed ${parts.length} part(s) (sha256) in ${hashSeconds}s; generation ${generation}.`);
     const totalBytes = parts.reduce((sum, part) => sum + part.bytes, 0);
@@ -129985,7 +130060,7 @@ async function cache_restoreCache(paths, primaryKey, restoreKeys, options, enabl
                 archiveFolder = staging.dir;
                 archiveDirIsCustom = staging.isCustom;
                 shardPartPaths = manifest.shards.map(shard => path.join(archiveFolder, shard.name));
-                await restoreShardedArchive(manifest, cacheEntry.archiveLocation, cacheEntry.cacheKey ?? "", shardPartPaths, options);
+                await restoreShardedArchive(manifest, cacheEntry.archiveLocation, cacheEntry.cacheKey ?? "", shardPartPaths, paths, options);
                 core.info("Cache restored successfully");
                 return cacheEntry.cacheKey;
             }
@@ -130068,17 +130143,22 @@ const defaultShardedRestoreDeps = {
     downloadCache: (archiveLocation, archivePath, options) => backend_downloadCache(archiveLocation, archivePath, options),
     hashFile: hashFileSha256,
     listPart: partPath => uncompressedTar_listTar(partPath, CompressionMethod.Zstd),
-    extractParts: partPaths => extractShardedArchive(partPaths)
+    extractParts: partPaths => extractShardedArchive(partPaths),
+    countRestoredFiles: cachePaths => enumerateCacheEntries(cachePaths).files.length,
+    clearRestoredPaths: cachePaths => clearCachePathContents(cachePaths)
 };
 // Download every part of a sharded entry into the staging dir (a bounded
 // number at a time; each download is itself a wide multipart transfer), from
 // exactly the object keys the manifest lists (never reconstructed from the
 // entry key), check each against the size AND the sha256 the manifest
-// recorded, then extract all parts concurrently. Any failure throws so
-// restoreCache's catch turns it into the usual warning + undefined; a
-// partially extracted workspace is harmless because a later restore or the
-// build itself overwrites it.
-async function restoreShardedArchive(manifest, archiveLocation, entryKey, partPaths, options, deps = defaultShardedRestoreDeps) {
+// recorded, then extract all parts concurrently and check that at least as
+// many regular files as the manifest recorded now exist under `cachePaths`.
+// Any failure throws so restoreCache's catch turns it into the usual warning +
+// undefined. A failure during or after extraction first empties the cache
+// paths: a partially restored tree would otherwise pass for a warm cache (the
+// step still succeeds, only `cache-hit` is empty), be built against, and
+// possibly be re-archived under a shared key.
+async function restoreShardedArchive(manifest, archiveLocation, entryKey, partPaths, cachePaths, options, deps = defaultShardedRestoreDeps) {
     core.info(`Sharded cache entry: ${manifest.shards.length} part(s), ~${Math.round(manifest.totalBytes / (1024 * 1024))} MB (${manifest.totalBytes} B), ${manifest.totalFiles} files${manifest.generation
         ? `, generation ${manifest.generation}`
         : " (legacy manifest without a generation)"}.`);
@@ -130115,7 +130195,22 @@ async function restoreShardedArchive(manifest, archiveLocation, entryKey, partPa
             await deps.listPart(partPath);
         }
     }
-    await deps.extractParts(partPaths);
+    try {
+        await deps.extractParts(partPaths);
+        if (cachePaths.length > 0) {
+            const verifyStartedAt = Date.now();
+            const present = deps.countRestoredFiles(cachePaths);
+            if (present < manifest.totalFiles) {
+                throw new Error(`sharded restore is incomplete: ${present} regular files exist under ${cachePaths.join(", ")} but the manifest recorded ${manifest.totalFiles}`);
+            }
+            core.info(`Sharded cache: verified ${present} files under the cache path(s) (manifest: ${manifest.totalFiles}) in ${((Date.now() - verifyStartedAt) / 1000).toFixed(1)}s.`);
+        }
+    }
+    catch (error) {
+        core.warning(`Sharded cache: ${error.message}. Removing the partially restored contents of ${cachePaths.join(", ")} so this counts as a clean miss instead of a corrupt warm cache.`);
+        deps.clearRestoredPaths(cachePaths);
+        throw error;
+    }
 }
 async function unlinkFiles(filePaths) {
     for (const filePath of filePaths) {

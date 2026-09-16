@@ -14,7 +14,9 @@ import {
 } from "../actionsCacheShims.js";
 import * as cacheHttpClient from "./backend";
 import {
+    clearCachePathContents,
     createShardedArchive,
+    enumerateCacheEntries,
     ENV_ARCHIVE_SHARDS,
     extractShardedArchive,
     getArchiveShardCount,
@@ -243,6 +245,7 @@ export async function restoreCache(
                     cacheEntry.archiveLocation,
                     cacheEntry.cacheKey ?? "",
                     shardPartPaths,
+                    paths,
                     options
                 );
                 core.info("Cache restored successfully");
@@ -353,6 +356,10 @@ export interface ShardedRestoreDeps {
     hashFile: (filePath: string) => Promise<string>;
     listPart: (partPath: string) => Promise<void>;
     extractParts: (partPaths: string[]) => Promise<void>;
+    /** Regular files currently present under the cache paths. */
+    countRestoredFiles: (cachePaths: string[]) => number;
+    /** Remove the contents of the cache paths after a failed extraction. */
+    clearRestoredPaths: (cachePaths: string[]) => void;
 }
 
 const defaultShardedRestoreDeps: ShardedRestoreDeps = {
@@ -360,22 +367,29 @@ const defaultShardedRestoreDeps: ShardedRestoreDeps = {
         cacheHttpClient.downloadCache(archiveLocation, archivePath, options),
     hashFile: hashFileSha256,
     listPart: partPath => uncompressedListTar(partPath, CompressionMethod.Zstd),
-    extractParts: partPaths => extractShardedArchive(partPaths)
+    extractParts: partPaths => extractShardedArchive(partPaths),
+    countRestoredFiles: cachePaths =>
+        enumerateCacheEntries(cachePaths).files.length,
+    clearRestoredPaths: cachePaths => clearCachePathContents(cachePaths)
 };
 
 // Download every part of a sharded entry into the staging dir (a bounded
 // number at a time; each download is itself a wide multipart transfer), from
 // exactly the object keys the manifest lists (never reconstructed from the
 // entry key), check each against the size AND the sha256 the manifest
-// recorded, then extract all parts concurrently. Any failure throws so
-// restoreCache's catch turns it into the usual warning + undefined; a
-// partially extracted workspace is harmless because a later restore or the
-// build itself overwrites it.
+// recorded, then extract all parts concurrently and check that at least as
+// many regular files as the manifest recorded now exist under `cachePaths`.
+// Any failure throws so restoreCache's catch turns it into the usual warning +
+// undefined. A failure during or after extraction first empties the cache
+// paths: a partially restored tree would otherwise pass for a warm cache (the
+// step still succeeds, only `cache-hit` is empty), be built against, and
+// possibly be re-archived under a shared key.
 export async function restoreShardedArchive(
     manifest: ShardManifest,
     archiveLocation: string,
     entryKey: string,
     partPaths: string[],
+    cachePaths: string[],
     options?: DownloadOptions,
     deps: ShardedRestoreDeps = defaultShardedRestoreDeps
 ): Promise<void> {
@@ -450,7 +464,35 @@ export async function restoreShardedArchive(
         }
     }
 
-    await deps.extractParts(partPaths);
+    try {
+        await deps.extractParts(partPaths);
+        if (cachePaths.length > 0) {
+            const verifyStartedAt = Date.now();
+            const present = deps.countRestoredFiles(cachePaths);
+            if (present < manifest.totalFiles) {
+                throw new Error(
+                    `sharded restore is incomplete: ${present} regular files exist under ${cachePaths.join(
+                        ", "
+                    )} but the manifest recorded ${manifest.totalFiles}`
+                );
+            }
+            core.info(
+                `Sharded cache: verified ${present} files under the cache path(s) (manifest: ${
+                    manifest.totalFiles
+                }) in ${((Date.now() - verifyStartedAt) / 1000).toFixed(1)}s.`
+            );
+        }
+    } catch (error) {
+        core.warning(
+            `Sharded cache: ${
+                (error as Error).message
+            }. Removing the partially restored contents of ${cachePaths.join(
+                ", "
+            )} so this counts as a clean miss instead of a corrupt warm cache.`
+        );
+        deps.clearRestoredPaths(cachePaths);
+        throw error;
+    }
 }
 
 async function unlinkFiles(filePaths: string[]): Promise<void> {

@@ -14,9 +14,11 @@ import * as os from "os";
 import * as path from "path";
 
 import {
+    ancestorDirectories,
     assertShardablePaths,
     assignFilesToShards,
     CacheFileEntry,
+    clearCachePathContents,
     createShardedArchive,
     DEFAULT_SHARD_RETENTION_HOURS,
     enumerateCacheEntries,
@@ -351,9 +353,14 @@ describe("assignFilesToShards", () => {
         expect(shards).toHaveLength(3);
         // 100 -> s0 (100), 90 -> s1 (90), 50 -> s2 (50), 40 -> s2 (90),
         // 30 -> s1 (tie 90/90, lowest index; 120), 10 -> s2 (100).
-        expect(shards[0].relPaths).toEqual(["Library/a"]);
-        expect(shards[1].relPaths).toEqual(["Library/b", "Library/e"]);
+        expect(shards[0].relPaths).toEqual(["Library", "Library/a"]);
+        expect(shards[1].relPaths).toEqual([
+            "Library",
+            "Library/b",
+            "Library/e"
+        ]);
         expect(shards[2].relPaths).toEqual([
+            "Library",
             "Library/c",
             "Library/d",
             "Library/f"
@@ -423,6 +430,52 @@ describe("assignFilesToShards", () => {
         expect(assignFilesToShards([], ["x"], 4)).toEqual([
             { relPaths: ["x"], bytes: 0, files: 0 }
         ]);
+    });
+
+    test("every shard carries the ancestor directories of its own entries, parents first", () => {
+        const deep: CacheFileEntry[] = [
+            { relPath: "Library/ShaderCache/shader/A1/00/x.bin", size: 9 },
+            { relPath: "Library/ShaderCache/shader/B2/00/y.bin", size: 8 },
+            { relPath: "Library/PackageCache/pkg@1/Editor/z.cs", size: 7 }
+        ];
+        const shards = assignFilesToShards(deep, ["Library/Empty/Leaf"], 3);
+        for (const shard of shards) {
+            const files = shard.relPaths.filter(
+                relPath =>
+                    !ancestorDirectories(shard.relPaths).includes(relPath)
+            );
+            const dirs = ancestorDirectories(files);
+            // Directories come first, shallowest first, then the entries.
+            expect(shard.relPaths).toEqual([...dirs, ...files]);
+            for (const file of files) {
+                const parent = file.split("/").slice(0, -1).join("/");
+                expect(shard.relPaths.indexOf(parent)).toBeLessThan(
+                    shard.relPaths.indexOf(file)
+                );
+            }
+        }
+        // Shard 0 also creates the empty directory's parents.
+        expect(shards[0].relPaths).toContain("Library/Empty");
+        expect(shards[0].relPaths.indexOf("Library/Empty")).toBeLessThan(
+            shards[0].relPaths.indexOf("Library/Empty/Leaf")
+        );
+        expect(shards.reduce((sum, shard) => sum + shard.files, 0)).toBe(3);
+    });
+});
+
+describe("ancestorDirectories", () => {
+    test("lists every proper prefix once, shallowest first, never '.' or the entry itself", () => {
+        expect(
+            ancestorDirectories([
+                "Library/a/b/c.bin",
+                "Library/a/d.bin",
+                "Library/x",
+                "top.bin",
+                "./Library/a/b/e.bin"
+            ])
+        ).toEqual(["Library", "Library/a", "Library/a/b"]);
+        expect(ancestorDirectories([])).toEqual([]);
+        expect(ancestorDirectories(["solo"])).toEqual([]);
     });
 });
 
@@ -741,6 +794,38 @@ describe("mapWithConcurrency", () => {
 // ============================================================================
 // Enumeration + orchestration against a real temp tree (tar/zstd injected).
 // ============================================================================
+describe("clearCachePathContents", () => {
+    test("empties a directory cache path but keeps the path itself, and removes a file cache path", () => {
+        const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "clear-ws-"));
+        try {
+            fs.mkdirSync(path.join(workspace, "Library", "deep", "er"), {
+                recursive: true
+            });
+            fs.writeFileSync(path.join(workspace, "Library", "a.bin"), "a");
+            fs.writeFileSync(
+                path.join(workspace, "Library", "deep", "er", "b.bin"),
+                "b"
+            );
+            fs.writeFileSync(path.join(workspace, "single.txt"), "s");
+
+            clearCachePathContents(
+                ["Library", "single.txt", "missing"],
+                workspace
+            );
+
+            expect(
+                fs.statSync(path.join(workspace, "Library")).isDirectory()
+            ).toBe(true);
+            expect(fs.readdirSync(path.join(workspace, "Library"))).toEqual([]);
+            expect(fs.existsSync(path.join(workspace, "single.txt"))).toBe(
+                false
+            );
+        } finally {
+            fs.rmSync(workspace, { recursive: true, force: true });
+        }
+    });
+});
+
 describe("enumerateCacheEntries", () => {
     let workspace: string;
 
@@ -899,12 +984,20 @@ describe("createShardedArchive / extractShardedArchive (injected tar)", () => {
             .trim()
             .split("\n");
         // 400 -> s0, 300 -> s1, 200 -> s1 (500), 100 -> s0 (500); empty dir -> s0.
+        // Each list starts with the directories its own entries need.
         expect(list0).toEqual([
+            "Library",
+            "Library/sub",
             "Library/a.bin",
             "Library/sub/d.bin",
             "Library/empty"
         ]);
-        expect(list1).toEqual(["Library/b.bin", "Library/sub/c.bin"]);
+        expect(list1).toEqual([
+            "Library",
+            "Library/sub",
+            "Library/b.bin",
+            "Library/sub/c.bin"
+        ]);
 
         expect(parts.map(part => part.name)).toEqual([
             "part-00.tzst",

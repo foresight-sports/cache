@@ -76,7 +76,14 @@ function makeDeps(objects: FakeObjects): cache.ShardedRestoreDeps & {
         ) as cache.ShardedRestoreDeps["listPart"],
         extractParts: jest.fn(async (partPaths: string[]) => {
             extracted.push(partPaths);
-        }) as cache.ShardedRestoreDeps["extractParts"]
+        }) as cache.ShardedRestoreDeps["extractParts"],
+        // Default: every file the manifest recorded is present afterwards.
+        countRestoredFiles: jest.fn(
+            () => Number.MAX_SAFE_INTEGER
+        ) as cache.ShardedRestoreDeps["countRestoredFiles"],
+        clearRestoredPaths: jest.fn(
+            () => undefined
+        ) as cache.ShardedRestoreDeps["clearRestoredPaths"]
     };
     return deps;
 }
@@ -162,6 +169,7 @@ describe("restoreShardedArchive", () => {
             archiveLocation,
             entryKey,
             partPaths,
+            ["Library"],
             undefined,
             deps
         );
@@ -196,6 +204,7 @@ describe("restoreShardedArchive", () => {
                 archiveLocation,
                 entryKey,
                 partPaths,
+                ["Library"],
                 undefined,
                 deps
             )
@@ -226,6 +235,7 @@ describe("restoreShardedArchive", () => {
                 archiveLocation,
                 entryKey,
                 partPaths,
+                ["Library"],
                 undefined,
                 deps
             )
@@ -260,6 +270,7 @@ describe("restoreShardedArchive", () => {
             archiveLocation,
             entryKey,
             partPaths,
+            ["Library"],
             undefined,
             deps
         );
@@ -290,11 +301,90 @@ describe("restoreShardedArchive", () => {
                 archiveLocation,
                 entryKey,
                 partPaths,
+                ["Library"],
                 undefined,
                 deps
             )
         ).rejects.toThrow(/references a part outside the entry/);
         expect(deps.downloadCache).not.toHaveBeenCalled();
         expect(deps.extracted).toEqual([]);
+    });
+    test("an extract failure empties the cache paths before the error propagates", async () => {
+        const objects: FakeObjects = new Map([
+            [`${prefixLocation}/${entryKey}.shards/gen-a/part-00.tzst`, partA],
+            [`${prefixLocation}/${entryKey}.shards/gen-a/part-01.tzst`, partB]
+        ]);
+        const deps = makeDeps(objects);
+        (deps.extractParts as jest.Mock).mockImplementation(async () => {
+            throw new Error(
+                "part part-01.tzst extract failed: The process '/usr/bin/tar' failed with exit code 2"
+            );
+        });
+
+        await expect(
+            cache.restoreShardedArchive(
+                generationManifest(),
+                archiveLocation,
+                entryKey,
+                partPaths,
+                ["Library"],
+                undefined,
+                deps
+            )
+        ).rejects.toThrow(/part-01.tzst extract failed/);
+
+        expect(deps.clearRestoredPaths).toHaveBeenCalledTimes(1);
+        expect(deps.clearRestoredPaths).toHaveBeenCalledWith(["Library"]);
+        expect(deps.countRestoredFiles).not.toHaveBeenCalled();
+        expect(stdoutLines.join("")).toMatch(/clean miss/);
+    });
+
+    test("fewer files than the manifest recorded is a failure that also empties the cache paths", async () => {
+        const objects: FakeObjects = new Map([
+            [`${prefixLocation}/${entryKey}.shards/gen-a/part-00.tzst`, partA],
+            [`${prefixLocation}/${entryKey}.shards/gen-a/part-01.tzst`, partB]
+        ]);
+        const deps = makeDeps(objects);
+        (deps.countRestoredFiles as jest.Mock).mockImplementation(() => 4);
+
+        await expect(
+            cache.restoreShardedArchive(
+                generationManifest(),
+                archiveLocation,
+                entryKey,
+                partPaths,
+                ["Library"],
+                undefined,
+                deps
+            )
+        ).rejects.toThrow(
+            /incomplete: 4 regular files exist under Library but the manifest recorded 5/
+        );
+
+        expect(deps.extracted).toEqual([partPaths]);
+        expect(deps.countRestoredFiles).toHaveBeenCalledWith(["Library"]);
+        expect(deps.clearRestoredPaths).toHaveBeenCalledWith(["Library"]);
+    });
+
+    test("a complete restore verifies the file count and leaves the tree alone", async () => {
+        const objects: FakeObjects = new Map([
+            [`${prefixLocation}/${entryKey}.shards/gen-a/part-00.tzst`, partA],
+            [`${prefixLocation}/${entryKey}.shards/gen-a/part-01.tzst`, partB]
+        ]);
+        const deps = makeDeps(objects);
+        (deps.countRestoredFiles as jest.Mock).mockImplementation(() => 5);
+
+        await cache.restoreShardedArchive(
+            generationManifest(),
+            archiveLocation,
+            entryKey,
+            partPaths,
+            ["Library"],
+            undefined,
+            deps
+        );
+
+        expect(deps.clearRestoredPaths).not.toHaveBeenCalled();
+        expect(stdoutLines.join("")).toMatch(/verified 5 files/);
     });
 });

@@ -119,7 +119,9 @@ export interface CacheEntries {
 }
 
 export interface ShardAssignment {
-    /** Paths written to this shard's `--files-from` list, in list order. */
+    /** Paths written to this shard's `--files-from` list, in list order: every
+     *  ancestor directory of the shard's entries first (shallowest first), then
+     *  the regular files, then any empty directories. */
     relPaths: string[];
     /** Sum of the sizes of the regular files in this shard. */
     bytes: number;
@@ -574,6 +576,27 @@ export function parseShardManifest(
 }
 
 /**
+ * Every proper ancestor directory of `relPaths` (never "." or ""), ordered
+ * shallowest first so a tar stream creates parents before children.
+ */
+export function ancestorDirectories(relPaths: string[]): string[] {
+    const dirs = new Set<string>();
+    for (const relPath of relPaths) {
+        const segments = relPath
+            .split("/")
+            .filter(segment => segment !== "" && segment !== ".");
+        for (let depth = 1; depth < segments.length; depth++) {
+            dirs.add(segments.slice(0, depth).join("/"));
+        }
+    }
+    return Array.from(dirs).sort((a, b) => {
+        const depthA = a.split("/").length;
+        const depthB = b.split("/").length;
+        return depthA - depthB || (a < b ? -1 : a > b ? 1 : 0);
+    });
+}
+
+/**
  * Greedy largest-first bin packing: files are visited by size descending
  * (ties broken by path, so the result is deterministic for a given input set)
  * and each goes to the shard that currently holds the fewest bytes (ties to
@@ -581,6 +604,15 @@ export function parseShardManifest(
  * up with nothing (fewer entries than shards) are dropped, so the returned
  * array may be shorter than `shardCount` but is never empty when there is
  * anything to archive.
+ *
+ * Each shard's list is prefixed with every ancestor directory of its entries.
+ * The parts are extracted concurrently into one tree, and a tar stream that
+ * carries only files relies on tar creating missing parents on the fly, which
+ * races between the extractors (GNU tar loses that race with "Cannot open: No
+ * such file or directory" and the file is silently absent). With the directory
+ * entries in the same stream, every parent exists before its files are
+ * written, whatever the other extractors are doing; a directory that another
+ * part already created is simply reused.
  */
 export function assignFilesToShards(
     files: CacheFileEntry[],
@@ -615,6 +647,15 @@ export function assignFilesToShards(
 
     for (const dir of emptyDirs.slice().sort()) {
         shards[0].relPaths.push(dir);
+    }
+
+    for (const shard of shards) {
+        if (shard.relPaths.length > 0) {
+            shard.relPaths = [
+                ...ancestorDirectories(shard.relPaths),
+                ...shard.relPaths
+            ];
+        }
     }
 
     return shards.filter(shard => shard.relPaths.length > 0);
@@ -779,6 +820,48 @@ export function enumerateCacheEntries(
     return { files, emptyDirs };
 }
 
+/**
+ * Remove everything below each cache path (the path itself stays, so a
+ * Windows junction that routes Library/ onto another disk survives). Used when
+ * a sharded restore fails after extraction started: a partially populated
+ * tree is worse than a miss, because the job would treat it as a warm cache,
+ * build against it, and possibly re-archive it. Errors are reported, never
+ * thrown, so the caller can still surface the original failure.
+ */
+export function clearCachePathContents(
+    cachePaths: string[],
+    workspaceRoot: string = getWorkingDirectory()
+): void {
+    for (const cachePath of cachePaths) {
+        const absolutePath = path.resolve(workspaceRoot, cachePath);
+        let stats: fs.Stats;
+        try {
+            stats = fs.statSync(absolutePath);
+        } catch {
+            continue;
+        }
+        try {
+            if (stats.isDirectory()) {
+                for (const child of fs.readdirSync(absolutePath)) {
+                    fs.rmSync(path.join(absolutePath, child), {
+                        recursive: true,
+                        force: true,
+                        maxRetries: 3
+                    });
+                }
+            } else {
+                fs.rmSync(absolutePath, { force: true, maxRetries: 3 });
+            }
+        } catch (error) {
+            core.warning(
+                `Could not fully remove the partially restored ${absolutePath}: ${
+                    (error as Error).message
+                }`
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Create / extract orchestration.
 // ---------------------------------------------------------------------------
@@ -929,8 +1012,9 @@ export async function createShardedArchive(
     });
     for (const part of parts) {
         const raw = assignments[part.index].bytes;
+        const dirs = assignments[part.index].relPaths.length - part.files;
         core.info(
-            `  ${part.name}: ${part.files} files, ${formatMb(
+            `  ${part.name}: ${part.files} files (+${dirs} directory entries), ${formatMb(
                 raw
             )} raw -> ${formatMb(part.bytes)} compressed (${
                 part.bytes
