@@ -17,6 +17,42 @@ interface TarToolInfo {
     type: ArchiveToolType;
 }
 
+export const ENV_ZSTD_COMPRESS_ARGS = "CACHE_ZSTD_COMPRESS_ARGS";
+export const DEFAULT_ZSTD_COMPRESS_ARGS = "-T0 -3 --long=30";
+// Each token must look like a zstd option: no shell metacharacters, no paths.
+const ZSTD_ARG_TOKEN = /^-{1,2}[A-Za-z0-9][A-Za-z0-9=,.-]*$/;
+
+/**
+ * zstd flags used when creating the archive. `CACHE_ZSTD_COMPRESS_ARGS` (e.g.
+ * `-T0 -1` to trade a few percent of size for a much faster save, or `-T0 -3`
+ * to drop the 1 GiB long-range window) replaces the default when every
+ * whitespace-separated token is a plain option; anything else is ignored with a
+ * warning so a typo can never break a save. The decompressor always passes
+ * --long=30 and therefore reads either archive shape.
+ */
+export function getZstdCompressArgs(
+    env: NodeJS.ProcessEnv = process.env
+): string {
+    const raw = (env[ENV_ZSTD_COMPRESS_ARGS] ?? "").trim();
+    if (raw === "") {
+        return DEFAULT_ZSTD_COMPRESS_ARGS;
+    }
+    const tokens = raw.split(/\s+/);
+    if (tokens.every(token => ZSTD_ARG_TOKEN.test(token))) {
+        return tokens.join(" ");
+    }
+    core.warning(
+        `${ENV_ZSTD_COMPRESS_ARGS}='${raw}' contains a non-option token; using the default '${DEFAULT_ZSTD_COMPRESS_ARGS}'.`
+    );
+    return DEFAULT_ZSTD_COMPRESS_ARGS;
+}
+
+export function getZstdCompressProgram(
+    env: NodeJS.ProcessEnv = process.env
+): string {
+    return `zstd ${getZstdCompressArgs(env)}`;
+}
+
 async function getTarTool(): Promise<TarToolInfo> {
     switch (process.platform) {
         case "win32": {
@@ -129,15 +165,17 @@ export async function createTar(
 
     writeFileSync(normalizedManifestPath, sourceDirectories.join("\n"));
 
+    const compressProgram = getZstdCompressProgram();
+    core.info(`Cache archive compressor: ${compressProgram}`);
     const args = [
         "--posix",
         // Multithreaded zstd (-T0 = all cores) at the fast level 3, with long-range
-        // matching (--long=30 = 1 GiB window). tar splits this value on whitespace
-        // and runs it as the compression filter. This replaces the previous raw
-        // (uncompressed) tar so the payload is both smaller and produced in parallel.
-        // The matching decompressor in extractTar/listTar uses `zstd -d --long=30`.
+        // matching (--long=30 = 1 GiB window) by default; overridable per job via
+        // CACHE_ZSTD_COMPRESS_ARGS. tar splits this value on whitespace and runs it
+        // as the compression filter. The decompressor in extractTar/listTar stays
+        // `zstd -d --long=30`, which reads archives produced with or without --long.
         "--use-compress-program",
-        "zstd -T0 -3 --long=30",
+        compressProgram,
         "-cf",
         normalizedArchiveName,
         "--exclude",
@@ -147,6 +185,47 @@ export async function createTar(
         workingDirectory,
         "--files-from",
         ManifestFilename
+    ];
+
+    appendPlatformSpecificArgs(tool, args);
+
+    await runTar(tool, args, {
+        cwd: archiveFolder,
+        env: getExecEnv()
+    });
+}
+
+/**
+ * Create ONE shard of a sharded archive: tar exactly the paths listed in
+ * `fileListName` (one per line, relative to the workspace, no recursion) into
+ * `archiveName`, both inside `archiveFolder`, compressing with the given
+ * `zstd ...` program. Same tar tool, `--posix`, `-P -C <workspace>` and
+ * platform args as createTar; `--no-recursion` because the caller has already
+ * enumerated every file (and empty directory) explicitly so it can balance the
+ * shards by size. Several of these run concurrently.
+ */
+export async function createTarFromFileList(
+    archiveFolder: string,
+    fileListName: string,
+    archiveName: string,
+    compressProgram: string
+): Promise<void> {
+    const tool = await getTarTool();
+    await warnIfZstdMissing();
+    const workingDirectory = normalizeForTar(getWorkingDirectory());
+
+    const args = [
+        "--posix",
+        "--no-recursion",
+        "--use-compress-program",
+        compressProgram,
+        "-cf",
+        normalizeForTar(archiveName),
+        "-P",
+        "-C",
+        workingDirectory,
+        "--files-from",
+        normalizeForTar(fileListName)
     ];
 
     appendPlatformSpecificArgs(tool, args);
